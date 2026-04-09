@@ -25,52 +25,56 @@ mongoose.connect(process.env.MONGO_URI)
 // --- MULTI-STREAM MARKET DATA BRIDGE ---
 // We now subscribe to BOTH ticker (for watchlist) and kline (for chart)
 const symbols = ['btcusdt', 'ethusdt', 'solusdt', 'bnbusdt'];
-const tickerStreams = symbols.map(s => `${s}@ticker`).join('/');
-const klineStreams = symbols.map(s => `${s}@kline_1m`).join('/');
-const depthStreams = symbols.map(s => `${s}@depth5@100ms`).join('/'); // Top 5 bids/asks, updated every 100ms
 
-const binanceConn = new WebSocket(`wss://stream.binance.com:9443/ws/${tickerStreams}/${klineStreams}/${depthStreams}`);
+// Ensure no trailing slashes or empty strings
+const tickerStreams = symbols.map(s => `${s.toLowerCase()}@ticker`).join('/');
+const klineStreams = symbols.map(s => `${s.toLowerCase()}@kline_1m`).join('/');
+const depthStreams = symbols.map(s => `${s.toLowerCase()}@depth5`).join('/'); // Simplified from @depth5@100ms for stability
+
+const binanceUrl = `wss://stream.binance.com:9443/stream?streams=${tickerStreams}/${klineStreams}/${depthStreams}`;
+const binanceConn = new WebSocket(binanceUrl);
+
+console.log("🔗 Connecting to:", binanceUrl); // This helps us see if the URL looks weird
 
 binanceConn.on('message', (data) => {
   try {
-    const msg = JSON.parse(data);
+    const rawData = JSON.parse(data);
+    const streamName = rawData.stream || "";
+    const msg = rawData.data || rawData;
 
-    // 1. Handle Ticker Updates (For Watchlist Cards)
+    // 1. Tickers (e: 24hrTicker)
     if (msg.e === '24hrTicker') {
-      io.emit('marketUpdate', {
-        symbol: msg.s,
-        price: parseFloat(msg.c).toFixed(2),
-        change: msg.P,
-      });
+      io.emit('marketUpdate', { symbol: msg.s, price: parseFloat(msg.c).toFixed(2), change: msg.P });
+    } 
+    
+    // 2. Klines (e: kline)
+    else if (msg.e === 'kline') {
+      io.emit('candleUpdate', { symbol: msg.s, time: msg.k.t / 1000, open: parseFloat(msg.k.o), high: parseFloat(msg.k.h), low: parseFloat(msg.k.l), close: parseFloat(msg.k.c) });
     }
 
-    // 2. Handle Candlestick Updates (For the Graph)
-    if (msg.e === 'kline') {
-      const candle = msg.k;
-      io.emit('candleUpdate', {
-        symbol: msg.s,
-        time: candle.t / 1000,
-        open: parseFloat(candle.o),
-        high: parseFloat(candle.h),
-        low: parseFloat(candle.l),
-        close: parseFloat(candle.c),
-      });
+    // 3. DEPTH (Order Book)
+    // We check for 'bids' or 'b' because depth messages don't have an 'e' field
+    else if (msg.b || msg.bids || streamName.includes('depth')) {
+      //console.log("🟢 ORDER BOOK DATA ARRIVED for", );
+      
+      const bids = msg.b || msg.bids || [];
+      const asks = msg.a || msg.asks || [];
+      const symbol = (msg.s || streamName.split('@')[0] || 'BTCUSDT').toUpperCase();
 
-      // 3. Handle Depth Messages inside binanceConn.on('message'...)
-if (msg.e === 'depthUpdate' || !msg.e) { 
-  // Binance depth stream sometimes doesn't have an 'e' field if it's a top-level stream
-  // We'll simplify: if it has 'b' (bids) and 'a' (asks), it's depth data.
-  if (msg.b && msg.a) {
-    io.emit('depthUpdate', {
-      symbol: msg.s || 'BTCUSDT',
-      bids: msg.b.slice(0, 8), // Top 8 buy orders
-      asks: msg.a.slice(0, 8)  // Top 8 sell orders
-     });
+      io.emit('depthUpdate', {
+        symbol: symbol,
+        bids: bids.slice(0, 8),
+        asks: asks.slice(0, 8)
+      });
     }
-   }
+    
+    // 4. Unknown Data (Diagnostic)
+    else {
+      console.log("❓ Unknown message type from stream:", streamName);
     }
+
   } catch (err) {
-    console.error('❌ Error parsing market data:', err);
+    console.error('❌ Parser Error:', err);
   }
 });
 

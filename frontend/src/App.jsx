@@ -56,8 +56,11 @@ function App() {
       }
     });
     // --- ADD THIS NEW LISTENER ---
-  socket.on('depthUpdate', (depth) => {
-    if (depth.symbol === activeSymbol) {
+    socket.on('depthUpdate', (depth) => {
+    // --- ADD THIS TEMPORARY DEBUG LINE ---
+    console.log("Socket received depth for:", depth.symbol);
+
+    if (depth.symbol.toUpperCase() === activeSymbol.toUpperCase()) {
       setOrderBook(depth);
     }
   });
