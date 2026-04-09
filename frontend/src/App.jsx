@@ -1,12 +1,13 @@
 import React, { useState, useEffect } from 'react';
 import io from 'socket.io-client';
-import { LayoutDashboard, List, CreditCard, Activity, Clock } from 'lucide-react';
+import { LayoutDashboard, List, CreditCard, Activity, Clock, TrendingUp } from 'lucide-react';
 import CandleChart from './components/CandleChart';
 import axios from 'axios';
 
 const socket = io('http://localhost:5000');
 
 function App() {
+  // --- 1. STATE HOOKS (Must be inside App and at the top) ---
   const [activeSymbol, setActiveSymbol] = useState('BTCUSDT');
   const [watchlist, setWatchlist] = useState({
     BTCUSDT: { price: '0', change: '0' },
@@ -17,9 +18,21 @@ function App() {
   const [history, setHistory] = useState([]);
   const [latestCandle, setLatestCandle] = useState(null);
   const [balance, setBalance] = useState(10000);
-  const [trades, setTrades] = useState([]); // Trade log state
+  const [trades, setTrades] = useState([]); 
+  const [positions, setPositions] = useState([]); // Tracks active buys for PnL
 
-  // 1. Fetch History on Switch
+  // --- 2. HELPER FUNCTIONS ---
+  const calculatePnL = (symbol) => {
+    // Find the most recent buy position for this symbol
+    const position = positions.find(p => p.symbol === symbol);
+    if (!position || watchlist[symbol].price === '0') return "0.00";
+    
+    const currentPrice = parseFloat(watchlist[symbol].price);
+    const pnl = (currentPrice - position.entryPrice) * position.quantity;
+    return pnl.toFixed(2);
+  };
+
+  // --- 3. EFFECTS ---
   useEffect(() => {
     const fetchHistory = async () => {
       try {
@@ -30,14 +43,12 @@ function App() {
     fetchHistory();
   }, [activeSymbol]);
 
-  // 2. Real-time Listeners
   useEffect(() => {
     socket.on('marketUpdate', (update) => {
       setWatchlist(prev => ({ ...prev, [update.symbol]: update }));
     });
 
     socket.on('candleUpdate', (candle) => {
-      // Only update the chart if the live candle matches our active tab
       if (candle.symbol === activeSymbol) {
         setLatestCandle(candle);
       }
@@ -46,43 +57,47 @@ function App() {
     return () => socket.off();
   }, [activeSymbol]);
 
-  // 3. Portfolio-Ready Trade Handler
-const handleTrade = async (type) => {
-  const price = watchlist[activeSymbol].price;
-  const quantity = 0.01; // You can link this to your input field
+  // --- 4. EVENT HANDLERS ---
+  const handleTrade = async (type) => {
+    const price = watchlist[activeSymbol].price;
+    const qtyInput = document.getElementById('tradeQty')?.value || 0.01;
+    const quantity = parseFloat(qtyInput);
 
-  try {
-    // 1. Tell the backend about the trade
-    await axios.post('http://localhost:5000/api/trade', {
-      symbol: activeSymbol,
-      type,
-      quantity,
-      price
-    });
+    try {
+      // Logic for local simulation
+      const newTrade = {
+        id: Date.now(),
+        symbol: activeSymbol,
+        type,
+        price,
+        time: new Date().toLocaleTimeString(),
+        status: 'Filled'
+      };
 
-    // 2. Update the UI locally for instant feedback
-    const newTrade = {
-      id: Date.now(),
-      symbol: activeSymbol,
-      type,
-      price,
-      time: new Date().toLocaleTimeString(),
-      status: 'Filled'
-    };
+      setTrades(prev => [newTrade, ...prev]);
+      
+      if (type === 'BUY') {
+        // Record position to calculate PnL
+        setPositions(prev => [{ symbol: activeSymbol, entryPrice: parseFloat(price), quantity }, ...prev]);
+        setBalance(prev => prev - (parseFloat(price) * quantity));
+      } else {
+        // Simple sell logic: remove position and add to balance
+        setBalance(prev => prev + (parseFloat(price) * quantity));
+        setPositions(prev => prev.filter(p => p.symbol !== activeSymbol));
+      }
 
-    setTrades(prev => [newTrade, ...prev]);
-    
-    // 3. Add to our active positions if it's a Buy
-    if (type === 'BUY') {
-      setPositions(prev => [...prev, { symbol: activeSymbol, entryPrice: parseFloat(price), quantity }]);
+      // Optional: Sync with backend
+      await axios.post('http://localhost:5000/api/trade', { symbol: activeSymbol, type, quantity, price });
+
+    } catch (err) {
+      console.error("Trade failed");
     }
-  } catch (err) {
-    alert("Trade failed - check backend console");
-  }
-};
+  };
 
+  // --- 5. RENDER UI ---
   return (
     <div className="flex h-screen bg-[#0b0e11] text-[#eaecef]">
+      {/* Sidebar */}
       <aside className="w-20 border-r border-gray-800 flex flex-col items-center py-6 gap-8 bg-[#161a1e]">
         <div className="text-yellow-500 font-bold text-2xl">N</div>
         <LayoutDashboard className="text-yellow-500 cursor-pointer" />
@@ -132,35 +147,52 @@ const handleTrade = async (type) => {
              </div>
           </div>
 
-          {/* Right Panel: Execution & Wallet */}
+          {/* Right Panel */}
           <div className="col-span-3 space-y-4">
+            {/* Wallet Card */}
             <div className="bg-[#161a1e] p-5 rounded-xl border border-gray-800">
                <div className="flex justify-between items-center mb-2">
                  <p className="text-gray-400 text-xs uppercase tracking-wider">Wallet Balance</p>
                  <CreditCard size={14} className="text-gray-500" />
                </div>
-               <h3 className="text-2xl font-mono text-green-400 font-bold">${balance.toLocaleString()}</h3>
+               <h3 className="text-2xl font-mono text-green-400 font-bold">${balance.toLocaleString(undefined, {minimumFractionDigits: 2})}</h3>
+            </div>
+
+            {/* PnL Card (Newly Integrated) */}
+            <div className="bg-[#161a1e] p-5 rounded-xl border border-gray-800">
+              <div className="flex justify-between items-center mb-2">
+                <p className="text-gray-400 text-xs uppercase tracking-wider">Open PnL</p>
+                <TrendingUp size={14} className="text-gray-500" />
+              </div>
+              <h3 className={`text-2xl font-mono font-bold ${parseFloat(calculatePnL(activeSymbol)) >= 0 ? 'text-green-500' : 'text-red-500'}`}>
+                {parseFloat(calculatePnL(activeSymbol)) >= 0 ? '+' : ''}${calculatePnL(activeSymbol)}
+              </h3>
+              <p className="text-[10px] text-gray-500 mt-1 uppercase">Active Symbol: {activeSymbol}</p>
             </div>
             
+            {/* Order Panel */}
             <div className="bg-[#161a1e] p-5 rounded-xl border border-gray-800 space-y-4">
               <h4 className="text-sm font-bold border-b border-gray-800 pb-2">Quick Order</h4>
-              <input type="number" placeholder="Quantity" className="w-full bg-[#0b0e11] border border-gray-700 p-3 rounded text-sm focus:border-yellow-500 outline-none transition-all" />
+              <input id="tradeQty" type="number" placeholder="Quantity" defaultValue="0.01" step="0.01" className="w-full bg-[#0b0e11] border border-gray-700 p-3 rounded text-sm focus:border-yellow-500 outline-none transition-all" />
               <div className="flex gap-2">
-                <button onClick={() => handleTrade('BUY')} className="flex-1 bg-green-600 hover:bg-green-500 py-3 rounded font-bold text-sm transition-colors">BUY</button>
-                <button onClick={() => handleTrade('SELL')} className="flex-1 bg-red-600 hover:bg-red-500 py-3 rounded font-bold text-sm transition-colors">SELL</button>
+                <button onClick={() => handleTrade('BUY')} className="flex-1 bg-green-600 hover:bg-green-500 py-3 rounded font-bold text-sm transition-colors text-white">BUY</button>
+                <button onClick={() => handleTrade('SELL')} className="flex-1 bg-red-600 hover:bg-red-500 py-3 rounded font-bold text-sm transition-colors text-white">SELL</button>
               </div>
             </div>
 
-            {/* Trade Log: The "Portfolio" Touch */}
+            {/* Trade Log */}
             <div className="bg-[#161a1e] p-5 rounded-xl border border-gray-800">
               <h4 className="text-sm font-bold mb-4 flex items-center gap-2"><Clock size={14}/> Recent Activity</h4>
-              <div className="space-y-3">
+              <div className="space-y-3 max-h-40 overflow-y-auto pr-2">
                 {trades.length === 0 ? (
                   <p className="text-xs text-gray-600 italic">No trades yet</p>
                 ) : trades.map(trade => (
                   <div key={trade.id} className="flex justify-between items-center text-xs border-b border-gray-800/50 pb-2">
                     <span className={trade.type === 'BUY' ? 'text-green-500' : 'text-red-500'}>{trade.type}</span>
-                    <span className="font-mono text-gray-300">${trade.price}</span>
+                    <div className="text-right">
+                      <p className="font-mono text-gray-300">${trade.price}</p>
+                      <p className="text-[10px] text-gray-500">{trade.time}</p>
+                    </div>
                   </div>
                 ))}
               </div>
@@ -171,29 +203,5 @@ const handleTrade = async (type) => {
     </div>
   );
 }
-// Inside your App component:
-const [positions, setPositions] = useState([
-  { symbol: 'BTCUSDT', entryPrice: 65000, quantity: 0.1 } // Dummy position for testing
-]);
-
-// 1. Create a function to calculate Profit/Loss
-const calculatePnL = (symbol) => {
-  const position = positions.find(p => p.symbol === symbol);
-  if (!position || !watchlist[symbol].price) return 0;
-  
-  const currentPrice = parseFloat(watchlist[symbol].price);
-  const pnl = (currentPrice - position.entryPrice) * position.quantity;
-  return pnl.toFixed(2);
-};
-
-// 2. Add a PnL Display in your UI (Inside the return)
-{/* Place this under your Wallet Balance card */}
-<div className="bg-[#161a1e] p-5 rounded-xl border border-gray-800">
-  <p className="text-gray-400 text-xs uppercase tracking-wider mb-2">Open PnL</p>
-  <h3 className={`text-2xl font-mono font-bold ${calculatePnL(activeSymbol) >= 0 ? 'text-green-500' : 'text-red-500'}`}>
-    {calculatePnL(activeSymbol) >= 0 ? '+' : ''}${calculatePnL(activeSymbol)}
-  </h3>
-  <p className="text-[10px] text-gray-500 mt-1">Based on {activeSymbol} live price</p>
-</div>
 
 export default App;
