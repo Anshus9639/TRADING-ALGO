@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import io from 'socket.io-client';
 import { LayoutDashboard, List, CreditCard, Activity, Clock, TrendingUp } from 'lucide-react';
 import CandleChart from './components/CandleChart';
+import OrderBook from './components/OrderBook';
 import axios from 'axios';
 
 const socket = io('http://localhost:5000');
@@ -20,6 +21,7 @@ function App() {
   const [balance, setBalance] = useState(10000);
   const [trades, setTrades] = useState([]); 
   const [positions, setPositions] = useState([]); // Tracks active buys for PnL
+  const [orderBook, setOrderBook] = useState(null);
 
   // --- 2. HELPER FUNCTIONS ---
   const calculatePnL = (symbol) => {
@@ -53,6 +55,12 @@ function App() {
         setLatestCandle(candle);
       }
     });
+    // --- ADD THIS NEW LISTENER ---
+  socket.on('depthUpdate', (depth) => {
+    if (depth.symbol === activeSymbol) {
+      setOrderBook(depth);
+    }
+  });
 
     return () => socket.off();
   }, [activeSymbol]);
@@ -162,16 +170,23 @@ function App() {
             <div className="bg-[#161a1e] p-5 rounded-xl border border-gray-800">
               <div className="flex justify-between items-center mb-2">
                 <p className="text-gray-400 text-xs uppercase tracking-wider">Open PnL</p>
-                <TrendingUp size={14} className="text-gray-500" />
-              </div>
-              <h3 className={`text-2xl font-mono font-bold ${parseFloat(calculatePnL(activeSymbol)) >= 0 ? 'text-green-500' : 'text-red-500'}`}>
-                {parseFloat(calculatePnL(activeSymbol)) >= 0 ? '+' : ''}${calculatePnL(activeSymbol)}
-              </h3>
-              <p className="text-[10px] text-gray-500 mt-1 uppercase">Active Symbol: {activeSymbol}</p>
-            </div>
+                  <TrendingUp size={14} className="text-gray-500" />
+                  </div>
+                  <h3 className={`text-2xl font-mono font-bold ${parseFloat(calculatePnL(activeSymbol)) >= 0 ? 'text-green-500' : 'text-red-500'}`}>
+                     {parseFloat(calculatePnL(activeSymbol)) >= 0 ? '+' : ''}${calculatePnL(activeSymbol)}
+                  </h3>
+               <p className="text-[10px] text-gray-500 mt-1 uppercase">Active Symbol: {activeSymbol}</p>
+             </div>
+
+              <div className="bg-[#161a1e] p-5 rounded-xl border border-gray-800 min-h-[300px]">
+               <h4 className="text-sm font-bold mb-4 flex items-center gap-2 uppercase tracking-wider text-gray-400">
+                  <Activity size={14} className="text-yellow-500" /> Market Depth
+               </h4>
+                 <OrderBook data={orderBook} />
+             </div>
             
-            {/* Order Panel */}
-            <div className="bg-[#161a1e] p-5 rounded-xl border border-gray-800 space-y-4">
+             {/* Order Panel */}
+             <div className="bg-[#161a1e] p-5 rounded-xl border border-gray-800 space-y-4">
               <h4 className="text-sm font-bold border-b border-gray-800 pb-2">Quick Order</h4>
               <input id="tradeQty" type="number" placeholder="Quantity" defaultValue="0.01" step="0.01" className="w-full bg-[#0b0e11] border border-gray-700 p-3 rounded text-sm focus:border-yellow-500 outline-none transition-all" />
               <div className="flex gap-2">

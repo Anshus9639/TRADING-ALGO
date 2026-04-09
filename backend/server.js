@@ -27,8 +27,9 @@ mongoose.connect(process.env.MONGO_URI)
 const symbols = ['btcusdt', 'ethusdt', 'solusdt', 'bnbusdt'];
 const tickerStreams = symbols.map(s => `${s}@ticker`).join('/');
 const klineStreams = symbols.map(s => `${s}@kline_1m`).join('/');
+const depthStreams = symbols.map(s => `${s}@depth5@100ms`).join('/'); // Top 5 bids/asks, updated every 100ms
 
-const binanceConn = new WebSocket(`wss://stream.binance.com:9443/ws/${tickerStreams}/${klineStreams}`);
+const binanceConn = new WebSocket(`wss://stream.binance.com:9443/ws/${tickerStreams}/${klineStreams}/${depthStreams}`);
 
 binanceConn.on('message', (data) => {
   try {
@@ -54,6 +55,19 @@ binanceConn.on('message', (data) => {
         low: parseFloat(candle.l),
         close: parseFloat(candle.c),
       });
+
+      // 3. Handle Depth Messages inside binanceConn.on('message'...)
+if (msg.e === 'depthUpdate' || !msg.e) { 
+  // Binance depth stream sometimes doesn't have an 'e' field if it's a top-level stream
+  // We'll simplify: if it has 'b' (bids) and 'a' (asks), it's depth data.
+  if (msg.b && msg.a) {
+    io.emit('depthUpdate', {
+      symbol: msg.s || 'BTCUSDT',
+      bids: msg.b.slice(0, 8), // Top 8 buy orders
+      asks: msg.a.slice(0, 8)  // Top 8 sell orders
+     });
+    }
+   }
     }
   } catch (err) {
     console.error('❌ Error parsing market data:', err);
