@@ -1,6 +1,7 @@
+import Auth from './components/Auth';
 import React, { useState, useEffect } from 'react';
 import io from 'socket.io-client';
-import { LayoutDashboard, List, CreditCard, Activity, Clock, TrendingUp } from 'lucide-react';
+import { LayoutDashboard, List, CreditCard, Activity, Clock, TrendingUp, LogOut } from 'lucide-react';
 import CandleChart from './components/CandleChart';
 import OrderBook from './components/OrderBook';
 import axios from 'axios';
@@ -8,6 +9,9 @@ import axios from 'axios';
 const socket = io('http://localhost:5000');
 
 function App() {
+  // --- NEW SESSION STATES ---
+  const [token, setToken] = useState(localStorage.getItem('token'));
+  const [user, setUser] = useState(null);
   // --- 1. STATE HOOKS (Must be inside App and at the top) ---
   const [activeSymbol, setActiveSymbol] = useState('BTCUSDT');
   const [watchlist, setWatchlist] = useState({
@@ -68,6 +72,12 @@ function App() {
     return () => socket.off();
   }, [activeSymbol]);
 
+  const handleLogout = () => {
+    localStorage.removeItem('token'); // Deletes the "ID Card" from the browser
+    setToken(null);                   // Resets the app so it shows the Login screen
+    setUser(null);
+  };
+
   // --- 4. EVENT HANDLERS ---
   const handleTrade = async (type) => {
     const price = watchlist[activeSymbol].price;
@@ -104,16 +114,40 @@ function App() {
       console.error("Trade failed");
     }
   };
+  if (!token) {
+    return (
+      <Auth 
+        onLogin={(userData) => {
+          setToken(localStorage.getItem('token'));
+          setUser(userData);
+          // Optional: set initial balance from user data
+          setBalance(userData.balance); 
+        }} 
+      />
+    );
+  }
 
   // --- 5. RENDER UI ---
   return (
     <div className="flex h-screen bg-[#0b0e11] text-[#eaecef]">
       {/* Sidebar */}
-      <aside className="w-20 border-r border-gray-800 flex flex-col items-center py-6 gap-8 bg-[#161a1e]">
-        <div className="text-yellow-500 font-bold text-2xl">N</div>
-        <LayoutDashboard className="text-yellow-500 cursor-pointer" />
-        <Activity className="text-gray-500 hover:text-white cursor-pointer" />
-      </aside>
+      <aside className="w-20 border-r border-gray-800 flex flex-col items-center py-6 bg-[#161a1e]">
+  {/* TOP ICONS: Wrapped in a div with flex-1 */}
+  <div className="flex-1 flex flex-col items-center gap-8">
+    <div className="text-yellow-500 font-bold text-2xl">N</div>
+    <LayoutDashboard className="text-yellow-500 cursor-pointer" />
+    <Activity className="text-gray-500 hover:text-white cursor-pointer" />
+  </div>
+
+  {/* BOTTOM ICON: Pushed down by mt-auto */}
+  <button 
+    onClick={handleLogout} 
+    className="mt-auto p-3 text-gray-500 hover:text-red-500 transition-colors"
+    title="Logout"
+  >
+    <LogOut size={24} />
+  </button>
+</aside>
 
       <main className="flex-1 p-4 space-y-4 overflow-y-auto">
         {/* Watchlist Row */}
