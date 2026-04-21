@@ -12,17 +12,17 @@ const Auth = ({ onLogin }) => {
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    
+
     // Determine which backend route to hit
     const endpoint = isLogin ? '/api/auth/login' : '/api/auth/signup';
-    
+
     try {
-      const res = await axios.post(`http://localhost:5000${endpoint}`, formData);
-      
+      const res = await axios.post(`https://trading-algo-nqud.onrender.com${endpoint}`, formData);
+
       if (isLogin) {
         // 1. Save the JWT token to the browser's storage
         localStorage.setItem('token', res.data.token);
-        
+
         // 2. Pass the user data back to App.jsx
         onLogin(res.data.user);
       } else {
@@ -53,7 +53,7 @@ const Auth = ({ onLogin }) => {
               type="text"
               placeholder="Username"
               className="w-full bg-[#0b0e11] border border-gray-700 p-3 rounded focus:border-yellow-500 outline-none text-white transition-all"
-              onChange={(e) => setFormData({...formData, username: e.target.value})}
+              onChange={(e) => setFormData({ ...formData, username: e.target.value })}
               required
             />
           )}
@@ -62,7 +62,7 @@ const Auth = ({ onLogin }) => {
             type="email"
             placeholder="Email Address"
             className="w-full bg-[#0b0e11] border border-gray-700 p-3 rounded focus:border-yellow-500 outline-none text-white transition-all"
-            onChange={(e) => setFormData({...formData, email: e.target.value})}
+            onChange={(e) => setFormData({ ...formData, email: e.target.value })}
             required
           />
 
@@ -70,7 +70,7 @@ const Auth = ({ onLogin }) => {
             type="password"
             placeholder="Password"
             className="w-full bg-[#0b0e11] border border-gray-700 p-3 rounded focus:border-yellow-500 outline-none text-white transition-all"
-            onChange={(e) => setFormData({...formData, password: e.target.value})}
+            onChange={(e) => setFormData({ ...formData, password: e.target.value })}
             required
           />
 
@@ -81,8 +81,8 @@ const Auth = ({ onLogin }) => {
 
         <div className="mt-8 pt-6 border-t border-gray-800 text-center">
           <p className="text-gray-500 text-sm">
-            {isLogin ? "New to the platform?" : "Already have credentials?"} 
-            <button 
+            {isLogin ? "New to the platform?" : "Already have credentials?"}
+            <button
               className="text-yellow-500 ml-2 hover:underline font-bold"
               onClick={() => setIsLogin(!isLogin)}
             >

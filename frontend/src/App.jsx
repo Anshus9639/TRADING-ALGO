@@ -9,7 +9,7 @@ import CandleChart from './components/CandleChart';
 import OrderBook from './components/OrderBook';
 import QuickOrder from './components/QuickOrder';
 
-const socket = io('http://localhost:5000');
+const socket = io('https://trading-algo-nqud.onrender.com');
 
 function App() {
   // --- SESSION STATES ---
@@ -54,7 +54,7 @@ function App() {
   useEffect(() => {
     const fetchHistory = async () => {
       try {
-        const res = await axios.get(`http://localhost:5000/api/history/${activeSymbol}`);
+        const res = await axios.get(`https://trading-algo-nqud.onrender.com/api/history/${activeSymbol}`);
         setHistory(res.data);
       } catch (err) { console.error("History fetch failed"); }
     };

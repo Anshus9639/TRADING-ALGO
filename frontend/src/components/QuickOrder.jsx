@@ -19,7 +19,7 @@ const QuickOrder = ({ activeSymbol, currentPrice, token, onTradeComplete }) => {
       const endpoint = type === 'BUY' ? '/api/trade/buy' : '/api/trade/sell';
       
       const res = await axios.post(
-        `http://localhost:5000${endpoint}`, 
+        `https://trading-algo-nqud.onrender.com${endpoint}`, 
         {
           symbol: activeSymbol,
           quantity: Number(quantity),
