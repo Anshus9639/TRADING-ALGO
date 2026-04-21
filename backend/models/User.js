@@ -27,6 +27,15 @@ const UserSchema = new mongoose.Schema({
       avgPrice: { type: Number, default: 0, min: 0 }
     }
   ],
+  pendingOrders: [
+    {
+      symbol: String,
+      type: { type: String, enum: ['BUY', 'SELL'] }, // Must be exactly 'BUY' or 'SELL'
+      quantity: Number,
+      limitPrice: Number,
+      timestamp: { type: Date, default: Date.now }
+    }
+  ],
   
   trades: [
     {

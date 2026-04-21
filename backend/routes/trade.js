@@ -120,5 +120,61 @@ router.post('/sell', auth, async (req, res) => {
     res.status(500).json({ success: false, message: `Server Error: ${err.message}` });
   }
 });
+router.post('/limit', auth, async (req, res) => {
+  try {
+    const { symbol, type, quantity, limitPrice } = req.body;
+    
+    const numQty = Number(quantity);
+    const numLimitPrice = Number(limitPrice);
+    const totalValue = numQty * numLimitPrice;
+
+    const user = await User.findById(req.user.id);
+    if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
+
+    // --- ESCROW LOGIC ---
+    if (type === 'BUY') {
+      // 1. Lock up USDT
+      if (user.balance < totalValue) {
+        return res.status(400).json({ success: false, message: 'Insufficient USDT for Limit Buy.' });
+      }
+      user.balance -= totalValue; // Deduct funds immediately
+    } 
+    else if (type === 'SELL') {
+      // 2. Lock up Crypto Asset
+      const assetIndex = user.portfolio.findIndex(p => p.symbol === symbol);
+      if (assetIndex === -1 || user.portfolio[assetIndex].quantity < numQty) {
+        return res.status(400).json({ success: false, message: `Insufficient ${symbol} for Limit Sell.` });
+      }
+      user.portfolio[assetIndex].quantity -= numQty; // Deduct crypto immediately
+    } 
+    else {
+      return res.status(400).json({ success: false, message: 'Invalid order type.' });
+    }
+
+    // --- PLACE IN QUEUE ---
+    const newLimitOrder = {
+      symbol,
+      type,
+      quantity: numQty,
+      limitPrice: numLimitPrice,
+      timestamp: new Date()
+    };
+    
+    user.pendingOrders.push(newLimitOrder);
+    await user.save();
+
+    res.json({ 
+      success: true, 
+      message: `${type} Limit Order Placed at $${numLimitPrice}`,
+      balance: user.balance, 
+      portfolio: user.portfolio,
+      pendingOrders: user.pendingOrders 
+    });
+
+  } catch (err) {
+    console.error("🔥 LIMIT ORDER ERROR:", err);
+    res.status(500).json({ success: false, message: `Server Error: ${err.message}` });
+  }
+});
 
 module.exports = router;
