@@ -75,7 +75,7 @@ binanceConn.on('message', (data) => {
     else if (msg.e === 'kline') {
       io.emit('candleUpdate', { 
         symbol: msg.s, 
-        time: msg.k.t / 1000, 
+        time: Math.floor(msg.k.t / 1000), 
         open: parseFloat(msg.k.o), 
         high: parseFloat(msg.k.h), 
         low: parseFloat(msg.k.l), 
@@ -114,7 +114,7 @@ app.get('/api/history/:symbol', async (req, res) => {
     );
 
     const formattedData = response.data.map(d => ({
-      time: d[0] / 1000,
+      time: Math.floor(d[0] / 1000),
       open: parseFloat(d[1]),
       high: parseFloat(d[2]),
       low: parseFloat(d[3]),
