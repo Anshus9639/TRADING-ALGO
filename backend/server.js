@@ -10,17 +10,25 @@ require('dotenv').config();
 const app = express();
 const server = http.createServer(app);
 
-// 1. FIXED SOCKET.IO CORS (The "Zero" Fix)
-const io = new Server(server, { 
-  cors: { 
-    origin: "https://trading-algo-oa9r.vercel.app/", // 🚀 SECURE VERCEL URL HERE (e.g., "https://your-site.vercel.app")
-    methods: ["GET", "POST"]
-  } 
-});
+// 🚀 THE FIX: Unified CORS rules (NO Trailing Slash!)
+const corsOptions = {
+  origin: [
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "https://trading-algo-oa9r.vercel.app" // Exact match, no slash at the end!
+  ],
+  methods: ["GET", "POST", "PUT", "DELETE"],
+  credentials: true 
+};
 
-// 2. FIXED EXPRESS CORS
-app.use(cors({ origin: "*" })); 
+// Apply to Express
+app.use(cors(corsOptions)); 
 app.use(express.json());
+
+// Apply to Socket.io
+const io = new Server(server, { 
+  cors: corsOptions 
+});
 
 // --- DATABASE ---
 mongoose.connect(process.env.MONGO_URI)
@@ -32,7 +40,6 @@ const SYMBOLS = ['btcusdt', 'ethusdt', 'solusdt', 'bnbusdt'];
 let binanceConn;
 
 const connectBinance = () => {
-  // Using 1m for live updates, but history will use 5m for "Regular" patterns
   const streams = [
     ...SYMBOLS.map(s => `${s.toLowerCase()}@ticker`),
     ...SYMBOLS.map(s => `${s.toLowerCase()}@kline_1m`),
@@ -82,7 +89,6 @@ app.use('/api/trade', require('./routes/trade'));
 app.get('/api/history/:symbol', async (req, res) => {
   try {
     const { symbol } = req.params;
-    // 🚀 Switch to 5m interval and 500 limit for "Pro" pattern shapes
     const response = await axios.get(
       `https://api.binance.us/api/v3/klines?symbol=${symbol.toUpperCase()}&interval=5m&limit=500`
     );
