@@ -7,108 +7,118 @@ const cors = require('cors');
 const axios = require('axios');
 require('dotenv').config();
 
-const User = require('./models/User'); 
+// --- CONFIGURATION ---
+const PORT = process.env.PORT || 5000;
+const BINANCE_WS_URL = "wss://stream.binance.us:9443/stream?streams=";
+const SYMBOLS = ['btcusdt', 'ethusdt', 'solusdt', 'bnbusdt'];
 
-// --- INITIALIZE EXPRESS & SOCKET.IO ---
 const app = express();
 const server = http.createServer(app);
+
+// Optimized CORS for production
 const io = new Server(server, { 
   cors: { 
-    origin: "*", // Allows your Vercel frontend to connect
+    origin: ["http://localhost:3000", "https://your-vercel-link.vercel.app"], // Add your actual Vercel link here
     methods: ["GET", "POST"]
-  } 
+  },
+  pingTimeout: 60000, // Pro: Keeps socket connections alive longer
 });
 
 // --- MIDDLEWARE ---
 app.use(cors());
 app.use(express.json());
 
-// --- API ROUTES ---
-app.use('/api/auth', require('./routes/auth'));
-app.use('/api/trade', require('./routes/trade'));
-
-// --- DATABASE CONNECTION ---
+// --- DATABASE ---
 mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log('✅ MongoDB Connected'))
   .catch(err => console.error('❌ DB Error:', err));
 
-// --- MULTI-STREAM MARKET DATA BRIDGE (BINANCE) ---
-const symbols = ['btcusdt', 'ethusdt', 'solusdt', 'bnbusdt'];
+// --- BINANCE WEBSOCKET BRIDGE (Self-Healing) ---
+let binanceConn;
+let reconnectAttempts = 0;
 
-const tickerStreams = symbols.map(s => `${s.toLowerCase()}@ticker`).join('/');
-const klineStreams = symbols.map(s => `${s.toLowerCase()}@kline_1m`).join('/');
-const depthStreams = symbols.map(s => `${s.toLowerCase()}@depth5`).join('/'); 
+const connectBinance = () => {
+  const streams = [
+    ...SYMBOLS.map(s => `${s.toLowerCase()}@ticker`),
+    ...SYMBOLS.map(s => `${s.toLowerCase()}@kline_1m`),
+    ...SYMBOLS.map(s => `${s.toLowerCase()}@depth5`)
+  ].join('/');
 
-// 🚀 FIX: Switched to binance.us to avoid regional blocks on Render
-const binanceUrl = `wss://stream.binance.us:9443/stream?streams=${tickerStreams}/${klineStreams}/${depthStreams}`;
-const binanceConn = new WebSocket(binanceUrl);
+  console.log("🔗 Initializing Binance Bridge...");
+  binanceConn = new WebSocket(`${BINANCE_WS_URL}${streams}`);
 
-console.log("🔗 Connecting to Binance Websocket..."); 
+  binanceConn.on('open', () => {
+    console.log("🚀 Binance WebSocket Connected");
+    reconnectAttempts = 0; // Reset on successful connection
+  });
 
-// 🚀 CRITICAL FIX: The Safety Net
-// This prevents the "Exit Status 1" crash if Binance rejects the connection
-binanceConn.on('error', (err) => {
-  console.error("⚠️ BINANCE WS ERROR:", err.message);
-  console.log("Server will stay running, but live prices may be unavailable.");
-});
+  binanceConn.on('message', (data) => {
+    try {
+      const rawData = JSON.parse(data);
+      const streamName = rawData.stream || "";
+      const msg = rawData.data || rawData;
 
-binanceConn.on('close', () => {
-  console.log("🔌 Binance Connection Closed.");
-});
+      // 1. Optimized Tickers
+      if (msg.e === '24hrTicker') {
+        io.emit('marketUpdate', { 
+          symbol: msg.s, 
+          price: parseFloat(msg.c).toFixed(2), 
+          change: msg.P 
+        });
+      }
 
-binanceConn.on('message', (data) => {
-  try {
-    const rawData = JSON.parse(data);
-    const streamName = rawData.stream || "";
-    const msg = rawData.data || rawData;
+      // 2. High-Precision Klines
+      else if (msg.e === 'kline') {
+        io.emit('candleUpdate', { 
+          symbol: msg.s, 
+          time: Math.floor(msg.k.t / 1000), 
+          open: parseFloat(msg.k.o), 
+          high: parseFloat(msg.k.h), 
+          low: parseFloat(msg.k.l), 
+          close: parseFloat(msg.k.c),
+          volume: parseFloat(msg.k.v) // Added volume for advanced charting
+        });
+      }
 
-    // 1. Tickers (Watchlist Updates)
-    if (msg.e === '24hrTicker') {
-      io.emit('marketUpdate', { 
-        symbol: msg.s, 
-        price: parseFloat(msg.c).toFixed(2), 
-        change: msg.P 
-      });
+      // 3. Order Book Depth
+      else if (msg.b || msg.bids || streamName.includes('depth')) {
+        const bids = msg.b || msg.bids || [];
+        const asks = msg.a || msg.asks || [];
+        const symbol = (msg.s || streamName.split('@')[0] || 'BTCUSDT').toUpperCase();
+
+        io.emit('depthUpdate', {
+          symbol,
+          bids: bids.slice(0, 10), // Increased depth slightly for better patterns
+          asks: asks.slice(0, 10)
+        });
+      }
+    } catch (err) {
+      // Quiet parser error to avoid log spam
     }
+  });
 
-    // 2. Klines (Live Candlestick Updates)
-    else if (msg.e === 'kline') {
-      io.emit('candleUpdate', { 
-        symbol: msg.s, 
-        time: Math.floor(msg.k.t / 1000), 
-        open: parseFloat(msg.k.o), 
-        high: parseFloat(msg.k.h), 
-        low: parseFloat(msg.k.l), 
-        close: parseFloat(msg.k.c) 
-      });
-    }
+  binanceConn.on('error', (err) => {
+    console.error("⚠️ Binance WS Error:", err.message);
+  });
 
-    // 3. Order Book Depth
-    else if (msg.b || msg.bids || streamName.includes('depth')) {
-      const bids = msg.b || msg.bids || [];
-      const asks = msg.a || msg.asks || [];
-      const symbol = (msg.s || streamName.split('@')[0] || 'BTCUSDT').toUpperCase();
+  binanceConn.on('close', () => {
+    const delay = Math.min(1000 * (2 ** reconnectAttempts), 30000); // Exponential backoff
+    console.log(`🔌 Connection closed. Retrying in ${delay/1000}s...`);
+    setTimeout(connectBinance, delay);
+    reconnectAttempts++;
+  });
+};
 
-      io.emit('depthUpdate', {
-        symbol: symbol,
-        bids: bids.slice(0, 8),
-        asks: asks.slice(0, 8)
-      });
-    }
-  } catch (err) {
-    console.error('❌ Parser Error:', err);
-  }
-});
+connectBinance();
 
-// --- HELPER ROUTES ---
+// --- ROUTES ---
+app.use('/api/auth', require('./routes/auth'));
+app.use('/api/trade', require('./routes/trade'));
 
-// Health Check for Render
-app.get('/', (req, res) => res.send('NexusTrade API is Live and Running...'));
-
-// Historical Data for Chart Initialization
 app.get('/api/history/:symbol', async (req, res) => {
   try {
     const { symbol } = req.params;
+    // 🚀 ADVANCED: Increased limit to 500 for better pattern detection
     const response = await axios.get(
       `https://api.binance.us/api/v3/klines?symbol=${symbol.toUpperCase()}&interval=1m&limit=500`
     );
@@ -123,20 +133,16 @@ app.get('/api/history/:symbol', async (req, res) => {
 
     res.json(formattedData);
   } catch (err) {
-    console.error("History fetch error:", err.message);
     res.status(500).json({ error: "Failed to fetch history" });
   }
 });
 
-// Socket Connection Handler
-io.on('connection', (socket) => {
-  console.log('✅ Socket Client connected:', socket.id);
-  socket.on('disconnect', () => console.log('❌ Socket Client disconnected'));
+app.get('/', (req, res) => res.send('NexusTrade API v2 Live'));
+
+// --- SERVER SAFETY NETS ---
+// 🚀 Pro: Prevents the server from crashing on unhandled promise rejections
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
 });
 
-// --- START SERVER ---
-// 🚀 Render uses process.env.PORT automatically
-const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`🚀 Terminal running on port ${PORT}`));
