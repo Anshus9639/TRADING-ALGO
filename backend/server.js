@@ -110,7 +110,7 @@ app.get('/api/history/:symbol', async (req, res) => {
   try {
     const { symbol } = req.params;
     const response = await axios.get(
-      `https://api.binance.us/api/v3/klines?symbol=${symbol.toUpperCase()}&interval=1m&limit=100`
+      `https://api.binance.us/api/v3/klines?symbol=${symbol.toUpperCase()}&interval=1m&limit=500`
     );
 
     const formattedData = response.data.map(d => ({
