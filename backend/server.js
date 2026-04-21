@@ -67,7 +67,9 @@ const connectBinance = () => {
         });
       }
       else if (msg.b || msg.bids) {
-        const symbol = (msg.s || 'BTCUSDT').toUpperCase();
+        const streamName = rawData.stream || "";
+        const symbol = (msg.s || streamName.split('@')[0] || 'BTCUSDT').toUpperCase();
+        
         io.emit('depthUpdate', { symbol, bids: (msg.b || msg.bids).slice(0, 8), asks: (msg.a || msg.asks).slice(0, 8) });
       }
     } catch (e) {}
