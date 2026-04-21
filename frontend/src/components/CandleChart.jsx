@@ -38,12 +38,17 @@ const CandleChart = ({ initialData, candleData, symbol = "BTC/USDT" }) => {
       rightPriceScale: {
         borderColor: 'rgba(197, 203, 206, 0.2)',
         autoScale: true,
+        // 🚀 THE FLAT LINE FIX: Prevents chart from crushing candles against the floor
+        scaleMargins: {
+          top: 0.1,    // 10% breathing room at the top
+          bottom: 0.1, // 10% breathing room at the bottom
+        },
       },
       timeScale: {
         borderColor: 'rgba(197, 203, 206, 0.2)',
         timeVisible: true,
         secondsVisible: false,
-        barSpacing: 20, // 🚀 Keeps candles thick
+        barSpacing: 20, 
         minBarSpacing: 5,
       },
       watermark: {
@@ -60,16 +65,16 @@ const CandleChart = ({ initialData, candleData, symbol = "BTC/USDT" }) => {
 
     // 2. Add Candlestick Series
     const candleSeries = chart.addCandlestickSeries({
-  upColor: '#26a69a',
-  downColor: '#ef5350',
-  borderVisible: true,      // 🚀 TURN THIS ON
-  wickVisible: true,
-  borderColor: '#378658',   // Solid border for green
-  borderUpColor: '#26a69a',
-  borderDownColor: '#ef5350',
-  wickUpColor: '#26a69a',
-  wickDownColor: '#ef5350',
-});
+      upColor: '#26a69a',
+      downColor: '#ef5350',
+      borderVisible: true,      
+      wickVisible: true,
+      borderColor: '#378658',   
+      borderUpColor: '#26a69a',
+      borderDownColor: '#ef5350',
+      wickUpColor: '#26a69a',
+      wickDownColor: '#ef5350',
+    });
 
     // 3. Add SMA Line (Moving Average)
     const smaSeries = chart.addLineSeries({
@@ -94,19 +99,30 @@ const CandleChart = ({ initialData, candleData, symbol = "BTC/USDT" }) => {
     };
   }, []);
 
-  // 4. Load History & Calculate Indicators
+  // 4. Load History & Calculate Indicators (WITH THE SCRUBBER FIX)
   useEffect(() => {
     if (initialData && initialData.length > 0 && candleSeriesRef.current) {
-      // Ensure data is sorted for indicator calculation
-      const sortedData = [...initialData].sort((a, b) => a.time - b.time);
       
-      candleSeriesRef.current.setData(sortedData);
+      // 🚀 THE DATA SCRUBBER: Fixes misaligned bars and weird overlapping gaps
+      const uniqueDataMap = new Map();
       
-      // Calculate and set SMA
-      const smaData = calculateSMA(sortedData, 20);
+      initialData.forEach(item => {
+        // Only keep data if the price is > 0 (A single $0 glitch ruins the whole chart zoom)
+        if (item.close > 0) { 
+          uniqueDataMap.set(item.time, item);
+        }
+      });
+      
+      // Convert back to array and force a strict chronological sort
+      const sortedCleanData = Array.from(uniqueDataMap.values()).sort((a, b) => a.time - b.time);
+      
+      candleSeriesRef.current.setData(sortedCleanData);
+      
+      // Calculate and set SMA using the CLEAN data
+      const smaData = calculateSMA(sortedCleanData, 20);
       smaSeriesRef.current.setData(smaData);
 
-      // Auto-scroll to the latest candle without squishing
+      // Auto-scroll to the latest candle
       chartRef.current.timeScale().scrollToPosition(0, false);
     }
   }, [initialData]);
@@ -114,8 +130,10 @@ const CandleChart = ({ initialData, candleData, symbol = "BTC/USDT" }) => {
   // 5. Update Live Data
   useEffect(() => {
     if (candleData && candleSeriesRef.current) {
-      candleSeriesRef.current.update(candleData);
-      // Optional: Logic to update SMA live can be added here
+      // Safety check: Only update if the live price is valid
+      if (candleData.close > 0) {
+        candleSeriesRef.current.update(candleData);
+      }
     }
   }, [candleData]);
 

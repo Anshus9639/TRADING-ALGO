@@ -88,11 +88,14 @@ app.use('/api/auth', require('./routes/auth'));
 app.use('/api/trade', require('./routes/trade'));
 
 // 3. FIXED HISTORY (The "Pattern" Fix)
-app.get('/api/history/:symbol', async (req, res) => {
+ app.get('/api/history/:symbol', async (req, res) => {
   try {
     const { symbol } = req.params;
+    // 🚀 Look for the interval in the URL query, default to 1m
+    const interval = req.query.interval || '1m'; 
+    
     const response = await axios.get(
-      `https://api.binance.us/api/v3/klines?symbol=${symbol.toUpperCase()}&interval=5m&limit=500`
+      `https://api.binance.us/api/v3/klines?symbol=${symbol.toUpperCase()}&interval=${interval}&limit=500`
     );
 
     const formattedData = response.data.map(d => ({
