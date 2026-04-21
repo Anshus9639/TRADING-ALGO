@@ -1,32 +1,53 @@
 const router = require('express').Router();
-const User = require('../models/User'); // Makes sure this path points to your User model
+const User = require('../models/User'); 
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const auth = require('../middleware/auth'); // 🚀 Make sure this file exists!
+
+// @route    GET api/auth/me
+// @desc     Get current user data (The "Refresh Fix")
+// @access   Private
+router.get('/me', auth, async (req, res) => {
+  try {
+    // 🚀 We find the user and "populate" their trades so history shows up on refresh
+    const user = await User.findById(req.user.id).select('-password');
+    
+    if (!user) return res.status(404).json({ msg: "User not found" });
+
+    res.json({
+      id: user._id,
+      username: user.username,
+      email: user.email,
+      balance: user.balance,
+      portfolio: user.portfolio || [],
+      trades: user.trades || []
+    });
+  } catch (err) {
+    console.error("Auth Me Error:", err.message);
+    res.status(500).send("Server Error");
+  }
+});
 
 // SIGNUP: Register a new user
 router.post('/signup', async (req, res) => {
   try {
     const { username, email, password } = req.body;
 
-    // 1. Validation
     if (!username || !email || !password) {
       return res.status(400).json({ msg: "Please enter all fields" });
     }
 
-    // 2. Check if user already exists
     const existingUser = await User.findOne({ email });
     if (existingUser) return res.status(400).json({ msg: "A user with this email already exists." });
 
-    // 3. Hash the password (Security)
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
 
-    // 4. Create the User in MongoDB
     const newUser = new User({
       username,
       email,
       password: hashedPassword,
-      balance: 10000 // Starting balance from your schema
+      balance: 10000 
     });
 
     await newUser.save();
@@ -42,19 +63,16 @@ router.post('/signup', async (req, res) => {
 router.post('/login', async (req, res) => {
   try {
     const { email, password } = req.body;
-    
-    // 1. Find user by email
-    const user = await User.findOne({ email });
+
+    const user = await User.findOne({ email }).populate('trades');
     if (!user) return res.status(400).json({ msg: "No account found with this email." });
 
-    // 2. Compare passwords
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) return res.status(400).json({ msg: "Invalid password." });
 
-    // 3. Create the JWT Token (Your "ID Card")
     const token = jwt.sign(
-      { id: user._id }, 
-      process.env.JWT_SECRET || 'NexusTrade_Secret_Key', 
+      { user: { id: user._id } }, // 🚀 Matches the standard middleware format
+      process.env.JWT_SECRET || 'NexusTrade_Secret_Key',
       { expiresIn: '24h' }
     );
 
@@ -63,11 +81,14 @@ router.post('/login', async (req, res) => {
       user: {
         id: user._id,
         username: user.username,
-        balance: user.balance
+        balance: user.balance,
+        portfolio: user.portfolio || [],
+        trades: user.trades || []
       }
     });
 
   } catch (err) {
+    console.error("Login Error:", err);
     res.status(500).json({ msg: "Server error during login" });
   }
 });

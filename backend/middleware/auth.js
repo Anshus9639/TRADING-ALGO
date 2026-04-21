@@ -1,17 +1,20 @@
 const jwt = require('jsonwebtoken');
 
-module.exports = (req, res, next) => {
-  // 1. We changed this line to look for 'x-auth-token' to perfectly match your React frontend
+module.exports = function (req, res, next) {
+  // Get token from header
   const token = req.header('x-auth-token');
-  
-  if (!token) return res.status(401).json({ message: 'Access Denied' });
 
+  // Check if no token
+  if (!token) {
+    return res.status(401).json({ msg: 'No token, authorization denied' });
+  }
+
+  // Verify token
   try {
-    // 2. We added the fallback secret here just in case your .env file isn't loading perfectly
-    const verified = jwt.verify(token, process.env.JWT_SECRET || 'NexusTrade_Secret_Key');
-    req.user = verified;
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'NexusTrade_Secret_Key');
+    req.user = decoded.user; // 🚀 This must match the way you signed the token
     next();
   } catch (err) {
-    res.status(400).json({ message: 'Invalid Token' });
+    res.status(401).json({ msg: 'Token is not valid' });
   }
 };

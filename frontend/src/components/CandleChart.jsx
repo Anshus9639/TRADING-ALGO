@@ -6,36 +6,38 @@ const CandleChart = ({ initialData, candleData }) => {
   const chartRef = useRef();
   const candleSeriesRef = useRef();
 
-  // 1. Initialize Chart (Runs once on mount)
+  // 1. Initialize Chart
   useEffect(() => {
     if (!chartContainerRef.current) return;
 
-    // Create the chart with a Pro Dark Theme
     const chart = createChart(chartContainerRef.current, {
       layout: {
-        background: { color: '#161a1e' }, // Matches your UI
+        background: { color: '#161a1e' },
         textColor: '#d1d4dc',
       },
       grid: {
-        vertLines: { color: 'rgba(42, 46, 57, 0.5)' },
-        horzLines: { color: 'rgba(42, 46, 57, 0.5)' },
+        vertLines: { color: 'rgba(42, 46, 57, 0.1)' },
+        horzLines: { color: 'rgba(42, 46, 57, 0.1)' },
       },
       crosshair: {
         mode: CrosshairMode.Normal,
       },
       rightPriceScale: {
         borderColor: 'rgba(197, 203, 206, 0.8)',
+        autoScale: true, // 🚀 Fixes the "Flat" look by auto-adjusting height
       },
       timeScale: {
         borderColor: 'rgba(197, 203, 206, 0.8)',
         timeVisible: true,
         secondsVisible: false,
+        barSpacing: 12, // 🚀 Makes candles thicker and easier to read
+        minBarSpacing: 5,
+        shiftVisibleRangeOnNewBar: true, // Keeps chart at the live edge
       },
       width: chartContainerRef.current.clientWidth,
       height: 450,
     });
 
-    // Add Candlestick Series
     const candleSeries = chart.addCandlestickSeries({
       upColor: '#26a69a',
       downColor: '#ef5350',
@@ -47,7 +49,6 @@ const CandleChart = ({ initialData, candleData }) => {
     chartRef.current = chart;
     candleSeriesRef.current = candleSeries;
 
-    // Handle Window Resize
     const handleResize = () => {
       chart.applyOptions({ width: chartContainerRef.current.clientWidth });
     };
@@ -59,15 +60,19 @@ const CandleChart = ({ initialData, candleData }) => {
     };
   }, []);
 
-  // 2. Load Historical Data (Runs when you switch assets or load page)
+  // 2. Load Historical Data
   useEffect(() => {
     if (initialData && initialData.length > 0 && candleSeriesRef.current) {
-      candleSeriesRef.current.setData(initialData);
-      chartRef.current.timeScale().fitContent(); // Auto-zoom to show all data
+      // Sort data by time just in case it arrived out of order
+      const sortedData = [...initialData].sort((a, b) => a.time - b.time);
+      candleSeriesRef.current.setData(sortedData);
+      
+      // 🚀 Instead of fitContent (which squishes), we zoom to the end
+      chartRef.current.timeScale().scrollToPosition(0, false); 
     }
   }, [initialData]);
 
-  // 3. Handle Live Ticks (Runs every time a new price comes from Socket.io)
+  // 3. Handle Live Ticks
   useEffect(() => {
     if (candleData && candleSeriesRef.current) {
       candleSeriesRef.current.update(candleData);
@@ -75,7 +80,7 @@ const CandleChart = ({ initialData, candleData }) => {
   }, [candleData]);
 
   return (
-    <div className="relative w-full h-full">
+    <div className="w-full h-[450px]">
       <div ref={chartContainerRef} className="w-full h-full" />
     </div>
   );
