@@ -43,8 +43,8 @@ const CandleChart = ({ initialData, candleData, symbol = "BTC/USDT" }) => {
         borderColor: 'rgba(197, 203, 206, 0.2)',
         timeVisible: true,
         secondsVisible: false,
-        barSpacing: 10, // 🚀 Keeps candles thick
-        minBarSpacing: 4,
+        barSpacing: 20, // 🚀 Keeps candles thick
+        minBarSpacing: 5,
       },
       watermark: {
         color: 'rgba(255, 255, 255, 0.03)',
@@ -60,13 +60,16 @@ const CandleChart = ({ initialData, candleData, symbol = "BTC/USDT" }) => {
 
     // 2. Add Candlestick Series
     const candleSeries = chart.addCandlestickSeries({
-      upColor: '#26a69a',
-      downColor: '#ef5350',
-      borderVisible: false,
-      wickUpColor: '#26a69a',
-      wickDownColor: '#ef5350',
-      priceLineVisible: true, // 🚀 Line at current price
-    });
+  upColor: '#26a69a',
+  downColor: '#ef5350',
+  borderVisible: true,      // 🚀 TURN THIS ON
+  wickVisible: true,
+  borderColor: '#378658',   // Solid border for green
+  borderUpColor: '#26a69a',
+  borderDownColor: '#ef5350',
+  wickUpColor: '#26a69a',
+  wickDownColor: '#ef5350',
+});
 
     // 3. Add SMA Line (Moving Average)
     const smaSeries = chart.addLineSeries({
