@@ -7,6 +7,8 @@ const cors = require('cors');
 const axios = require('axios');
 require('dotenv').config();
 
+const User = require('./models/User');
+
 const app = express();
 const server = http.createServer(app);
 
