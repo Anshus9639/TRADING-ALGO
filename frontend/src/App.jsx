@@ -103,10 +103,25 @@ function App() {
   // --- 3. HELPER FUNCTIONS ---
   const calculatePnL = () => {
     const position = positions.find(p => p.symbol === activeSymbol);
-    if (!position || watchlist[activeSymbol].price === '0') return "0.00";
+    if (!position) return "0.00";
 
-    const currentPrice = parseFloat(watchlist[activeSymbol].price);
-    const pnl = (currentPrice - position.avgPrice) * position.quantity;
+    // 1. Default to the standard ticker price
+    let livePrice = parseFloat(watchlist[activeSymbol]?.price || 0);
+
+    // 2. 🚀 THE REAL-TIME FIX: Mark-to-Market using the Order Book!
+    // The Order Book updates milliseconds faster than the actual traded price.
+    if (orderBook && orderBook.symbol === activeSymbol && orderBook.bids && orderBook.bids.length > 0) {
+      livePrice = parseFloat(orderBook.bids[0][0]); 
+    } 
+    // 3. Fallback to the live candle close if order book is syncing
+    else if (latestCandle && latestCandle.symbol === activeSymbol) {
+      livePrice = latestCandle.close;
+    }
+
+    if (livePrice === 0) return "0.00";
+
+    // Calculate real-time profit
+    const pnl = (livePrice - position.avgPrice) * position.quantity;
     return pnl.toFixed(2);
   };
 
