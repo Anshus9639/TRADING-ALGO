@@ -2,96 +2,122 @@ const router = require('express').Router();
 const User = require('../models/User');
 const auth = require('../middleware/auth');
 
-// --- BUY ROUTE ---
+// --- STRICT BUY ROUTE ---
 router.post('/buy', auth, async (req, res) => {
-  console.log("🚨 1. BUY ROUTE STARTED!"); 
-  
   try {
     const { symbol, quantity, price } = req.body;
-    console.log(`📦 2. Data Received: ${quantity} ${symbol} at $${price}`);
-
-    console.log(`🔍 3. Looking for user ID: ${req.user?.id}`);
-    const user = await User.findById(req.user.id);
     
+    // Strict casting to prevent JavaScript string math bugs
+    const numQty = Number(quantity);
+    const numPrice = Number(price);
+    const totalCost = numQty * numPrice;
+
+    const user = await User.findById(req.user.id);
     if (!user) {
-      console.log("❌ 4. USER NOT FOUND IN DB");
-      return res.status(404).json({ message: 'User not found in database.' });
+      return res.status(404).json({ success: false, message: 'User not found in database.' });
     }
-    console.log(`✅ 4. User found! Wallet Balance: $${user.balance}`);
 
-    const totalCost = Number(quantity) * Number(price);
+    // 1. STRICT MARGIN CHECK
     if (user.balance < totalCost) {
-      console.log("❌ 5. INSUFFICIENT BALANCE");
-      return res.status(400).json({ message: 'Insufficient Balance.' });
+      return res.status(400).json({ success: false, message: 'Insufficient USDT Balance.' });
     }
 
-    console.log("💾 6. Updating numbers and saving to database...");
+    // 2. Deduct Balance
     user.balance -= totalCost;
 
+    // 3. Update Portfolio & Average Entry Price (AEP)
     const assetIndex = user.portfolio.findIndex(p => p.symbol === symbol);
+    
     if (assetIndex > -1) {
+      // Asset exists: Calculate new Average Entry Price (AEP)
       const oldQty = user.portfolio[assetIndex].quantity;
       const oldAvg = user.portfolio[assetIndex].avgPrice || 0;
-      const newQty = oldQty + Number(quantity);
+      const newQty = oldQty + numQty;
+      
+      // AEP Formula: ((OldQty * OldPrice) + (NewQty * NewPrice)) / TotalQty
       user.portfolio[assetIndex].avgPrice = ((oldQty * oldAvg) + totalCost) / newQty;
       user.portfolio[assetIndex].quantity = newQty;
     } else {
-      user.portfolio.push({ symbol, quantity: Number(quantity), avgPrice: Number(price) });
+      // New Asset
+      user.portfolio.push({ symbol, quantity: numQty, avgPrice: numPrice });
     }
 
-    user.trades.push({ symbol, type: 'BUY', quantity: Number(quantity), price: Number(price) });
+    // 4. Log the Transaction
+    const newTrade = { symbol, type: 'BUY', quantity: numQty, price: numPrice, timestamp: new Date() };
+    user.trades.push(newTrade);
     
     await user.save();
-    console.log("🎉 7. TRADE SAVED SUCCESSFULLY!");
 
+    // 5. Send synchronized data back to frontend
     res.json({ 
       success: true, 
+      message: 'Trade Executed Successfully',
       balance: user.balance, 
       portfolio: user.portfolio,
       newTrade: user.trades[user.trades.length - 1] 
     });
 
   } catch (err) {
-    console.error("🔥 CRASH ERROR:", err);
-    res.status(500).json({ message: `DB Crash: ${err.message}` });
+    console.error("🔥 BUY ERROR:", err);
+    res.status(500).json({ success: false, message: `Server Error: ${err.message}` });
   }
 });
 
-// --- SELL ROUTE ---
+// --- STRICT SELL ROUTE ---
 router.post('/sell', auth, async (req, res) => {
   try {
     const { symbol, quantity, price } = req.body;
-    const totalRevenue = Number(quantity) * Number(price);
+    
+    const numQty = Number(quantity);
+    const numPrice = Number(price);
+    const totalRevenue = numQty * numPrice;
 
     const user = await User.findById(req.user.id);
-    if (!user) return res.status(404).json({ message: 'User not found in database.' });
-
-    const assetIndex = user.portfolio.findIndex(p => p.symbol === symbol);
-
-    // Check Crypto Balance
-    if (assetIndex === -1 || user.portfolio[assetIndex].quantity < Number(quantity)) {
-      return res.status(400).json({ message: 'Insufficient Crypto Balance.' });
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found in database.' });
     }
 
-    // Add Balance & Deduct Crypto
-    user.balance += totalRevenue;
-    user.portfolio[assetIndex].quantity -= Number(quantity);
+    // 1. Check Crypto Balance Exists
+    const assetIndex = user.portfolio.findIndex(p => p.symbol === symbol);
+    if (assetIndex === -1) {
+      return res.status(400).json({ success: false, message: `You do not own any ${symbol}.` });
+    }
 
-    // Log Trade
-    user.trades.push({ symbol, type: 'SELL', quantity: Number(quantity), price: Number(price) });
+    const currentPos = user.portfolio[assetIndex];
+
+    // 2. STRICT ASSET CHECK
+    if (currentPos.quantity < numQty) {
+      return res.status(400).json({ success: false, message: 'Insufficient Crypto Balance.' });
+    }
+
+    // 3. Add to Wallet Balance & Deduct Crypto
+    user.balance += totalRevenue;
+    currentPos.quantity -= numQty;
+
+    // 4. FLOATING-POINT CLEANUP (The "Dust" Fix)
+    // If you sell 0.3 of 0.3, JS might leave 0.00000000004. This deletes the empty asset.
+    if (currentPos.quantity <= 0.00001) {
+      user.portfolio.splice(assetIndex, 1);
+    }
+
+    // 5. Log the Transaction
+    const newTrade = { symbol, type: 'SELL', quantity: numQty, price: numPrice, timestamp: new Date() };
+    user.trades.push(newTrade);
     
     await user.save();
 
+    // 6. Send synchronized data back to frontend
     res.json({ 
       success: true, 
+      message: 'Trade Executed Successfully',
       balance: user.balance, 
       portfolio: user.portfolio,
       newTrade: user.trades[user.trades.length - 1] 
     });
 
   } catch (err) {
-    console.error("SELL ERROR:", err);
-    res.status(500).json({ message: `DB Crash: ${err.message}` });
+    console.error("🔥 SELL ERROR:", err);
+    res.status(500).json({ success: false, message: `Server Error: ${err.message}` });
   }
 });
 
