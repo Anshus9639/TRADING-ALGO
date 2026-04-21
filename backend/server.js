@@ -37,6 +37,7 @@ mongoose.connect(process.env.MONGO_URI)
 
 // --- BINANCE WS BRIDGE (SELF-HEALING) ---
 const SYMBOLS = ['btcusdt', 'ethusdt', 'solusdt', 'bnbusdt'];
+const livePrices = {};
 let binanceConn;
 
 const connectBinance = () => {
@@ -54,6 +55,8 @@ const connectBinance = () => {
       const msg = rawData.data || rawData;
 
       if (msg.e === '24hrTicker') {
+        const currentPrice = parseFloat(msg.c);
+        livePrices[msg.s] = currentPrice;
         io.emit('marketUpdate', { symbol: msg.s, price: parseFloat(msg.c).toFixed(2), change: msg.P });
       } 
       else if (msg.e === 'kline') {
@@ -82,6 +85,83 @@ const connectBinance = () => {
   });
 };
 connectBinance();
+
+setInterval(async () => {
+  try {
+    // 1. Find all users who have at least one pending order
+    const usersWithOrders = await User.find({ 'pendingOrders.0': { $exists: true } });
+
+    for (let user of usersWithOrders) {
+      let databaseModified = false;
+
+      // 2. Loop backwards so we can safely delete completed orders from the array
+      for (let i = user.pendingOrders.length - 1; i >= 0; i--) {
+        const order = user.pendingOrders[i];
+        const currentPrice = livePrices[order.symbol];
+
+        if (!currentPrice) continue; // Skip if we don't have a price yet
+
+        let shouldExecute = false;
+        
+        // LIMIT BUY Logic: Execute if live price drops BELOW or EQUAL TO target
+        if (order.type === 'BUY' && currentPrice <= order.limitPrice) {
+          shouldExecute = true;
+        } 
+        // LIMIT SELL Logic: Execute if live price rises ABOVE or EQUAL TO target
+        else if (order.type === 'SELL' && currentPrice >= order.limitPrice) {
+          shouldExecute = true;
+        }
+
+        // 3. EXECUTE THE TRADE
+        if (shouldExecute) {
+          console.log(`⚡ EXECUTING LIMIT ORDER: ${order.type} ${order.symbol} @ $${order.limitPrice}`);
+
+          if (order.type === 'BUY') {
+            // Escrow already took their USDT. Now, give them the Crypto!
+            const assetIndex = user.portfolio.findIndex(p => p.symbol === order.symbol);
+            if (assetIndex > -1) {
+              const oldQty = user.portfolio[assetIndex].quantity;
+              const oldAvg = user.portfolio[assetIndex].avgPrice || 0;
+              const newQty = oldQty + order.quantity;
+              
+              // Recalculate Average Entry Price (AEP)
+              user.portfolio[assetIndex].avgPrice = ((oldQty * oldAvg) + (order.quantity * order.limitPrice)) / newQty;
+              user.portfolio[assetIndex].quantity = newQty;
+            } else {
+              user.portfolio.push({ symbol: order.symbol, quantity: order.quantity, avgPrice: order.limitPrice });
+            }
+          } 
+          else if (order.type === 'SELL') {
+            // Escrow already took their Crypto. Now, give them the USDT!
+            const revenue = order.quantity * order.limitPrice;
+            user.balance += revenue;
+          }
+
+          // Log the executed trade
+          user.trades.push({
+            symbol: order.symbol,
+            type: `${order.type} (LIMIT)`, // Tag it so the UI knows it was an auto-trade
+            quantity: order.quantity,
+            price: order.limitPrice,
+            timestamp: new Date()
+          });
+
+          // Remove it from the pending queue
+          user.pendingOrders.splice(i, 1);
+          databaseModified = true;
+        }
+      }
+
+      // 4. Save the user only if an order actually triggered
+      if (databaseModified) {
+        await user.save();
+        console.log(`✅ Saved executed orders for user ${user._id}`);
+      }
+    }
+  } catch (err) {
+    console.error("⚠️ Order Engine Error:", err.message);
+  }
+}, 3000);
 
 // --- ROUTES ---
 app.use('/api/auth', require('./routes/auth'));
