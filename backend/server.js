@@ -142,7 +142,7 @@ setInterval(async () => {
           // Log the executed trade
           user.trades.push({
             symbol: order.symbol,
-            type: `${order.type} (LIMIT)`, // Tag it so the UI knows it was an auto-trade
+            type: order.type, // Tag it so the UI knows it was an auto-trade
             quantity: order.quantity,
             price: order.limitPrice,
             timestamp: new Date()
