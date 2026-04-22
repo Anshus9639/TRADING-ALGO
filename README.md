@@ -65,7 +65,7 @@ JWT_SECRET=your_secure_random_secret
 ```
 Start the engine:
 ```bash
-npm run dev
+npm start
 ```
 
 ### 3. Frontend Setup
