@@ -1,4 +1,4 @@
- NexusTrade Pro 📈
+ NexusTrade Pro 
 
 A mathematically strict, real-time paper trading terminal engineered for precision. NexusTrade Pro bridges live market telemetry via Binance WebSockets with a bulletproof execution engine, ensuring flawless portfolio mathematics, real-time Mark-to-Market PnL, and automated Limit Order matching.
 
@@ -40,7 +40,7 @@ A mathematically strict, real-time paper trading terminal engineered for precisi
 
 ---
 
-## 🚀 Installation & Setup
+##  Installation & Setup
 
 ### Prerequisites
 * Node.js (v16+)
