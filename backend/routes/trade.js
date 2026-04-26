@@ -177,4 +177,37 @@ router.post('/limit', auth, async (req, res) => {
   }
 });
 
+router.delete('/cancel/:orderId', auth, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id);
+    if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
+
+    // Find the order
+    const orderIndex = user.pendingOrders.findIndex(o => o._id.toString() === req.params.orderId);
+    if (orderIndex === -1) return res.status(404).json({ success: false, message: 'Order not found.' });
+
+    const order = user.pendingOrders[orderIndex];
+
+    // REFUND ESCROW
+    if (order.type === 'BUY') {
+      user.balance += (order.quantity * order.limitPrice); // Refund USDT
+    } else if (order.type === 'SELL') {
+      const assetIndex = user.portfolio.findIndex(p => p.symbol === order.symbol);
+      if (assetIndex > -1) {
+        user.portfolio[assetIndex].quantity += order.quantity; // Refund Crypto
+      } else {
+        user.portfolio.push({ symbol: order.symbol, quantity: order.quantity, avgPrice: 0 });
+      }
+    }
+
+    // Remove order from queue
+    user.pendingOrders.splice(orderIndex, 1);
+    await user.save();
+
+    res.json({ success: true, message: 'Order Cancelled & Escrow Refunded' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: `Server Error: ${err.message}` });
+  }
+});
+
 module.exports = router;

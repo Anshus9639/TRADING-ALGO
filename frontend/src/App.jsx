@@ -8,6 +8,7 @@ import Auth from './components/Auth';
 import CandleChart from './components/CandleChart';
 import OrderBook from './components/OrderBook';
 import QuickOrder from './components/QuickOrder';
+import ActivityDashboard from './components/ActivityDashboard'; // 🚀 Imported the new component
 
 // Initialize socket outside to prevent multiple connections on re-render
 const socket = io('https://trading-algo-nqud.onrender.com');
@@ -19,8 +20,8 @@ function App() {
   const [isInitializing, setIsInitializing] = useState(true);
   
   // --- UI STATES ---
-  const [currentView, setCurrentView] = useState('dashboard'); // 🚀 Makes sidebar clickable
-  const [chartInterval, setChartInterval] = useState('5m'); // 🚀 Dynamic Chart Interval
+  const [currentView, setCurrentView] = useState('dashboard');
+  const [chartInterval, setChartInterval] = useState('5m'); 
   
   // --- MARKET STATES ---
   const [activeSymbol, setActiveSymbol] = useState('BTCUSDT');
@@ -38,6 +39,7 @@ function App() {
   const [balance, setBalance] = useState(0);
   const [positions, setPositions] = useState([]); 
   const [trades, setTrades] = useState([]);
+  const [pendingOrders, setPendingOrders] = useState([]); // 🚀 Added state for pending limit orders
 
   // --- 1. PERSISTENCE LOGIC ---
   const fetchUserProfile = useCallback(async (authToken) => {
@@ -49,6 +51,7 @@ function App() {
       setBalance(res.data.balance || 0);
       setPositions(res.data.portfolio || []);
       setTrades(res.data.trades ? [...res.data.trades].reverse() : []);
+      setPendingOrders(res.data.pendingOrders || []); // 🚀 Load pending orders from backend
     } catch (err) {
       console.error("Session expired or invalid");
       handleLogout();
@@ -65,12 +68,11 @@ function App() {
     }
   }, [token, fetchUserProfile]);
 
-  // --- 2. MARKET DATA LOGIC (WITH INTERVAL FIX) ---
+  // --- 2. MARKET DATA LOGIC ---
   useEffect(() => {
     const fetchHistory = async () => {
       try {
         setHistory([]); 
-        // 🚀 Requests the specific interval from your backend
         const res = await axios.get(`https://trading-algo-nqud.onrender.com/api/history/${activeSymbol}?interval=${chartInterval}`);
         setHistory(res.data);
       } catch (err) { 
@@ -78,7 +80,7 @@ function App() {
       }
     };
     fetchHistory();
-  }, [activeSymbol, chartInterval]); // 🚀 Re-runs when symbol OR interval changes
+  }, [activeSymbol, chartInterval]); 
 
   useEffect(() => {
     socket.on('marketUpdate', (update) => {
@@ -105,22 +107,17 @@ function App() {
     const position = positions.find(p => p.symbol === activeSymbol);
     if (!position) return "0.00";
 
-    // 1. Default to the standard ticker price
     let livePrice = parseFloat(watchlist[activeSymbol]?.price || 0);
 
-    // 2. 🚀 THE REAL-TIME FIX: Mark-to-Market using the Order Book!
-    // The Order Book updates milliseconds faster than the actual traded price.
     if (orderBook && orderBook.symbol === activeSymbol && orderBook.bids && orderBook.bids.length > 0) {
       livePrice = parseFloat(orderBook.bids[0][0]); 
     } 
-    // 3. Fallback to the live candle close if order book is syncing
     else if (latestCandle && latestCandle.symbol === activeSymbol) {
       livePrice = latestCandle.close;
     }
 
     if (livePrice === 0) return "0.00";
 
-    // Calculate real-time profit
     const pnl = (livePrice - position.avgPrice) * position.quantity;
     return pnl.toFixed(2);
   };
@@ -132,6 +129,7 @@ function App() {
     setBalance(0);
     setPositions([]);
     setTrades([]);
+    setPendingOrders([]); // 🚀 Clear pending orders on logout
   };
 
   const handleLoginSuccess = (userData, userToken) => {
@@ -140,6 +138,7 @@ function App() {
     setBalance(userData.balance || 0);
     setPositions(userData.portfolio || []);
     setTrades(userData.trades ? [...userData.trades].reverse() : []);
+    setPendingOrders(userData.pendingOrders || []); // 🚀 Set pending orders on login
   };
 
   // --- 4. RENDER LOGIC ---
@@ -157,7 +156,6 @@ function App() {
       <aside className="w-20 border-r border-gray-800 flex flex-col items-center py-6 bg-[#161a1e] z-10">
         <div className="flex-1 flex flex-col items-center gap-8">
           <div className="text-yellow-500 font-bold text-2xl tracking-tighter">N</div>
-          {/* 🚀 Make Icons Clickable */}
           <LayoutDashboard 
             onClick={() => setCurrentView('dashboard')}
             className={`cursor-pointer transition-colors ${currentView === 'dashboard' ? 'text-yellow-500' : 'text-gray-500 hover:text-white'}`} 
@@ -177,9 +175,13 @@ function App() {
       {/* Main Content Area */}
       <main className="flex-1 flex flex-col h-full">
         {currentView === 'activity' ? (
-          <div className="flex-1 flex items-center justify-center font-mono text-gray-600 tracking-widest">
-            ACTIVITY MODULE PENDING
-          </div>
+          // 🚀 Injected the ActivityDashboard Component
+          <ActivityDashboard 
+            trades={trades} 
+            pendingOrders={pendingOrders} 
+            token={token} 
+            refreshData={fetchUserProfile} 
+          />
         ) : (
           <>
             {/* Watchlist Row */}
@@ -217,7 +219,6 @@ function App() {
                         <span className="w-2 h-2 bg-green-500 rounded-full animate-pulse" /> Live
                       </span>
                       
-                      {/* 🚀 The New Time Interval Buttons */}
                       <div className="flex bg-[#0b0e11] border border-gray-800 rounded p-0.5">
                         {['1m', '5m', '15m', '1h'].map(int => (
                           <button 
@@ -246,7 +247,6 @@ function App() {
 
                 {/* Trading & Status Panel */}
                 <div className="col-span-12 lg:col-span-3 space-y-4">
-                  {/* Stats Grid */}
                   <div className="grid grid-cols-2 lg:grid-cols-1 gap-4">
                     <div className="bg-[#161a1e] p-4 rounded-xl border border-gray-800">
                       <p className="text-gray-500 text-[10px] uppercase font-bold mb-1">Available Margin</p>
@@ -262,15 +262,12 @@ function App() {
                     </div>
                   </div>
 
+                  {/* 🚀 QuickOrder now triggers a data refresh to pull the new pending order */}
                   <QuickOrder 
                     activeSymbol={activeSymbol}
                     currentPrice={watchlist[activeSymbol]?.price}
                     token={token}
-                    onTradeComplete={(newBalance, newPortfolio, newTrade) => {
-                      setBalance(newBalance);
-                      setPositions(newPortfolio);
-                      if (newTrade) setTrades(prev => [newTrade, ...prev]);
-                    }} 
+                    onTradeComplete={() => fetchUserProfile(token)} 
                   />
 
                   <div className="bg-[#161a1e] p-4 rounded-xl border border-gray-800">
@@ -283,10 +280,10 @@ function App() {
                     <div className="space-y-3 max-h-40 overflow-y-auto custom-scrollbar">
                       {trades.length === 0 ? (
                         <p className="text-[10px] text-gray-600 font-mono tracking-tighter italic">NO ACTIVITY RECORDED</p>
-                      ) : trades.map(trade => (
+                      ) : trades.slice(0, 5).map(trade => ( // Only show the 5 most recent in the sidebar
                         <div key={trade._id || Math.random()} className="flex justify-between items-center text-[10px] border-b border-gray-800/50 pb-2">
                           <div className="flex flex-col">
-                            <span className={`font-bold ${trade.type === 'BUY' ? 'text-green-500' : 'text-red-500'}`}>{trade.type} {trade.symbol}</span>
+                            <span className={`font-bold ${trade.type.includes('BUY') ? 'text-green-500' : 'text-red-500'}`}>{trade.type} {trade.symbol}</span>
                             <span className="text-gray-600 text-[8px]">{new Date(trade.timestamp).toLocaleString()}</span>
                           </div>
                           <span className="font-mono text-gray-300 font-bold">${parseFloat(trade.price).toFixed(2)}</span>
