@@ -9,6 +9,7 @@ import CandleChart from './components/CandleChart';
 import OrderBook from './components/OrderBook';
 import QuickOrder from './components/QuickOrder';
 import ActivityDashboard from './components/ActivityDashboard';
+import AICopilot from './components/AICopilot';
 
 // Initialize socket outside to prevent multiple connections on re-render
 const socket = io('https://trading-algo-nqud.onrender.com');
@@ -260,6 +261,17 @@ function App() {
                       </h3>
                     </div>
                   </div>
+
+                  <AICopilot 
+                    token={token} 
+                    watchlist={watchlist} 
+                    onTradeComplete={(newBalance, newPortfolio, newTrade, newPending) => {
+                      setBalance(newBalance);
+                      setPositions(newPortfolio);
+                      if (newTrade) setTrades(prev => [newTrade, ...prev]);
+                      if (newPending) setPendingOrders(newPending);
+                    }}
+                  />
 
                   <QuickOrder 
                     activeSymbol={activeSymbol}

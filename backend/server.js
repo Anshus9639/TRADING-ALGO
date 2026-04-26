@@ -168,6 +168,7 @@ setInterval(async () => {
 // --- ROUTES ---
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/trade', require('./routes/trade'));
+app.use('/api/copilot', require('./routes/copilot'));
 
 // 3. FIXED HISTORY (The "Pattern" Fix)
  app.get('/api/history/:symbol', async (req, res) => {
