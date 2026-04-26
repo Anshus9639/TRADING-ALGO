@@ -1,14 +1,14 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import io from 'socket.io-client';
 import axios from 'axios';
-import { LayoutDashboard, Activity, Clock, CreditCard, TrendingUp, LogOut } from 'lucide-react';
+import { LayoutDashboard, Activity, Clock, LogOut } from 'lucide-react';
 
 // Components
 import Auth from './components/Auth';
 import CandleChart from './components/CandleChart';
 import OrderBook from './components/OrderBook';
 import QuickOrder from './components/QuickOrder';
-import ActivityDashboard from './components/ActivityDashboard'; // 🚀 Imported the new component
+import ActivityDashboard from './components/ActivityDashboard';
 
 // Initialize socket outside to prevent multiple connections on re-render
 const socket = io('https://trading-algo-nqud.onrender.com');
@@ -35,11 +35,11 @@ function App() {
   const [latestCandle, setLatestCandle] = useState(null);
   const [orderBook, setOrderBook] = useState(null);
 
-  // --- USER DATA STATES ---
+  // --- USER DATA STATES (Deduplicated & Cleaned) ---
   const [balance, setBalance] = useState(0);
   const [positions, setPositions] = useState([]); 
   const [trades, setTrades] = useState([]);
-  const [pendingOrders, setPendingOrders] = useState([]); // 🚀 Added state for pending limit orders
+  const [pendingOrders, setPendingOrders] = useState([]);
 
   // --- 1. PERSISTENCE LOGIC ---
   const fetchUserProfile = useCallback(async (authToken) => {
@@ -51,7 +51,7 @@ function App() {
       setBalance(res.data.balance || 0);
       setPositions(res.data.portfolio || []);
       setTrades(res.data.trades ? [...res.data.trades].reverse() : []);
-      setPendingOrders(res.data.pendingOrders || []); // 🚀 Load pending orders from backend
+      setPendingOrders(res.data.pendingOrders || []); 
     } catch (err) {
       console.error("Session expired or invalid");
       handleLogout();
@@ -129,7 +129,7 @@ function App() {
     setBalance(0);
     setPositions([]);
     setTrades([]);
-    setPendingOrders([]); // 🚀 Clear pending orders on logout
+    setPendingOrders([]); 
   };
 
   const handleLoginSuccess = (userData, userToken) => {
@@ -138,7 +138,7 @@ function App() {
     setBalance(userData.balance || 0);
     setPositions(userData.portfolio || []);
     setTrades(userData.trades ? [...userData.trades].reverse() : []);
-    setPendingOrders(userData.pendingOrders || []); // 🚀 Set pending orders on login
+    setPendingOrders(userData.pendingOrders || []); 
   };
 
   // --- 4. RENDER LOGIC ---
@@ -175,7 +175,6 @@ function App() {
       {/* Main Content Area */}
       <main className="flex-1 flex flex-col h-full">
         {currentView === 'activity' ? (
-          // 🚀 Injected the ActivityDashboard Component
           <ActivityDashboard 
             trades={trades} 
             pendingOrders={pendingOrders} 
@@ -262,7 +261,6 @@ function App() {
                     </div>
                   </div>
 
-                  {/* 🚀 QuickOrder now triggers a data refresh to pull the new pending order */}
                   <QuickOrder 
                     activeSymbol={activeSymbol}
                     currentPrice={watchlist[activeSymbol]?.price}
@@ -280,7 +278,7 @@ function App() {
                     <div className="space-y-3 max-h-40 overflow-y-auto custom-scrollbar">
                       {trades.length === 0 ? (
                         <p className="text-[10px] text-gray-600 font-mono tracking-tighter italic">NO ACTIVITY RECORDED</p>
-                      ) : trades.slice(0, 5).map(trade => ( // Only show the 5 most recent in the sidebar
+                      ) : trades.slice(0, 5).map(trade => (
                         <div key={trade._id || Math.random()} className="flex justify-between items-center text-[10px] border-b border-gray-800/50 pb-2">
                           <div className="flex flex-col">
                             <span className={`font-bold ${trade.type.includes('BUY') ? 'text-green-500' : 'text-red-500'}`}>{trade.type} {trade.symbol}</span>
