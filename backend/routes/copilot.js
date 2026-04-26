@@ -13,7 +13,7 @@ router.post('/parse', auth, async (req, res) => {
 
     // Use the flash model for ultra-low latency
     const model = genAI.getGenerativeModel({ 
-  model: "gemini-1.5-flash-latest", // 🚀 Added "-latest" right here
+  model: "gemini-2.5-flash", // 🚀 Added "-latest" right here
   generationConfig: { responseMimeType: "application/json" }
 });
 
