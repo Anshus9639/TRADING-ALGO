@@ -12,7 +12,10 @@ router.post('/parse', auth, async (req, res) => {
     if (!prompt) return res.status(400).json({ success: false, message: 'Prompt required' });
 
     // Use the flash model for ultra-low latency
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+    const model = genAI.getGenerativeModel({ 
+  model: "gemini-1.5-flash-latest", // 🚀 Added "-latest" right here
+  generationConfig: { responseMimeType: "application/json" }
+});
 
     // The "System Prompt" - This forces the AI to behave like a strict API parser
     const promptInstruction = `
