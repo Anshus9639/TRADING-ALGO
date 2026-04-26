@@ -1,6 +1,6 @@
-================================================================================
-                              NEXUSTRADE PRO                                   
-================================================================================
+
+                                                              NEXUSTRADE PRO                                   
+
 
 An advanced, real-time paper trading terminal equipped with an Agentic AI 
 Execution Copilot. NexusTrade Pro bridges live market telemetry via Binance 
@@ -75,7 +75,7 @@ Processing (NLP) agent, allowing for seamless, autonomous trade routing.
 * Google Gemini API Key (Free tier via Google AI Studio)
 
 [ Step 1: Clone the Repository ]
-git clone https://github.com/yourusername/nexustrade-pro.git
+git clone https://github.com/Anshus9639/TRADING-ALGO.git
 cd nexustrade-pro
 
 [ Step 2: Backend Setup ]
