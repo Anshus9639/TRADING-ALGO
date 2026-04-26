@@ -265,7 +265,12 @@ function App() {
                     activeSymbol={activeSymbol}
                     currentPrice={watchlist[activeSymbol]?.price}
                     token={token}
-                    onTradeComplete={() => fetchUserProfile(token)} 
+                    onTradeComplete={(newBalance, newPortfolio, newTrade, newPending) => {
+                      setBalance(newBalance);
+                      setPositions(newPortfolio);
+                      if (newTrade) setTrades(prev => [newTrade, ...prev]);
+                      if (newPending) setPendingOrders(newPending); // 🚀 Instantly updates the Activity Dashboard!
+                    }}
                   />
 
                   <div className="bg-[#161a1e] p-4 rounded-xl border border-gray-800">

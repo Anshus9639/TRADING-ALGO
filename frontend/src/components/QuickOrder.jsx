@@ -54,7 +54,7 @@ const QuickOrder = ({ activeSymbol, currentPrice, token, onTradeComplete }) => {
       
       // Update Dashboard UI (Wallet, Portfolio, Trades)
       if (onTradeComplete) {
-        onTradeComplete(res.data.balance, res.data.portfolio, res.data.newTrade); 
+        onTradeComplete(res.data.balance, res.data.portfolio, res.data.newTrade, res.data.pendingOrders); 
       }
       
     } catch (err) {
