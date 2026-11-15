@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import axios from 'axios';
+import { api } from '../lib/api';
 
 const Auth = ({ onLogin }) => {
   const [isLogin, setIsLogin] = useState(true);
@@ -23,7 +23,7 @@ const Auth = ({ onLogin }) => {
       : formData;
 
     try {
-      const res = await axios.post(`https://trading-algo-nqud.onrender.com${endpoint}`, payload);
+      const res = await api.post(endpoint, payload);
 
       if (isLogin) {
         // 🚀 OPTIMIZATION 2: Persistence

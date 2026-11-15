@@ -1,5 +1,6 @@
-import React, { useState, useEffect } from 'react';
-import axios from 'axios';
+import React, { useState, useEffect, useRef } from 'react';
+import { api, authHeaders } from '../lib/api';
+import { createClientOrderId } from '../lib/orderId.mjs';
 
 const QuickOrder = ({ activeSymbol, currentPrice, token, onTradeComplete }) => {
   const [orderType, setOrderType] = useState('MARKET'); // 🚀 New: Tracks Market vs Limit
@@ -7,6 +8,9 @@ const QuickOrder = ({ activeSymbol, currentPrice, token, onTradeComplete }) => {
   const [limitPrice, setLimitPrice] = useState(''); // 🚀 New: Tracks target price
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState(null); 
+  // Reused when a network failure is retried so the backend can return the
+  // original execution instead of placing a second order.
+  const pendingSubmission = useRef(null);
 
   // 🚀 Auto-fill limit price with the current live price when switching to LIMIT tab
   useEffect(() => {
@@ -21,34 +25,45 @@ const QuickOrder = ({ activeSymbol, currentPrice, token, onTradeComplete }) => {
     // Safety Checks
     if (!token) return setMessage({ text: "Error: Please log in.", type: "error" });
     if (quantity <= 0) return setMessage({ text: "Error: Quantity must be > 0.", type: "error" });
-    if (orderType === 'MARKET' && !currentPrice) return setMessage({ text: "Error: Waiting for live price...", type: "error" });
     if (orderType === 'LIMIT' && (!limitPrice || limitPrice <= 0)) return setMessage({ text: "Error: Enter a valid target price.", type: "error" });
 
     setLoading(true);
     try {
       let endpoint = '';
-      let payload = { symbol: activeSymbol, quantity: Number(quantity) };
+      const numericQuantity = Number(quantity);
+      const numericLimitPrice = Number(limitPrice);
+      const payload = { symbol: activeSymbol, quantity: numericQuantity };
 
       // 🚀 Route the data based on Market vs Limit
       if (orderType === 'MARKET') {
         endpoint = side === 'BUY' ? '/api/trade/buy' : '/api/trade/sell';
-        payload.price = Number(currentPrice);
       } else {
         endpoint = '/api/trade/limit'; // Routes to your Escrow system
         payload.type = side; // 'BUY' or 'SELL'
-        payload.limitPrice = Number(limitPrice);
+        payload.limitPrice = numericLimitPrice;
       }
 
-      const res = await axios.post(
-        `https://trading-algo-nqud.onrender.com${endpoint}`, 
-        payload,
-        { headers: { 'x-auth-token': token } }
-      );
+      const requestKey = [
+        endpoint,
+        side,
+        activeSymbol,
+        numericQuantity,
+        orderType === 'LIMIT' ? numericLimitPrice : 'MARKET'
+      ].join('|');
+      if (pendingSubmission.current?.key === requestKey) {
+        payload.clientOrderId = pendingSubmission.current.clientOrderId;
+      } else {
+        payload.clientOrderId = createClientOrderId();
+        pendingSubmission.current = { key: requestKey, clientOrderId: payload.clientOrderId };
+      }
+
+      const res = await api.post(endpoint, payload, authHeaders(token));
+      pendingSubmission.current = null;
 
       // Success! Show inline message
       const successText = orderType === 'LIMIT' 
         ? `Success: ${side} Limit placed at $${payload.limitPrice}` 
-        : `Success: ${side} ${quantity} ${activeSymbol}`;
+        : `Success: ${side} ${quantity} ${activeSymbol} @ $${Number(res.data.executedPrice).toFixed(2)}`;
       
       setMessage({ text: successText, type: "success" });
       
@@ -58,6 +73,9 @@ const QuickOrder = ({ activeSymbol, currentPrice, token, onTradeComplete }) => {
       }
       
     } catch (err) {
+      // Only a received response proves the request reached the server. Keep
+      // the idempotency key for a retry after network failures or timeouts.
+      if (err.response) pendingSubmission.current = null;
       // Error! Show inline message
       const errorMsg = err.response?.data?.message || "Trade failed due to server error.";
       setMessage({ text: `Rejected: ${errorMsg}`, type: "error" });

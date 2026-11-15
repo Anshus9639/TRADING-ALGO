@@ -1,27 +1,37 @@
 const router = require('express').Router();
-const User = require('../models/User'); 
+const User = require('../models/User');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const auth = require('../middleware/auth'); // 🚀 Make sure this file exists!
+const auth = require('../middleware/auth');
+const { getJwtSecret } = require('../config/env');
+const { loadAccountView } = require('../services/accountView');
+
+async function buildUserPayload(user) {
+  const view = await loadAccountView(user);
+  return {
+    id: view.id,
+    username: view.username,
+    email: view.email,
+    balance: view.balance,
+    lockedBalance: view.lockedBalance,
+    portfolio: view.portfolio,
+    trades: view.trades,
+    pendingOrders: view.pendingOrders
+  };
+}
 
 // @route    GET api/auth/me
 // @desc     Get current user data (The "Refresh Fix")
 // @access   Private
 router.get('/me', auth, async (req, res) => {
   try {
-    // 🚀 We find the user and "populate" their trades so history shows up on refresh
+    // Orders and trades are canonical collections; embedded legacy arrays are
+    // still merged until the gated migration is explicitly applied.
     const user = await User.findById(req.user.id).select('-password');
     
     if (!user) return res.status(404).json({ msg: "User not found" });
 
-    res.json({
-      id: user._id,
-      username: user.username,
-      email: user.email,
-      balance: user.balance,
-      portfolio: user.portfolio || [],
-      trades: user.trades || []
-    });
+    res.json(await buildUserPayload(user));
   } catch (err) {
     console.error("Auth Me Error:", err.message);
     res.status(500).send("Server Error");
@@ -64,7 +74,7 @@ router.post('/login', async (req, res) => {
   try {
     const { email, password } = req.body;
 
-    const user = await User.findOne({ email }).populate('trades');
+    const user = await User.findOne({ email });
     if (!user) return res.status(400).json({ msg: "No account found with this email." });
 
     const isMatch = await bcrypt.compare(password, user.password);
@@ -72,20 +82,14 @@ router.post('/login', async (req, res) => {
 
     const token = jwt.sign(
       { user: { id: user._id } }, // 🚀 Matches the standard middleware format
-      process.env.JWT_SECRET || 'NexusTrade_Secret_Key',
+      getJwtSecret(),
       { expiresIn: '24h' }
     );
 
-    res.json({
-      token,
-      user: {
-        id: user._id,
-        username: user.username,
-        balance: user.balance,
-        portfolio: user.portfolio || [],
-        trades: user.trades || []
-      }
-    });
+    const payload = await buildUserPayload(user);
+    delete payload.email;
+
+    res.json({ token, user: payload });
 
   } catch (err) {
     console.error("Login Error:", err);

@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
-import axios from 'axios';
 import { Clock, CheckCircle, Trash2 } from 'lucide-react';
+import { api, authHeaders } from '../lib/api';
 
 const ActivityDashboard = ({ trades, pendingOrders, token, refreshData }) => {
   const [cancellingId, setCancellingId] = useState(null);
@@ -9,9 +9,7 @@ const ActivityDashboard = ({ trades, pendingOrders, token, refreshData }) => {
   const handleCancelOrder = async (orderId) => {
     setCancellingId(orderId);
     try {
-      await axios.delete(`https://trading-algo-nqud.onrender.com/api/trade/cancel/${orderId}`, {
-        headers: { 'x-auth-token': token }
-      });
+      await api.delete(`/api/trade/cancel/${orderId}`, authHeaders(token));
       // Ping App.jsx to refresh the user data so the wallet balance updates
       refreshData(token); 
     } catch (err) {
@@ -84,11 +82,12 @@ const ActivityDashboard = ({ trades, pendingOrders, token, refreshData }) => {
                 <th className="p-4">Executed Price</th>
                 <th className="p-4">Amount</th>
                 <th className="p-4">Total Value</th>
+                <th className="p-4">Realized PnL</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-800 text-gray-300 font-mono text-xs">
               {!trades || trades.length === 0 ? (
-                <tr><td colSpan="6" className="p-6 text-center text-gray-600 italic">No trading history.</td></tr>
+                <tr><td colSpan="7" className="p-6 text-center text-gray-600 italic">No trading history.</td></tr>
               ) : trades.map(trade => (
                 <tr key={trade._id} className="hover:bg-[#1e2329] transition-colors">
                   <td className="p-4 text-gray-500">{new Date(trade.timestamp).toLocaleString()}</td>
@@ -97,6 +96,11 @@ const ActivityDashboard = ({ trades, pendingOrders, token, refreshData }) => {
                   <td className="p-4">${trade.price.toLocaleString()}</td>
                   <td className="p-4">{trade.quantity}</td>
                   <td className="p-4 font-bold">${(trade.price * trade.quantity).toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
+                  <td className={`p-4 font-bold ${trade.realizedPnl == null ? 'text-gray-500' : trade.realizedPnl >= 0 ? 'text-green-500' : 'text-red-500'}`}>
+                    {trade.realizedPnl == null
+                      ? <span title="Cost basis unavailable">—</span>
+                      : `$${trade.realizedPnl.toLocaleString(undefined, { minimumFractionDigits: 2 })}`}
+                  </td>
                 </tr>
               ))}
             </tbody>

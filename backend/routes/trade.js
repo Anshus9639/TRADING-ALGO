@@ -1,213 +1,77 @@
-const router = require('express').Router();
-const User = require('../models/User');
+const express = require('express');
 const auth = require('../middleware/auth');
+const { createTradeService } = require('../services/tradeService');
+const { validateClientOrderId } = require('../lib/validate');
 
-// --- STRICT BUY ROUTE ---
-router.post('/buy', auth, async (req, res) => {
-  try {
-    const { symbol, quantity, price } = req.body;
-    
-    // Strict casting to prevent JavaScript string math bugs
-    const numQty = Number(quantity);
-    const numPrice = Number(price);
-    const totalCost = numQty * numPrice;
+function createTradeRouter({ feed, runtimeStatus = null }) {
+  const router = express.Router();
+  const tradeService = createTradeService({ feed, runtimeStatus });
 
-    const user = await User.findById(req.user.id);
-    if (!user) {
-      return res.status(404).json({ success: false, message: 'User not found in database.' });
+  async function send(res, work) {
+    try {
+      const result = await work();
+      return res.status(result.status).json(result.body);
+    } catch (err) {
+      console.error('Trade error:', err.message);
+      return res.status(500).json({ success: false, message: 'Server Error' });
     }
-
-    // 1. STRICT MARGIN CHECK
-    if (user.balance < totalCost) {
-      return res.status(400).json({ success: false, message: 'Insufficient USDT Balance.' });
-    }
-
-    // 2. Deduct Balance
-    user.balance -= totalCost;
-
-    // 3. Update Portfolio & Average Entry Price (AEP)
-    const assetIndex = user.portfolio.findIndex(p => p.symbol === symbol);
-    
-    if (assetIndex > -1) {
-      // Asset exists: Calculate new Average Entry Price (AEP)
-      const oldQty = user.portfolio[assetIndex].quantity;
-      const oldAvg = user.portfolio[assetIndex].avgPrice || 0;
-      const newQty = oldQty + numQty;
-      
-      // AEP Formula: ((OldQty * OldPrice) + (NewQty * NewPrice)) / TotalQty
-      user.portfolio[assetIndex].avgPrice = ((oldQty * oldAvg) + totalCost) / newQty;
-      user.portfolio[assetIndex].quantity = newQty;
-    } else {
-      // New Asset
-      user.portfolio.push({ symbol, quantity: numQty, avgPrice: numPrice });
-    }
-
-    // 4. Log the Transaction
-    const newTrade = { symbol, type: 'BUY', quantity: numQty, price: numPrice, timestamp: new Date() };
-    user.trades.push(newTrade);
-    
-    await user.save();
-
-    // 5. Send synchronized data back to frontend
-    res.json({ 
-      success: true, 
-      message: 'Trade Executed Successfully',
-      balance: user.balance, 
-      portfolio: user.portfolio,
-      newTrade: user.trades[user.trades.length - 1] 
-    });
-
-  } catch (err) {
-    console.error("🔥 BUY ERROR:", err);
-    res.status(500).json({ success: false, message: `Server Error: ${err.message}` });
   }
-});
 
-// --- STRICT SELL ROUTE ---
-router.post('/sell', auth, async (req, res) => {
-  try {
-    const { symbol, quantity, price } = req.body;
-    
-    const numQty = Number(quantity);
-    const numPrice = Number(price);
-    const totalRevenue = numQty * numPrice;
-
-    const user = await User.findById(req.user.id);
-    if (!user) {
-      return res.status(404).json({ success: false, message: 'User not found in database.' });
+  // Every manual order requires a client-generated UUID `clientOrderId`. It is
+  // the idempotency key shared by market and limit submissions: a retry with
+  // the same key and identical parameters returns the original result, while
+  // reusing a key with different parameters is rejected with 409
+  // IDEMPOTENCY_CONFLICT instead of creating a second trade.
+  function requireClientOrderId(req, res) {
+    const check = validateClientOrderId(req.body?.clientOrderId);
+    if (!check.ok) {
+      res.status(400).json({ success: false, code: 'INVALID_CLIENT_ORDER_ID', message: check.error });
+      return null;
     }
-
-    // 1. Check Crypto Balance Exists
-    const assetIndex = user.portfolio.findIndex(p => p.symbol === symbol);
-    if (assetIndex === -1) {
-      return res.status(400).json({ success: false, message: `You do not own any ${symbol}.` });
-    }
-
-    const currentPos = user.portfolio[assetIndex];
-
-    // 2. STRICT ASSET CHECK
-    if (currentPos.quantity < numQty) {
-      return res.status(400).json({ success: false, message: 'Insufficient Crypto Balance.' });
-    }
-
-    // 3. Add to Wallet Balance & Deduct Crypto
-    user.balance += totalRevenue;
-    currentPos.quantity -= numQty;
-
-    // 4. FLOATING-POINT CLEANUP (The "Dust" Fix)
-    // If you sell 0.3 of 0.3, JS might leave 0.00000000004. This deletes the empty asset.
-    if (currentPos.quantity <= 0.00001) {
-      user.portfolio.splice(assetIndex, 1);
-    }
-
-    // 5. Log the Transaction
-    const newTrade = { symbol, type: 'SELL', quantity: numQty, price: numPrice, timestamp: new Date() };
-    user.trades.push(newTrade);
-    
-    await user.save();
-
-    // 6. Send synchronized data back to frontend
-    res.json({ 
-      success: true, 
-      message: 'Trade Executed Successfully',
-      balance: user.balance, 
-      portfolio: user.portfolio,
-      newTrade: user.trades[user.trades.length - 1] 
-    });
-
-  } catch (err) {
-    console.error("🔥 SELL ERROR:", err);
-    res.status(500).json({ success: false, message: `Server Error: ${err.message}` });
+    return check.value;
   }
-});
-router.post('/limit', auth, async (req, res) => {
-  try {
-    const { symbol, type, quantity, limitPrice } = req.body;
-    
-    const numQty = Number(quantity);
-    const numLimitPrice = Number(limitPrice);
-    const totalValue = numQty * numLimitPrice;
 
-    const user = await User.findById(req.user.id);
-    if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
+  function handleMarketOrder(req, res, side) {
+    const clientOrderId = requireClientOrderId(req, res);
+    if (!clientOrderId) return undefined;
 
-    // --- ESCROW LOGIC ---
-    if (type === 'BUY') {
-      // 1. Lock up USDT
-      if (user.balance < totalValue) {
-        return res.status(400).json({ success: false, message: 'Insufficient USDT for Limit Buy.' });
-      }
-      user.balance -= totalValue; // Deduct funds immediately
-    } 
-    else if (type === 'SELL') {
-      // 2. Lock up Crypto Asset
-      const assetIndex = user.portfolio.findIndex(p => p.symbol === symbol);
-      if (assetIndex === -1 || user.portfolio[assetIndex].quantity < numQty) {
-        return res.status(400).json({ success: false, message: `Insufficient ${symbol} for Limit Sell.` });
-      }
-      user.portfolio[assetIndex].quantity -= numQty; // Deduct crypto immediately
-    } 
-    else {
-      return res.status(400).json({ success: false, message: 'Invalid order type.' });
-    }
+    return send(res, () => tradeService.executeMarketOrder({
+      userId: req.user.id,
+      side,
+      symbol: req.body?.symbol,
+      quantity: req.body?.quantity,
+      clientOrderId
+    }));
+  }
 
-    // --- PLACE IN QUEUE ---
-    const newLimitOrder = {
+  // Market orders are priced exclusively by the server-side market feed.
+  router.post('/buy', auth, (req, res) => handleMarketOrder(req, res, 'BUY'));
+  router.post('/sell', auth, (req, res) => handleMarketOrder(req, res, 'SELL'));
+
+  router.post('/limit', auth, (req, res) => {
+    const clientOrderId = requireClientOrderId(req, res);
+    if (!clientOrderId) return undefined;
+
+    const { symbol, type, quantity, limitPrice } = req.body || {};
+
+    return send(res, () => tradeService.placeLimitOrder({
+      userId: req.user.id,
+      side: type,
       symbol,
-      type,
-      quantity: numQty,
-      limitPrice: numLimitPrice,
-      timestamp: new Date()
-    };
-    
-    user.pendingOrders.push(newLimitOrder);
-    await user.save();
+      quantity,
+      limitPrice,
+      clientOrderId
+    }));
+  });
 
-    res.json({ 
-      success: true, 
-      message: `${type} Limit Order Placed at $${numLimitPrice}`,
-      balance: user.balance, 
-      portfolio: user.portfolio,
-      pendingOrders: user.pendingOrders 
-    });
+  router.delete('/cancel/:orderId', auth, (req, res) => {
+    return send(res, () => tradeService.cancelOrder({
+      orderId: req.params.orderId,
+      userId: req.user.id
+    }));
+  });
 
-  } catch (err) {
-    console.error("🔥 LIMIT ORDER ERROR:", err);
-    res.status(500).json({ success: false, message: `Server Error: ${err.message}` });
-  }
-});
+  return router;
+}
 
-router.delete('/cancel/:orderId', auth, async (req, res) => {
-  try {
-    const user = await User.findById(req.user.id);
-    if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
-
-    // Find the order
-    const orderIndex = user.pendingOrders.findIndex(o => o._id.toString() === req.params.orderId);
-    if (orderIndex === -1) return res.status(404).json({ success: false, message: 'Order not found.' });
-
-    const order = user.pendingOrders[orderIndex];
-
-    // REFUND ESCROW
-    if (order.type === 'BUY') {
-      user.balance += (order.quantity * order.limitPrice); // Refund USDT
-    } else if (order.type === 'SELL') {
-      const assetIndex = user.portfolio.findIndex(p => p.symbol === order.symbol);
-      if (assetIndex > -1) {
-        user.portfolio[assetIndex].quantity += order.quantity; // Refund Crypto
-      } else {
-        user.portfolio.push({ symbol: order.symbol, quantity: order.quantity, avgPrice: 0 });
-      }
-    }
-
-    // Remove order from queue
-    user.pendingOrders.splice(orderIndex, 1);
-    await user.save();
-
-    res.json({ success: true, message: 'Order Cancelled & Escrow Refunded' });
-  } catch (err) {
-    res.status(500).json({ success: false, message: `Server Error: ${err.message}` });
-  }
-});
-
-module.exports = router;
+module.exports = { createTradeRouter };

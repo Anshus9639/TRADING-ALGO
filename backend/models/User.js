@@ -14,17 +14,32 @@ const UserSchema = new mongoose.Schema({
   },
   password: { type: String, required: true },
   
+  // Spendable USDT only. Reserved BUY-limit funds live in lockedBalance.
   balance: { 
     type: Number, 
     default: 10000,
     min: [0, 'Critical Error: Balance cannot drop below zero.'] // 🛡️ Database-level protection
   },
+
+  // USDT reserved by open BUY limit orders. available = balance (already net).
+  lockedBalance: {
+    type: Number,
+    default: 0,
+    min: [0, 'Locked balance cannot be negative.']
+  },
   
   portfolio: [
     {
       symbol: { type: String, required: true, uppercase: true }, // Forces "btcusdt" to "BTCUSDT"
+      // Total quantity owned. Available quantity is quantity - lockedQuantity.
       quantity: { type: Number, default: 0, min: [0, 'Cannot own negative crypto'] },
-      avgPrice: { type: Number, default: 0, min: 0 }
+      // Quantity reserved by open SELL limit orders.
+      lockedQuantity: { type: Number, default: 0, min: [0, 'Locked quantity cannot be negative'] },
+      // Historical legacy holdings may have no recoverable purchase price.
+      // Storing null + UNKNOWN is deliberate: a missing basis must never be
+      // interpreted as a real zero-cost purchase.
+      avgPrice: { type: Number, default: null, min: 0 },
+      costBasisStatus: { type: String, enum: ['KNOWN', 'UNKNOWN'], default: 'KNOWN' }
     }
   ],
   pendingOrders: [

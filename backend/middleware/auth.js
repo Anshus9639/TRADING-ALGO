@@ -1,4 +1,5 @@
 const jwt = require('jsonwebtoken');
+const { getJwtSecret } = require('../config/env');
 
 module.exports = function (req, res, next) {
   // Get token from header
@@ -9,9 +10,19 @@ module.exports = function (req, res, next) {
     return res.status(401).json({ msg: 'No token, authorization denied' });
   }
 
+  let secret;
+  try {
+    secret = getJwtSecret();
+  } catch {
+    return res.status(500).json({ msg: 'Server authentication is not configured' });
+  }
+
   // Verify token
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'NexusTrade_Secret_Key');
+    const decoded = jwt.verify(token, secret);
+    if (!decoded || !decoded.user || !decoded.user.id) {
+      return res.status(401).json({ msg: 'Token is not valid' });
+    }
     req.user = decoded.user; // 🚀 This must match the way you signed the token
     next();
   } catch (err) {

@@ -1,66 +1,143 @@
-import React, { useState } from 'react';
-import axios from 'axios';
-import { Bot, Send, Sparkles } from 'lucide-react';
+import React, { useEffect, useRef, useState } from 'react';
+import { Bot, Send, Sparkles, Check, X, AlertTriangle } from 'lucide-react';
+import { api } from '../lib/api';
+import {
+  createConfirmLock,
+  requestProposal,
+  confirmProposal,
+  discardProposal,
+  canConfirm,
+  isExpired,
+  formatRemaining
+} from '../lib/copilotProposal';
 
 const AICopilot = ({ token, watchlist, onTradeComplete }) => {
   const [prompt, setPrompt] = useState('');
   const [loading, setLoading] = useState(false);
   const [log, setLog] = useState(null);
+  const [proposal, setProposal] = useState(null);
+  const [now, setNow] = useState(() => Date.now());
+  const confirmLock = useRef(createConfirmLock());
+
+  // Logout unmounts this panel; also clear any proposal if the token changes.
+  useEffect(() => {
+    setProposal(null);
+    confirmLock.current = createConfirmLock();
+  }, [token]);
+
+  useEffect(() => {
+    if (!proposal) return undefined;
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [proposal]);
+
+  useEffect(() => {
+    if (!log || log.status === 'loading') return undefined;
+    const timer = setTimeout(() => setLog(null), 5000);
+    return () => clearTimeout(timer);
+  }, [log]);
 
   const handleCommand = async (e) => {
     e.preventDefault();
-    if (!prompt.trim()) return;
+    const trimmed = prompt.trim();
+    if (!trimmed || loading) return;
 
     setLoading(true);
-    setLog({ text: "Thinking...", status: "loading" });
+    setProposal(null);
+    setLog({ text: 'Thinking...', status: 'loading' });
 
     try {
-      const parseRes = await axios.post(
-        'https://trading-algo-nqud.onrender.com/api/copilot/parse', 
-        { prompt }, 
-        { headers: { 'x-auth-token': token } }
-      );
-
-      const intent = parseRes.data.data;
-      setLog({ text: `Agent routing ${intent.orderType} ${intent.side} for ${intent.symbol}...`, status: "loading" });
-
-      let endpoint = '';
-      let payload = { symbol: intent.symbol, quantity: Number(intent.quantity) };
-
-      if (intent.orderType === 'LIMIT') {
-        endpoint = '/api/trade/limit';
-        payload.type = intent.side;
-        payload.limitPrice = Number(intent.limitPrice);
-      } else {
-        endpoint = intent.side === 'BUY' ? '/api/trade/buy' : '/api/trade/sell';
-        const livePrice = parseFloat(watchlist[intent.symbol]?.price || 0);
-        
-        if (livePrice === 0) throw new Error(`Market price for ${intent.symbol} unavailable.`);
-        payload.price = livePrice;
-      }
-
-      const execRes = await axios.post(
-        `https://trading-algo-nqud.onrender.com${endpoint}`, 
-        payload, 
-        { headers: { 'x-auth-token': token } }
-      );
-
-      setLog({ text: `Success: ${intent.side} ${intent.quantity} ${intent.symbol} executed!`, status: "success" });
+      // Stage 1 only: build a server-side proposal. No trade is sent here.
+      const state = await requestProposal({
+        http: api,
+        prompt: trimmed,
+        token,
+        now: Date.now()
+      });
+      setNow(Date.now());
+      setProposal(state);
       setPrompt('');
 
-      if (onTradeComplete) {
-        onTradeComplete(execRes.data.balance, execRes.data.portfolio, execRes.data.newTrade, execRes.data.pendingOrders); 
-      }
-
+      const preview = state.preview || {};
+      setLog({
+        text: `Proposal ready: ${preview.side} ${preview.quantity} ${preview.symbol} ${preview.orderType}. Review and confirm.`,
+        status: 'loading'
+      });
     } catch (err) {
-      console.error(err);
-      const errorMsg = err.response?.data?.message || err.message || "Agent failed to execute command.";
-      setLog({ text: `Failed: ${errorMsg}`, status: "error" });
+      const data = err.response?.data;
+      const text = data?.code === 'CLARIFICATION_REQUIRED'
+        ? data.clarification
+        : data?.message || err.message || 'Agent failed to understand command.';
+      setLog({ text: `Failed: ${text}`, status: 'error' });
     } finally {
       setLoading(false);
-      setTimeout(() => setLog(null), 5000); 
     }
   };
+
+  const handleConfirm = async () => {
+    const current = proposal;
+    if (!current || !canConfirm(current, Date.now()) || loading) return;
+
+    setLoading(true);
+    setLog({ text: 'Executing confirmed proposal...', status: 'loading' });
+
+    const result = await confirmProposal({
+      http: api,
+      state: current,
+      token,
+      now: Date.now(),
+      lock: confirmLock.current
+    });
+
+    if (result.ok) {
+      const trade = result.result || {};
+      const confirmation = current.intent?.orderType === 'LIMIT'
+        ? `${current.intent.side} ${current.intent.quantity} ${current.intent.symbol} limit @ $${current.intent.limitPrice}`
+        : `${current.intent?.side} ${current.intent?.quantity} ${current.intent?.symbol} @ $${Number(trade.executedPrice).toFixed(2)}`;
+
+      setLog({ text: `Success: ${confirmation}`, status: 'success' });
+      setProposal(null);
+
+      if (onTradeComplete) {
+        onTradeComplete(trade.balance, trade.portfolio, trade.newTrade, trade.pendingOrders);
+      }
+    } else {
+      setProposal(null);
+      if (result.reason === 'PRICE_CHANGED') {
+        setLog({
+          text: 'Price moved beyond tolerance. Proposal discarded; request a fresh one.',
+          status: 'error'
+        });
+      } else if (result.reason === 'EXPIRED') {
+        setLog({ text: 'Proposal expired. Request a fresh one.', status: 'error' });
+      } else {
+        setLog({ text: `Failed: ${result.state?.error || 'Execution failed.'}`, status: 'error' });
+      }
+    }
+
+    setLoading(false);
+  };
+
+  const handleDiscard = async () => {
+    const current = proposal;
+    if (!current || loading) return;
+
+    setLoading(true);
+    // Revoke server-side first so the proposal can never be executed later.
+    const result = await discardProposal({ http: api, state: current, token });
+
+    if (result.ok) {
+      setProposal(null);
+      setLog({ text: 'Proposal discarded. No trade was sent.', status: 'success' });
+    } else {
+      setLog({ text: `Discard failed: ${result.state?.error || 'Please retry.'}`, status: 'error' });
+    }
+    setLoading(false);
+  };
+
+  const preview = proposal?.preview;
+  const expired = proposal ? isExpired(proposal, now) : false;
+  const confirmEnabled = canConfirm(proposal, now) && !loading;
 
   return (
     <div className="bg-[#161a1e] p-4 rounded-xl border border-gray-800 relative overflow-hidden group">
@@ -90,6 +167,7 @@ const AICopilot = ({ token, watchlist, onTradeComplete }) => {
             type="text"
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
+            maxLength={500}
             disabled={loading}
             placeholder='e.g., "Buy 0.5 BTC if it drops to $60,000"'
             className="flex-1 bg-transparent text-sm text-white p-3 outline-none placeholder-gray-600 font-mono"
@@ -104,6 +182,81 @@ const AICopilot = ({ token, watchlist, onTradeComplete }) => {
         </div>
       </form>
 
+      {/* --- CONFIRMATION CARD: nothing executes until Confirm --- */}
+      {proposal && preview && (
+        <div className="relative z-10 mt-3 rounded-lg border border-purple-500/40 bg-[#0b0e11]/90 p-3 font-mono text-[10px] text-gray-300 shadow-lg">
+          <div className="flex justify-between items-center mb-2">
+            <span className="text-purple-300 font-bold uppercase tracking-wider">Trade Proposal</span>
+            <span className={`px-2 py-0.5 rounded font-bold ${
+              expired ? 'text-red-400 bg-red-500/10' : 'text-yellow-400 bg-yellow-500/10'
+            }`}>
+              {expired ? 'EXPIRED' : `Expires in ${formatRemaining(proposal, now)}`}
+            </span>
+          </div>
+
+          <div className="grid grid-cols-2 gap-x-3 gap-y-1">
+            <span className="text-gray-500 uppercase">Side</span>
+            <span className={`font-bold ${preview.side === 'BUY' ? 'text-green-500' : 'text-red-500'}`}>
+              {preview.side}
+            </span>
+            <span className="text-gray-500 uppercase">Pair</span>
+            <span className="font-bold text-white">{preview.symbol}</span>
+            <span className="text-gray-500 uppercase">Type</span>
+            <span>{preview.orderType}</span>
+            <span className="text-gray-500 uppercase">Quantity</span>
+            <span>{preview.quantity}</span>
+            <span className="text-gray-500 uppercase">
+              {preview.orderType === 'LIMIT' ? 'Limit Price' : 'Market Price'}
+            </span>
+            <span>
+              ${preview.orderType === 'LIMIT'
+                ? Number(preview.limitPrice).toLocaleString()
+                : Number(preview.quotePrice).toLocaleString()}
+            </span>
+            <span className="text-gray-500 uppercase">Est. Total</span>
+            <span className="font-bold">${Number(preview.estimatedValue).toLocaleString()}</span>
+            <span className="text-gray-500 uppercase">
+              {preview.side === 'BUY' ? 'Available USDT' : `Available ${preview.symbol}`}
+            </span>
+            <span>
+              {preview.side === 'BUY'
+                ? `$${Number(preview.balance).toLocaleString()}`
+                : Number(preview.availableQuantity).toLocaleString()}
+            </span>
+          </div>
+
+          {preview.warnings && preview.warnings.length > 0 && (
+            <div className="mt-2 space-y-1 text-amber-400">
+              {preview.warnings.map((warning, index) => (
+                <div key={index} className="flex gap-1.5 items-start">
+                  <AlertTriangle size={11} className="mt-0.5 shrink-0" />
+                  <span>{warning}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div className="mt-3 flex gap-2">
+            <button
+              type="button"
+              onClick={handleConfirm}
+              disabled={!confirmEnabled}
+              className="flex-1 flex items-center justify-center gap-1 bg-green-500/20 border border-green-500/40 text-green-400 font-bold py-1.5 rounded hover:bg-green-500/30 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              <Check size={12} /> Confirm
+            </button>
+            <button
+              type="button"
+              onClick={handleDiscard}
+              disabled={loading}
+              className="flex-1 flex items-center justify-center gap-1 bg-gray-800/60 border border-gray-700 text-gray-400 font-bold py-1.5 rounded hover:bg-gray-700 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              <X size={12} /> Discard
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Dynamic Status Log */}
       {log && (
         <div className={`relative z-10 mt-3 text-[10px] font-mono font-bold px-2 py-1.5 rounded animate-pulse shadow-lg ${
@@ -111,7 +264,7 @@ const AICopilot = ({ token, watchlist, onTradeComplete }) => {
           log.status === 'error' ? 'text-red-400 bg-red-500/10 border border-red-500/20' : 
           'text-purple-400 bg-purple-500/10 border border-purple-500/20'
         }`}>
-          > {log.text}
+           {log.text}
         </div>
       )}
     </div>

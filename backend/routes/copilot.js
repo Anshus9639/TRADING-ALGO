@@ -1,61 +1,473 @@
 const express = require('express');
-const router = express.Router();
+const User = require('../models/User');
 const auth = require('../middleware/auth');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
+const { getGeminiApiKey, getCopilotConfig } = require('../config/env');
+const { createTradeService } = require('../services/tradeService');
+const { createProposalStore } = require('../services/ai/proposalStore');
+const { createGeminiIntentExtractor } = require('../services/ai/gemini');
+const {
+  validateModelIntent,
+  resolveIntent,
+  revalidateStoredIntent
+} = require('../services/ai/intent');
+const { SUPPORTED_SYMBOLS } = require('../lib/validate');
+const { roundTo } = require('../lib/numbers');
 
-// Initialize the AI Agent
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const MAX_PROMPT_LENGTH = 500;
 
-router.post('/parse', auth, async (req, res) => {
-  try {
-    const { prompt } = req.body;
-    if (!prompt) return res.status(400).json({ success: false, message: 'Prompt required' });
-
-    // Use the flash model for ultra-low latency
-    const model = genAI.getGenerativeModel({ 
-  model: "gemini-2.5-flash", // 🚀 Added "-latest" right here
-  generationConfig: { responseMimeType: "application/json" }
+const CODE_MESSAGES = Object.freeze({
+  INVALID_PROPOSAL: 'Proposal is invalid.',
+  PROPOSAL_NOT_FOUND: 'Proposal not found.',
+  PROPOSAL_EXPIRED: 'Proposal has expired. Request a fresh proposal.',
+  PROPOSAL_ALREADY_USED: 'Proposal was already used. Request a fresh proposal.',
+  PROPOSAL_REVOKED: 'Proposal was discarded. Request a fresh proposal.',
+  PRICE_CHANGED: 'Price moved beyond the allowed tolerance. Request a fresh proposal.',
+  INSUFFICIENT_BALANCE: 'Insufficient USDT balance.',
+  INSUFFICIENT_ASSET: 'Insufficient asset balance.'
 });
 
-    // The "System Prompt" - This forces the AI to behave like a strict API parser
-    const promptInstruction = `
-      You are a trading execution agent. Convert the user's natural language trading command into a strict JSON object.
-      User Command: "${prompt}"
-      
-      You must return ONLY a raw JSON object with no markdown formatting, no backticks, and no extra text.
-      
-      Required JSON Schema:
-      {
-        "side": "BUY" or "SELL",
-        "symbol": "BTCUSDT", "ETHUSDT", "SOLUSDT", or "BNBUSDT" (Infer the crypto from the text. Always append USDT),
-        "orderType": "MARKET" or "LIMIT",
-        "limitPrice": Number or null (If they mention a target price, it is a LIMIT order. Extract the price.),
-        "quantity": Number (The exact amount of crypto they want to trade. If they specify dollars (e.g., "$50 of BTC"), you MUST calculate the crypto quantity using the current estimated market price. Assume BTC=65000, ETH=3500, SOL=150, BNB=600 for math if needed, but return the final crypto amount).
-      }
-      
-      Example Input: "Buy 0.5 Bitcoin if it drops to 60k"
-      Example Output: {"side": "BUY", "symbol": "BTCUSDT", "orderType": "LIMIT", "limitPrice": 60000, "quantity": 0.5}
-    `;
+const PROPOSAL_ERROR_STATUS = Object.freeze({
+  INVALID_PROPOSAL: 400,
+  PROPOSAL_NOT_FOUND: 404,
+  PROPOSAL_EXPIRED: 410,
+  PROPOSAL_ALREADY_USED: 409,
+  PROPOSAL_REVOKED: 409
+});
 
-    // Send to Gemini
-    const result = await model.generateContent(promptInstruction);
-    let rawText = result.response.text();
-    
-    // Clean up any potential markdown formatting the AI tries to sneak in
-    rawText = rawText.replace(/```json/g, '').replace(/```/g, '').trim();
-    
-    const parsedData = JSON.parse(rawText);
+function createRateLimiter({ max, windowMs, now = Date.now } = {}) {
+  const attempts = new Map();
+  const enabled = Number.isFinite(max) && max > 0 && Number.isFinite(windowMs) && windowMs > 0;
 
-    res.json({
-      success: true,
-      message: "Agent successfully parsed intent",
-      data: parsedData
-    });
+  function check(userId) {
+    if (!enabled) return { allowed: true };
 
-  } catch (err) {
-    console.error("🔥 AI COPILOT ERROR:", err);
-    res.status(500).json({ success: false, message: "Agent failed to understand command." });
+    const key = String(userId);
+    const timestamp = now();
+    const cutoff = timestamp - windowMs;
+    const recent = (attempts.get(key) || []).filter(entry => entry > cutoff);
+
+    if (recent.length >= max) {
+      attempts.set(key, recent);
+      return { allowed: false, retryAfterMs: Math.max(0, recent[0] + windowMs - timestamp) };
+    }
+
+    recent.push(timestamp);
+    attempts.set(key, recent);
+    return { allowed: true };
   }
-});
 
-module.exports = router;
+  return { check };
+}
+
+function readPrompt(prompt, maxLength) {
+  if (typeof prompt !== 'string') {
+    return { ok: false, message: 'Prompt must be a string.' };
+  }
+  const trimmed = prompt.trim();
+  if (!trimmed) return { ok: false, message: 'Prompt is required.' };
+  if (trimmed.length > maxLength) {
+    return { ok: false, message: `Prompt must be at most ${maxLength} characters.` };
+  }
+  return { ok: true, value: trimmed };
+}
+
+function inferTradeErrorCode(message = '') {
+  if (/insufficient crypto|do not own|insufficient .* for limit sell/i.test(message)) {
+    return 'INSUFFICIENT_ASSET';
+  }
+  if (/insufficient usdt|insufficient.*balance/i.test(message)) return 'INSUFFICIENT_BALANCE';
+  return 'TRADE_REJECTED';
+}
+
+function sendTradeResult(res, result) {
+  if (result.body.success) {
+    return res.status(result.status).json(result.body);
+  }
+
+  // Preserve an explicit service code (e.g. MATCHER_NOT_READY) instead of
+  // collapsing every 503 into PRICE_UNAVAILABLE.
+  const code = result.body.code
+    || (result.status === 503
+      ? 'PRICE_UNAVAILABLE'
+      : result.status === 400
+        ? inferTradeErrorCode(result.body.message)
+        : 'TRADE_REJECTED');
+
+  return res.status(result.status).json({
+    success: false,
+    code,
+    message: result.body.message
+  });
+}
+
+function createCopilotRouter({
+  feed,
+  runtimeStatus = null,
+  ai = null,
+  proposalStore = null,
+  now = Date.now,
+  User: UserModel = User,
+  rateLimit = null,
+  usdInrRate,
+  maxPriceDriftPct,
+  geminiModel,
+  geminiTimeoutMs,
+  maxPromptLength = MAX_PROMPT_LENGTH
+} = {}) {
+  if (!feed || typeof feed.getQuote !== 'function') {
+    throw new TypeError('createCopilotRouter requires a market feed instance.');
+  }
+
+  const runtime = getCopilotConfig();
+  const driftThreshold = Number.isFinite(maxPriceDriftPct)
+    ? maxPriceDriftPct
+    : runtime.maxPriceDriftPct;
+  const configuredInrRate = usdInrRate === undefined
+    ? runtime.usdInrRate
+    : (Number.isFinite(usdInrRate) && usdInrRate > 0 ? usdInrRate : null);
+  const store = proposalStore || createProposalStore({ now, ttlMs: runtime.proposalTtlMs });
+  const tradeService = createTradeService({ feed, User: UserModel, runtimeStatus });
+
+  const limits = rateLimit || runtime.rateLimit;
+  const limiter = createRateLimiter({
+    max: limits.max,
+    windowMs: limits.windowMs,
+    now
+  });
+
+  let cachedExtractor = ai || null;
+
+  function getExtractor() {
+    if (cachedExtractor) return cachedExtractor;
+    const apiKey = getGeminiApiKey();
+    if (!apiKey) return null;
+    cachedExtractor = createGeminiIntentExtractor({
+      apiKey,
+      model: geminiModel || runtime.geminiModel,
+      timeoutMs: geminiTimeoutMs || runtime.geminiTimeoutMs
+    });
+    return cachedExtractor;
+  }
+
+  function enforceRateLimit(req, res) {
+    const verdict = limiter.check(req.user.id);
+    if (verdict.allowed) return false;
+
+    res.set('Retry-After', String(Math.max(1, Math.ceil(verdict.retryAfterMs / 1000))));
+    res.status(429).json({
+      success: false,
+      code: 'RATE_LIMITED',
+      message: 'Too many copilot requests. Please wait and retry.'
+    });
+    return true;
+  }
+
+  const router = express.Router();
+
+  // Stage 1: extract and validate intent, build a server-side proposal, and
+  // return a preview. This route never mutates the account.
+  router.post('/parse', auth, async (req, res) => {
+    try {
+      if (enforceRateLimit(req, res)) return undefined;
+
+      const promptCheck = readPrompt(req.body?.prompt, maxPromptLength);
+      if (!promptCheck.ok) {
+        return res.status(400).json({
+          success: false,
+          code: 'INVALID_PROMPT',
+          message: promptCheck.message
+        });
+      }
+
+      const extractor = getExtractor();
+      if (!extractor) {
+        return res.status(503).json({
+          success: false,
+          code: 'AI_UNAVAILABLE',
+          message: 'AI copilot is not configured.'
+        });
+      }
+
+      const user = await UserModel.findById(req.user.id);
+      if (!user) {
+        return res.status(404).json({
+          success: false,
+          code: 'INVALID_USER',
+          message: 'User not found.'
+        });
+      }
+
+      const holdings = Object.fromEntries(
+        (user.portfolio || []).map(position => [
+          position.symbol,
+          Math.max(0, roundTo(position.quantity - (position.lockedQuantity || 0)))
+        ])
+      );
+      const quotes = {};
+      for (const symbol of SUPPORTED_SYMBOLS) {
+        const quote = feed.getQuote(symbol);
+        if (quote.status === 'ok') quotes[symbol] = { price: quote.price, ts: quote.ts };
+      }
+
+      let rawIntent;
+      try {
+        rawIntent = await extractor.extract({
+          prompt: promptCheck.value,
+          context: { balance: user.balance, holdings, quotes }
+        });
+      } catch {
+        return res.status(502).json({
+          success: false,
+          code: 'AI_UNAVAILABLE',
+          message: 'AI copilot is temporarily unavailable.'
+        });
+      }
+
+      const intentCheck = validateModelIntent(rawIntent);
+      if (!intentCheck.ok) {
+        if (intentCheck.code === 'CLARIFICATION_REQUIRED') {
+          return res.status(422).json({
+            success: false,
+            code: 'CLARIFICATION_REQUIRED',
+            clarification: intentCheck.clarification
+          });
+        }
+        return res.status(400).json({
+          success: false,
+          code: 'INVALID_INTENT',
+          message: intentCheck.message
+        });
+      }
+
+      const resolved = resolveIntent({
+        modelIntent: intentCheck.value,
+        context: {
+          balance: user.balance,
+          holdings,
+          quoteFor: symbol => feed.getQuote(symbol),
+          usdInrRate: configuredInrRate,
+          maxPriceDriftPct: driftThreshold
+        }
+      });
+
+      if (!resolved.ok) {
+        if (resolved.code === 'CLARIFICATION_REQUIRED') {
+          return res.status(422).json({
+            success: false,
+            code: 'CLARIFICATION_REQUIRED',
+            clarification: resolved.clarification
+          });
+        }
+        if (resolved.code === 'PRICE_UNAVAILABLE') {
+          return res.status(503).json({
+            success: false,
+            code: 'PRICE_UNAVAILABLE',
+            message: resolved.message
+          });
+        }
+        if (resolved.code === 'INSUFFICIENT_ASSET') {
+          return res.status(400).json({
+            success: false,
+            code: 'INSUFFICIENT_ASSET',
+            message: resolved.message
+          });
+        }
+        return res.status(400).json({
+          success: false,
+          code: 'INVALID_INTENT',
+          message: resolved.message
+        });
+      }
+
+      const { intent, preview } = resolved.value;
+      const quote = intent.orderType === 'MARKET' && Number.isFinite(preview.quotePrice)
+        ? { price: preview.quotePrice, ts: preview.quoteTs }
+        : null;
+
+      const proposal = store.create({
+        userId: req.user.id,
+        intent,
+        preview,
+        quote
+      });
+
+      return res.json({
+        success: true,
+        proposalId: proposal.id,
+        intent,
+        preview,
+        expiresAt: new Date(proposal.expiresAt).toISOString()
+      });
+    } catch (err) {
+      console.error('Copilot parse error:', err.message);
+      return res.status(500).json({
+        success: false,
+        code: 'COPILOT_ERROR',
+        message: 'Copilot request failed.'
+      });
+    }
+  });
+
+  // Stage 2: consume the server-side proposal exactly once and execute its
+  // stored intent through the same trade service used by manual orders.
+  router.post('/execute', auth, async (req, res) => {
+    try {
+      if (enforceRateLimit(req, res)) return undefined;
+
+      const proposalId = typeof req.body?.proposalId === 'string'
+        ? req.body.proposalId.trim()
+        : '';
+
+      if (!proposalId) {
+        return res.status(400).json({
+          success: false,
+          code: 'INVALID_PROPOSAL',
+          message: CODE_MESSAGES.INVALID_PROPOSAL
+        });
+      }
+
+      // The proposal id is the execution idempotency key. If this proposal
+      // already produced an order, a network retry returns that same result
+      // instead of reporting the proposal as merely consumed.
+      const priorResult = await tradeService.getExecutionResult({
+        userId: req.user.id,
+        clientOrderId: proposalId
+      });
+      if (priorResult) {
+        return res.status(priorResult.status).json(priorResult.body);
+      }
+
+      const consumed = store.consume({ proposalId, userId: req.user.id });
+      if (!consumed.ok) {
+        if (consumed.code === 'PROPOSAL_ALREADY_USED') {
+          const retried = await tradeService.getExecutionResult({
+            userId: req.user.id,
+            clientOrderId: proposalId
+          });
+          if (retried) return res.status(retried.status).json(retried.body);
+        }
+        return res.status(PROPOSAL_ERROR_STATUS[consumed.code] || 400).json({
+          success: false,
+          code: consumed.code,
+          message: CODE_MESSAGES[consumed.code] || 'Proposal rejected.'
+        });
+      }
+
+      const { intent, quote } = consumed.proposal;
+      const revalidated = revalidateStoredIntent(intent);
+      if (!revalidated.ok) {
+        return res.status(400).json({
+          success: false,
+          code: 'INVALID_PROPOSAL',
+          message: revalidated.message
+        });
+      }
+      const storedIntent = revalidated.value;
+
+      if (storedIntent.orderType === 'MARKET') {
+        const freshQuote = feed.getQuote(storedIntent.symbol);
+        if (freshQuote.status !== 'ok') {
+          return res.status(503).json({
+            success: false,
+            code: 'PRICE_UNAVAILABLE',
+            message: 'Market price unavailable. Please retry.'
+          });
+        }
+
+        if (!quote || !Number.isFinite(quote.price) || quote.price <= 0) {
+          return res.status(400).json({
+            success: false,
+            code: 'INVALID_PROPOSAL',
+            message: CODE_MESSAGES.INVALID_PROPOSAL
+          });
+        }
+
+        const driftPct = (Math.abs(freshQuote.price - quote.price) / quote.price) * 100;
+        if (driftPct > driftThreshold) {
+          return res.status(409).json({
+            success: false,
+            code: 'PRICE_CHANGED',
+            message: CODE_MESSAGES.PRICE_CHANGED,
+            previewPrice: quote.price,
+            currentPrice: freshQuote.price,
+            driftPct: roundTo(driftPct, 4)
+          });
+        }
+
+        const result = await tradeService.executeMarketOrder({
+          userId: req.user.id,
+          side: storedIntent.side,
+          symbol: storedIntent.symbol,
+          quantity: storedIntent.quantity,
+          clientOrderId: proposalId,
+          // The quote that passed the drift check is the quote used for
+          // settlement; no second, different quote is fetched.
+          executionQuote: {
+            symbol: storedIntent.symbol,
+            price: freshQuote.price,
+            ts: freshQuote.ts
+          }
+        });
+        return sendTradeResult(res, result);
+      }
+
+      const result = await tradeService.placeLimitOrder({
+        userId: req.user.id,
+        side: storedIntent.side,
+        symbol: storedIntent.symbol,
+        quantity: storedIntent.quantity,
+        limitPrice: storedIntent.limitPrice,
+        clientOrderId: proposalId
+      });
+      return sendTradeResult(res, result);
+    } catch (err) {
+      console.error('Copilot execute error:', err.message);
+      return res.status(500).json({
+        success: false,
+        code: 'COPILOT_ERROR',
+        message: 'Copilot request failed.'
+      });
+    }
+  });
+
+  // Stage 1b: owner-only server-side discard. Revocation never trades or
+  // reserves anything; a revoked proposal is never executable.
+  router.post('/proposals/:proposalId/revoke', auth, async (req, res) => {
+    try {
+      const result = store.revoke({
+        proposalId: req.params.proposalId,
+        userId: req.user.id
+      });
+
+      if (!result.ok) {
+        return res.status(PROPOSAL_ERROR_STATUS[result.code] || 400).json({
+          success: false,
+          code: result.code,
+          message: CODE_MESSAGES[result.code] || 'Proposal rejected.'
+        });
+      }
+
+      return res.json({
+        success: true,
+        revoked: true,
+        alreadyRevoked: result.alreadyRevoked === true,
+        expiresAt: new Date(result.expiresAt).toISOString()
+      });
+    } catch (err) {
+      console.error('Copilot revoke error:', err.message);
+      return res.status(500).json({
+        success: false,
+        code: 'COPILOT_ERROR',
+        message: 'Copilot request failed.'
+      });
+    }
+  });
+
+  return router;
+}
+
+module.exports = {
+  createCopilotRouter,
+  inferTradeErrorCode,
+  MAX_PROMPT_LENGTH
+};
