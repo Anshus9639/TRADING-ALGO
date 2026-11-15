@@ -8,6 +8,7 @@ const axios = require('axios');
 require('dotenv').config();
 
 const User = require('./models/User');
+const { setPrice, getPrice } = require('./lib/prices');
 
 const app = express();
 const server = http.createServer(app);
@@ -39,7 +40,6 @@ mongoose.connect(process.env.MONGO_URI)
 
 // --- BINANCE WS BRIDGE (SELF-HEALING) ---
 const SYMBOLS = ['btcusdt', 'ethusdt', 'solusdt', 'bnbusdt'];
-const livePrices = {};
 let binanceConn;
 
 const connectBinance = () => {
@@ -58,7 +58,7 @@ const connectBinance = () => {
 
       if (msg.e === '24hrTicker') {
         const currentPrice = parseFloat(msg.c);
-        livePrices[msg.s] = currentPrice;
+        setPrice(msg.s, currentPrice);
         io.emit('marketUpdate', { symbol: msg.s, price: parseFloat(msg.c).toFixed(2), change: msg.P });
       } 
       else if (msg.e === 'kline') {
@@ -99,9 +99,10 @@ setInterval(async () => {
       // 2. Loop backwards so we can safely delete completed orders from the array
       for (let i = user.pendingOrders.length - 1; i >= 0; i--) {
         const order = user.pendingOrders[i];
-        const currentPrice = livePrices[order.symbol];
+        // null when missing OR stale (feed down) -> never fill against an old price
+        const currentPrice = getPrice(order.symbol);
 
-        if (!currentPrice) continue; // Skip if we don't have a price yet
+        if (!currentPrice) continue;
 
         let shouldExecute = false;
         

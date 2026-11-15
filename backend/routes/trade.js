@@ -1,15 +1,23 @@
 const router = require('express').Router();
 const User = require('../models/User');
 const auth = require('../middleware/auth');
+const { parseSymbol, parseQuantity, parsePrice, parseSide } = require('../lib/validate');
+const { getPrice } = require('../lib/prices');
+
+const bad = (res, message, status = 400) => res.status(status).json({ success: false, message });
 
 // --- STRICT BUY ROUTE ---
 router.post('/buy', auth, async (req, res) => {
   try {
-    const { symbol, quantity, price } = req.body;
-    
-    // Strict casting to prevent JavaScript string math bugs
-    const numQty = Number(quantity);
-    const numPrice = Number(price);
+    // The client-supplied `price` is deliberately ignored: the server's own
+    // market price is the only authoritative execution price.
+    const symbol = parseSymbol(req.body.symbol);
+    const numQty = parseQuantity(req.body.quantity);
+    if (!symbol) return bad(res, 'Invalid or unsupported symbol.');
+    if (numQty === null) return bad(res, 'Quantity must be a positive number.');
+
+    const numPrice = getPrice(symbol);
+    if (numPrice === null) return bad(res, `Market price for ${symbol} is unavailable. Try again shortly.`, 503);
     const totalCost = numQty * numPrice;
 
     const user = await User.findById(req.user.id);
@@ -66,10 +74,14 @@ router.post('/buy', auth, async (req, res) => {
 // --- STRICT SELL ROUTE ---
 router.post('/sell', auth, async (req, res) => {
   try {
-    const { symbol, quantity, price } = req.body;
-    
-    const numQty = Number(quantity);
-    const numPrice = Number(price);
+    // Client-supplied `price` is ignored (see /buy).
+    const symbol = parseSymbol(req.body.symbol);
+    const numQty = parseQuantity(req.body.quantity);
+    if (!symbol) return bad(res, 'Invalid or unsupported symbol.');
+    if (numQty === null) return bad(res, 'Quantity must be a positive number.');
+
+    const numPrice = getPrice(symbol);
+    if (numPrice === null) return bad(res, `Market price for ${symbol} is unavailable. Try again shortly.`, 503);
     const totalRevenue = numQty * numPrice;
 
     const user = await User.findById(req.user.id);
@@ -122,10 +134,14 @@ router.post('/sell', auth, async (req, res) => {
 });
 router.post('/limit', auth, async (req, res) => {
   try {
-    const { symbol, type, quantity, limitPrice } = req.body;
-    
-    const numQty = Number(quantity);
-    const numLimitPrice = Number(limitPrice);
+    const symbol = parseSymbol(req.body.symbol);
+    const type = parseSide(req.body.type);
+    const numQty = parseQuantity(req.body.quantity);
+    const numLimitPrice = parsePrice(req.body.limitPrice);
+    if (!symbol) return bad(res, 'Invalid or unsupported symbol.');
+    if (!type) return bad(res, 'Invalid order type.');
+    if (numQty === null) return bad(res, 'Quantity must be a positive number.');
+    if (numLimitPrice === null) return bad(res, 'Limit price must be a positive number.');
     const totalValue = numQty * numLimitPrice;
 
     const user = await User.findById(req.user.id);
