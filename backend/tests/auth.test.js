@@ -221,6 +221,57 @@ describe('authentication and session restoration', () => {
     expect(oversizedPassword.status).toBe(400);
   });
 
+  test('enforces the signup password limit in UTF-8 bytes', async () => {
+    const accepted = [
+      { username: 'bytes-72-ascii', email: 'bytes-72-ascii@example.test', password: 'a'.repeat(72) },
+      { username: 'bytes-72-utf8', email: 'bytes-72-utf8@example.test', password: 'é'.repeat(36) }
+    ];
+    for (const payload of accepted) {
+      const res = await request(app).post('/api/auth/signup').send(payload);
+      expect(res.status).toBe(200);
+      expect(await User.findOne({ email: payload.email })).toBeTruthy();
+    }
+
+    const rejected = [
+      { username: 'bytes-73-ascii', email: 'bytes-73-ascii@example.test', password: 'a'.repeat(73) },
+      { username: 'bytes-73-utf8', email: 'bytes-73-utf8@example.test', password: `${'é'.repeat(36)}A` }
+    ];
+    for (const payload of rejected) {
+      expect(Buffer.byteLength(payload.password, 'utf8')).toBe(73);
+      const res = await request(app).post('/api/auth/signup').send(payload);
+      expect(res.status).toBe(400);
+      expect(await User.findOne({ email: payload.email })).toBeNull();
+    }
+  });
+
+  test('logs in legacy accounts whose password exceeds 72 characters', async () => {
+    const legacyPassword = `${'x'.repeat(100)}-legacy`;
+    const passwordHash = await bcrypt.hash(legacyPassword, 4);
+    const user = await createTestUser({ username: 'legacy-user', password: passwordHash });
+
+    const login = await request(app)
+      .post('/api/auth/login')
+      .send({ email: user.email, password: legacyPassword });
+
+    expect(login.status).toBe(200);
+    expect(login.body.token).toBeTruthy();
+
+    const invalidPasswords = [undefined, '', { $ne: null }, [], 42];
+    for (const password of invalidPasswords) {
+      const res = await request(app)
+        .post('/api/auth/login')
+        .send({ email: user.email, password });
+      expect(res.status).toBe(400);
+      expect(res.body.token).toBeUndefined();
+    }
+
+    const wrongLongPassword = await request(app)
+      .post('/api/auth/login')
+      .send({ email: user.email, password: 'y'.repeat(80) });
+    expect(wrongLongPassword.status).toBe(400);
+    expect(wrongLongPassword.body.token).toBeUndefined();
+  });
+
   test('normalizes email for signup and login', async () => {
     const signup = await request(app)
       .post('/api/auth/signup')

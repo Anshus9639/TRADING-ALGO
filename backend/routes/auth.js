@@ -10,7 +10,8 @@ const { loadAccountView } = require('../services/accountView');
 
 const MAX_EMAIL_LENGTH = 254;
 const MAX_USERNAME_LENGTH = 50;
-// bcrypt only considers the first 72 bytes; reject longer inputs explicitly.
+// bcrypt only considers the first 72 UTF-8 bytes. Enforcing the limit on signup
+// prevents silently truncated credentials.
 const MAX_PASSWORD_LENGTH = 72;
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -32,9 +33,19 @@ function normalizeUsername(value) {
   return username;
 }
 
-function readPassword(value) {
+function readSignupPassword(value) {
   if (typeof value !== 'string') return null;
-  if (!value || value.length > MAX_PASSWORD_LENGTH) return null;
+  if (!value) return null;
+  if (Buffer.byteLength(value, 'utf8') > MAX_PASSWORD_LENGTH) return null;
+  return value;
+}
+
+// Login has no byte limit so accounts hashed from longer passwords before the
+// signup limit existed can still authenticate. bcrypt.compare applies the same
+// 72-byte truncation to the input and the stored hash.
+function readLoginPassword(value) {
+  if (typeof value !== 'string') return null;
+  if (!value) return null;
   return value;
 }
 
@@ -86,7 +97,7 @@ function createAuthRouter({ rateLimits = getRateLimitConfig() } = {}) {
       const body = readBodyObject(req.body);
       const username = normalizeUsername(body.username);
       const email = normalizeEmail(body.email);
-      const password = readPassword(body.password);
+      const password = readSignupPassword(body.password);
 
       if (!username || !email || !password) {
         return res.status(400).json({ msg: "Please enter a valid username, email, and password." });
@@ -119,7 +130,7 @@ function createAuthRouter({ rateLimits = getRateLimitConfig() } = {}) {
     try {
       const body = readBodyObject(req.body);
       const email = normalizeEmail(body.email);
-      const password = readPassword(body.password);
+      const password = readLoginPassword(body.password);
 
       // Reject non-string or malformed credentials before building a query.
       // This prevents NoSQL operator objects such as { "$ne": null } from
