@@ -4,11 +4,12 @@ const axios = require('axios');
 const { marketFeed } = require('./services/marketFeed');
 const { createTradeRouter } = require('./routes/trade');
 const { createCopilotRouter } = require('./routes/copilot');
+const { createAuthRouter } = require('./routes/auth');
 const { loadAppConfig } = require('./config/env');
 
 // App-only configuration: does not require database or JWT secrets, so isolated
 // tests can import this factory without a full environment.
-const { corsOrigins } = loadAppConfig();
+const { corsOrigins, trustProxy } = loadAppConfig();
 
 const corsOptions = {
   origin: corsOrigins,
@@ -16,16 +17,23 @@ const corsOptions = {
   credentials: true
 };
 
-function createApp({ feed = marketFeed, copilot = {}, runtimeStatus = null } = {}) {
+function createApp({
+  feed = marketFeed,
+  copilot = {},
+  runtimeStatus = null,
+  auth: authOptions = {},
+  trade: tradeOptions = {}
+} = {}) {
   const app = express();
+  app.set('trust proxy', trustProxy);
 
   // Apply to Express
   app.use(cors(corsOptions));
   app.use(express.json());
 
   // --- ROUTES ---
-  app.use('/api/auth', require('./routes/auth'));
-  app.use('/api/trade', createTradeRouter({ feed, runtimeStatus }));
+  app.use('/api/auth', createAuthRouter(authOptions));
+  app.use('/api/trade', createTradeRouter({ feed, runtimeStatus, ...tradeOptions }));
   app.use('/api/copilot', createCopilotRouter({ feed, ...copilot, runtimeStatus }));
 
   // Liveness never depends on downstream components: it only proves the HTTP

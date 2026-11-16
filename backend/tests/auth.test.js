@@ -2,6 +2,7 @@ const request = require('supertest');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { createApp } = require('../app');
+const User = require('../models/User');
 const { createMarketFeed } = require('../services/marketFeed');
 const {
   startTestDb,
@@ -174,5 +175,81 @@ describe('authentication and session restoration', () => {
     } finally {
       process.env.JWT_SECRET = originalSecret;
     }
+  });
+
+  test('rejects NoSQL operator objects on login and signup', async () => {
+    const user = await createLoginUser({ balance: 10000 });
+    const before = await User.countDocuments({});
+    const payloads = [{ $ne: null }, { $gt: '' }, ['a@b.test'], 42, null, ''];
+
+    for (const email of payloads) {
+      const login = await request(app)
+        .post('/api/auth/login')
+        .send({ email, password: PASSWORD });
+
+      expect(login.status).toBe(400);
+      expect(login.body.token).toBeUndefined();
+
+      const signup = await request(app)
+        .post('/api/auth/signup')
+        .send({ username: 'injection', email, password: PASSWORD });
+
+      expect(signup.status).toBe(400);
+    }
+
+    const objectPassword = await request(app)
+      .post('/api/auth/login')
+      .send({ email: user.email, password: { $ne: null } });
+
+    expect(objectPassword.status).toBe(400);
+    expect(objectPassword.body.token).toBeUndefined();
+    expect(await User.countDocuments({})).toBe(before);
+  });
+
+  test('rejects malformed and oversized credentials', async () => {
+    const malformedEmails = ['not-an-email', 'missing@domain', '@example.test', `${'a'.repeat(250)}@example.test`];
+    for (const email of malformedEmails) {
+      const res = await request(app)
+        .post('/api/auth/login')
+        .send({ email, password: PASSWORD });
+      expect(res.status).toBe(400);
+    }
+
+    const oversizedPassword = await request(app)
+      .post('/api/auth/signup')
+      .send({ username: 'too-long', email: 'too-long@example.test', password: 'x'.repeat(73) });
+    expect(oversizedPassword.status).toBe(400);
+  });
+
+  test('normalizes email for signup and login', async () => {
+    const signup = await request(app)
+      .post('/api/auth/signup')
+      .send({
+        username: '  normalized-user  ',
+        email: '  Normalized.User@Example.Test  ',
+        password: PASSWORD
+      });
+
+    expect(signup.status).toBe(200);
+
+    const stored = await User.findOne({ email: 'normalized.user@example.test' });
+    expect(stored).toBeTruthy();
+    expect(stored.username).toBe('normalized-user');
+
+    const login = await request(app)
+      .post('/api/auth/login')
+      .send({ email: '  NORMALIZED.USER@EXAMPLE.TEST  ', password: PASSWORD });
+
+    expect(login.status).toBe(200);
+    expect(login.body.token).toBeTruthy();
+
+    const duplicate = await request(app)
+      .post('/api/auth/signup')
+      .send({
+        username: 'duplicate',
+        email: 'normalized.user@example.test',
+        password: PASSWORD
+      });
+    expect(duplicate.status).toBe(400);
   });
 });

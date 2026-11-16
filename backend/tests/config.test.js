@@ -6,8 +6,13 @@ const {
   loadAppConfig,
   getJwtSecret,
   isGeminiConfigured,
+  getRateLimitConfig,
+  parseTrustProxy,
   MIN_JWT_SECRET_LENGTH,
-  DEFAULT_CORS_ORIGINS
+  DEFAULT_CORS_ORIGINS,
+  DEFAULT_AUTH_RATE_LIMIT_MAX,
+  DEFAULT_AUTH_READ_RATE_LIMIT_MAX,
+  DEFAULT_TRADE_RATE_LIMIT_MAX
 } = require('../config/env');
 
 const LOCAL_URI = 'mongodb://127.0.0.1:27017/nexustrade_test';
@@ -78,9 +83,49 @@ describe('backend environment configuration', () => {
   test('loads app-only configuration without database or JWT secrets', () => {
     expect(() => loadAppConfig({})).not.toThrow();
     expect(loadAppConfig({}).corsOrigins).toEqual([...DEFAULT_CORS_ORIGINS]);
+    expect(loadAppConfig({}).trustProxy).toBe(false);
+    expect(loadAppConfig({ NODE_ENV: 'production' }).trustProxy).toBe(1);
 
     const custom = loadAppConfig({ CORS_ORIGINS: 'https://app.example.com, https://admin.example.com' });
     expect(custom.corsOrigins).toEqual(['https://app.example.com', 'https://admin.example.com']);
+  });
+
+  test('rate limit defaults are bounded and configurable', () => {
+    const defaults = getRateLimitConfig({});
+    expect(defaults.auth).toEqual({
+      max: DEFAULT_AUTH_RATE_LIMIT_MAX,
+      windowMs: 15 * 60 * 1000
+    });
+    expect(defaults.authRead.max).toBe(DEFAULT_AUTH_READ_RATE_LIMIT_MAX);
+    expect(defaults.trade).toEqual({
+      max: DEFAULT_TRADE_RATE_LIMIT_MAX,
+      windowMs: 60 * 1000
+    });
+
+    const custom = getRateLimitConfig({
+      AUTH_RATE_LIMIT_MAX: '5',
+      AUTH_RATE_LIMIT_WINDOW_SECONDS: '30',
+      AUTH_READ_RATE_LIMIT_MAX: '60',
+      TRADE_RATE_LIMIT_MAX: '20',
+      TRADE_RATE_LIMIT_WINDOW_SECONDS: '10'
+    });
+    expect(custom.auth).toEqual({ max: 5, windowMs: 30000 });
+    expect(custom.authRead).toEqual({ max: 60, windowMs: 60 * 1000 });
+    expect(custom.trade).toEqual({ max: 20, windowMs: 10000 });
+  });
+
+  test('rejects invalid rate limit settings', () => {
+    expect(() => getRateLimitConfig({ AUTH_RATE_LIMIT_MAX: 'abc' })).toThrow(/AUTH_RATE_LIMIT_MAX/);
+    expect(() => getRateLimitConfig({ TRADE_RATE_LIMIT_WINDOW_SECONDS: '-1' })).toThrow(/TRADE_RATE_LIMIT_WINDOW_SECONDS/);
+  });
+
+  test('trust proxy requires an explicit hop count', () => {
+    expect(parseTrustProxy(undefined, 'production')).toBe(1);
+    expect(parseTrustProxy(undefined, 'test')).toBe(false);
+    expect(parseTrustProxy('false', 'production')).toBe(false);
+    expect(parseTrustProxy('0', 'development')).toBe(false);
+    expect(parseTrustProxy('2', 'production')).toBe(2);
+    expect(() => parseTrustProxy('true', 'production')).toThrow(/hop count/);
   });
 
   test('getJwtSecret never falls back to a default', () => {

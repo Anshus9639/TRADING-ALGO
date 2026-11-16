@@ -1,10 +1,42 @@
-const router = require('express').Router();
+const express = require('express');
+const { rateLimit } = require('express-rate-limit');
 const User = require('../models/User');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const auth = require('../middleware/auth');
-const { getJwtSecret } = require('../config/env');
+const { rateLimitOptions } = require('../middleware/rateLimit');
+const { getJwtSecret, getRateLimitConfig } = require('../config/env');
 const { loadAccountView } = require('../services/accountView');
+
+const MAX_EMAIL_LENGTH = 254;
+const MAX_USERNAME_LENGTH = 50;
+// bcrypt only considers the first 72 bytes; reject longer inputs explicitly.
+const MAX_PASSWORD_LENGTH = 72;
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function readBodyObject(body) {
+  return body && typeof body === 'object' && !Array.isArray(body) ? body : {};
+}
+
+function normalizeEmail(value) {
+  if (typeof value !== 'string') return null;
+  const email = value.trim().toLowerCase();
+  if (!email || email.length > MAX_EMAIL_LENGTH || !EMAIL_PATTERN.test(email)) return null;
+  return email;
+}
+
+function normalizeUsername(value) {
+  if (typeof value !== 'string') return null;
+  const username = value.trim();
+  if (!username || username.length > MAX_USERNAME_LENGTH) return null;
+  return username;
+}
+
+function readPassword(value) {
+  if (typeof value !== 'string') return null;
+  if (!value || value.length > MAX_PASSWORD_LENGTH) return null;
+  return value;
+}
 
 async function buildUserPayload(user) {
   const view = await loadAccountView(user);
@@ -20,81 +52,106 @@ async function buildUserPayload(user) {
   };
 }
 
-// @route    GET api/auth/me
-// @desc     Get current user data (The "Refresh Fix")
-// @access   Private
-router.get('/me', auth, async (req, res) => {
-  try {
-    // Orders and trades are canonical collections; embedded legacy arrays are
-    // still merged until the gated migration is explicitly applied.
-    const user = await User.findById(req.user.id).select('-password');
-    
-    if (!user) return res.status(404).json({ msg: "User not found" });
+function createAuthRouter({ rateLimits = getRateLimitConfig() } = {}) {
+  const router = express.Router();
 
-    res.json(await buildUserPayload(user));
-  } catch (err) {
-    console.error("Auth Me Error:", err.message);
-    res.status(500).send("Server Error");
-  }
-});
+  const credentialsLimiter = rateLimits.auth.max > 0 && rateLimits.auth.windowMs > 0
+    ? rateLimit(rateLimitOptions(rateLimits.auth))
+    : (_req, _res, next) => next();
+  const readLimiter = rateLimits.authRead.max > 0 && rateLimits.authRead.windowMs > 0
+    ? rateLimit(rateLimitOptions(rateLimits.authRead))
+    : (_req, _res, next) => next();
 
-// SIGNUP: Register a new user
-router.post('/signup', async (req, res) => {
-  try {
-    const { username, email, password } = req.body;
+  // @route    GET api/auth/me
+  // @desc     Get current user data (The "Refresh Fix")
+  // @access   Private
+  router.get('/me', auth, readLimiter, async (req, res) => {
+    try {
+      // Orders and trades are canonical collections; embedded legacy arrays are
+      // still merged until the gated migration is explicitly applied.
+      const user = await User.findById(req.user.id).select('-password');
 
-    if (!username || !email || !password) {
-      return res.status(400).json({ msg: "Please enter all fields" });
+      if (!user) return res.status(404).json({ msg: "User not found" });
+
+      res.json(await buildUserPayload(user));
+    } catch (err) {
+      console.error("Auth Me Error:", err.message);
+      res.status(500).send("Server Error");
     }
+  });
 
-    const existingUser = await User.findOne({ email });
-    if (existingUser) return res.status(400).json({ msg: "A user with this email already exists." });
+  // SIGNUP: Register a new user
+  router.post('/signup', credentialsLimiter, async (req, res) => {
+    try {
+      const body = readBodyObject(req.body);
+      const username = normalizeUsername(body.username);
+      const email = normalizeEmail(body.email);
+      const password = readPassword(body.password);
 
-    const salt = await bcrypt.genSalt(10);
-    const hashedPassword = await bcrypt.hash(password, salt);
+      if (!username || !email || !password) {
+        return res.status(400).json({ msg: "Please enter a valid username, email, and password." });
+      }
 
-    const newUser = new User({
-      username,
-      email,
-      password: hashedPassword,
-      balance: 10000 
-    });
+      const existingUser = await User.findOne({ email });
+      if (existingUser) return res.status(400).json({ msg: "A user with this email already exists." });
 
-    await newUser.save();
-    res.json({ msg: "Registration successful! You can now log in." });
+      const salt = await bcrypt.genSalt(10);
+      const hashedPassword = await bcrypt.hash(password, salt);
 
-  } catch (err) {
-    console.error("Signup Error:", err);
-    res.status(500).json({ msg: "Server error during signup" });
-  }
-});
+      const newUser = new User({
+        username,
+        email,
+        password: hashedPassword,
+        balance: 10000
+      });
 
-// LOGIN: Verify user and return a Token
-router.post('/login', async (req, res) => {
-  try {
-    const { email, password } = req.body;
+      await newUser.save();
+      res.json({ msg: "Registration successful! You can now log in." });
 
-    const user = await User.findOne({ email });
-    if (!user) return res.status(400).json({ msg: "No account found with this email." });
+    } catch (err) {
+      console.error("Signup Error:", err);
+      res.status(500).json({ msg: "Server error during signup" });
+    }
+  });
 
-    const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) return res.status(400).json({ msg: "Invalid password." });
+  // LOGIN: Verify user and return a Token
+  router.post('/login', credentialsLimiter, async (req, res) => {
+    try {
+      const body = readBodyObject(req.body);
+      const email = normalizeEmail(body.email);
+      const password = readPassword(body.password);
 
-    const token = jwt.sign(
-      { user: { id: user._id } }, // 🚀 Matches the standard middleware format
-      getJwtSecret(),
-      { expiresIn: '24h' }
-    );
+      // Reject non-string or malformed credentials before building a query.
+      // This prevents NoSQL operator objects such as { "$ne": null } from
+      // reaching MongoDB as a query selector.
+      if (!email || !password) {
+        return res.status(400).json({ msg: "Invalid email or password." });
+      }
 
-    const payload = await buildUserPayload(user);
-    delete payload.email;
+      const user = await User.findOne({ email });
+      if (!user) return res.status(400).json({ msg: "No account found with this email." });
 
-    res.json({ token, user: payload });
+      const isMatch = await bcrypt.compare(password, user.password);
+      if (!isMatch) return res.status(400).json({ msg: "Invalid password." });
 
-  } catch (err) {
-    console.error("Login Error:", err);
-    res.status(500).json({ msg: "Server error during login" });
-  }
-});
+      const token = jwt.sign(
+        { user: { id: user._id } }, // 🚀 Matches the standard middleware format
+        getJwtSecret(),
+        { expiresIn: '24h' }
+      );
 
-module.exports = router;
+      const payload = await buildUserPayload(user);
+      delete payload.email;
+
+      res.json({ token, user: payload });
+
+    } catch (err) {
+      console.error("Login Error:", err);
+      res.status(500).json({ msg: "Server error during login" });
+    }
+  });
+
+  return router;
+}
+
+module.exports = { createAuthRouter };

@@ -1,6 +1,8 @@
 const express = require('express');
+const { rateLimit: expressRateLimit } = require('express-rate-limit');
 const User = require('../models/User');
 const auth = require('../middleware/auth');
+const { rateLimitOptions, userRateLimitKey } = require('../middleware/rateLimit');
 const { getGeminiApiKey, getCopilotConfig } = require('../config/env');
 const { createTradeService } = require('../services/tradeService');
 const { createProposalStore } = require('../services/ai/proposalStore');
@@ -33,31 +35,6 @@ const PROPOSAL_ERROR_STATUS = Object.freeze({
   PROPOSAL_ALREADY_USED: 409,
   PROPOSAL_REVOKED: 409
 });
-
-function createRateLimiter({ max, windowMs, now = Date.now } = {}) {
-  const attempts = new Map();
-  const enabled = Number.isFinite(max) && max > 0 && Number.isFinite(windowMs) && windowMs > 0;
-
-  function check(userId) {
-    if (!enabled) return { allowed: true };
-
-    const key = String(userId);
-    const timestamp = now();
-    const cutoff = timestamp - windowMs;
-    const recent = (attempts.get(key) || []).filter(entry => entry > cutoff);
-
-    if (recent.length >= max) {
-      attempts.set(key, recent);
-      return { allowed: false, retryAfterMs: Math.max(0, recent[0] + windowMs - timestamp) };
-    }
-
-    recent.push(timestamp);
-    attempts.set(key, recent);
-    return { allowed: true };
-  }
-
-  return { check };
-}
 
 function readPrompt(prompt, maxLength) {
   if (typeof prompt !== 'string') {
@@ -129,11 +106,13 @@ function createCopilotRouter({
   const tradeService = createTradeService({ feed, User: UserModel, runtimeStatus });
 
   const limits = rateLimit || runtime.rateLimit;
-  const limiter = createRateLimiter({
-    max: limits.max,
-    windowMs: limits.windowMs,
-    now
-  });
+  const copilotLimiter = limits.max > 0 && limits.windowMs > 0
+    ? expressRateLimit(rateLimitOptions({
+      ...limits,
+      keyGenerator: userRateLimitKey,
+      message: 'Too many copilot requests. Please wait and retry.'
+    }))
+    : (_req, _res, next) => next();
 
   let cachedExtractor = ai || null;
 
@@ -149,27 +128,12 @@ function createCopilotRouter({
     return cachedExtractor;
   }
 
-  function enforceRateLimit(req, res) {
-    const verdict = limiter.check(req.user.id);
-    if (verdict.allowed) return false;
-
-    res.set('Retry-After', String(Math.max(1, Math.ceil(verdict.retryAfterMs / 1000))));
-    res.status(429).json({
-      success: false,
-      code: 'RATE_LIMITED',
-      message: 'Too many copilot requests. Please wait and retry.'
-    });
-    return true;
-  }
-
   const router = express.Router();
 
   // Stage 1: extract and validate intent, build a server-side proposal, and
   // return a preview. This route never mutates the account.
-  router.post('/parse', auth, async (req, res) => {
+  router.post('/parse', auth, copilotLimiter, async (req, res) => {
     try {
-      if (enforceRateLimit(req, res)) return undefined;
-
       const promptCheck = readPrompt(req.body?.prompt, maxPromptLength);
       if (!promptCheck.ok) {
         return res.status(400).json({
@@ -310,10 +274,8 @@ function createCopilotRouter({
 
   // Stage 2: consume the server-side proposal exactly once and execute its
   // stored intent through the same trade service used by manual orders.
-  router.post('/execute', auth, async (req, res) => {
+  router.post('/execute', auth, copilotLimiter, async (req, res) => {
     try {
-      if (enforceRateLimit(req, res)) return undefined;
-
       const proposalId = typeof req.body?.proposalId === 'string'
         ? req.body.proposalId.trim()
         : '';
@@ -432,7 +394,7 @@ function createCopilotRouter({
 
   // Stage 1b: owner-only server-side discard. Revocation never trades or
   // reserves anything; a revoked proposal is never executable.
-  router.post('/proposals/:proposalId/revoke', auth, async (req, res) => {
+  router.post('/proposals/:proposalId/revoke', auth, copilotLimiter, async (req, res) => {
     try {
       const result = store.revoke({
         proposalId: req.params.proposalId,

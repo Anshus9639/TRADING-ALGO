@@ -19,6 +19,12 @@ const DEFAULT_PROPOSAL_TTL_MS = 120000;
 const DEFAULT_MAX_PRICE_DRIFT_PCT = 1.5;
 const DEFAULT_COPILOT_RATE_LIMIT_MAX = 10;
 const DEFAULT_COPILOT_RATE_LIMIT_WINDOW_MS = 60000;
+const DEFAULT_AUTH_RATE_LIMIT_MAX = 10;
+const DEFAULT_AUTH_RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
+const DEFAULT_AUTH_READ_RATE_LIMIT_MAX = 120;
+const DEFAULT_AUTH_READ_RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const DEFAULT_TRADE_RATE_LIMIT_MAX = 60;
+const DEFAULT_TRADE_RATE_LIMIT_WINDOW_MS = 60 * 1000;
 
 class ConfigError extends Error {
   constructor(message) {
@@ -103,6 +109,75 @@ function readOptionalPositive(value, name, max) {
   return number;
 }
 
+function parseTrustProxy(value, nodeEnv) {
+  if (value === undefined || value === null || String(value).trim() === '') {
+    // Render terminates TLS at a single proxy hop. Anything else (local, test)
+    // must not trust forwarded headers.
+    return nodeEnv === 'production' ? 1 : false;
+  }
+
+  const raw = String(value).trim().toLowerCase();
+  if (raw === 'false') return false;
+  if (raw === 'true') {
+    throw new ConfigError(
+      'TRUST_PROXY must be a hop count (0-5), not true, so arbitrary forwarded headers are never trusted.'
+    );
+  }
+
+  const hops = Number(raw);
+  if (!Number.isInteger(hops) || hops < 0 || hops > 5) {
+    throw new ConfigError('TRUST_PROXY must be false or an integer hop count between 0 and 5.');
+  }
+  return hops === 0 ? false : hops;
+}
+
+function getRateLimitConfig(env = process.env) {
+  return {
+    auth: {
+      max: Math.round(parseBoundedNumber(env.AUTH_RATE_LIMIT_MAX, 'AUTH_RATE_LIMIT_MAX', {
+        fallback: DEFAULT_AUTH_RATE_LIMIT_MAX,
+        min: 0,
+        max: 100000,
+        allowZero: true
+      })),
+      windowMs: Math.round(parseBoundedNumber(env.AUTH_RATE_LIMIT_WINDOW_SECONDS, 'AUTH_RATE_LIMIT_WINDOW_SECONDS', {
+        fallback: DEFAULT_AUTH_RATE_LIMIT_WINDOW_MS / 1000,
+        min: 0,
+        max: 86400,
+        allowZero: true
+      }) * 1000)
+    },
+    authRead: {
+      max: Math.round(parseBoundedNumber(env.AUTH_READ_RATE_LIMIT_MAX, 'AUTH_READ_RATE_LIMIT_MAX', {
+        fallback: DEFAULT_AUTH_READ_RATE_LIMIT_MAX,
+        min: 0,
+        max: 100000,
+        allowZero: true
+      })),
+      windowMs: Math.round(parseBoundedNumber(env.AUTH_READ_RATE_LIMIT_WINDOW_SECONDS, 'AUTH_READ_RATE_LIMIT_WINDOW_SECONDS', {
+        fallback: DEFAULT_AUTH_READ_RATE_LIMIT_WINDOW_MS / 1000,
+        min: 0,
+        max: 86400,
+        allowZero: true
+      }) * 1000)
+    },
+    trade: {
+      max: Math.round(parseBoundedNumber(env.TRADE_RATE_LIMIT_MAX, 'TRADE_RATE_LIMIT_MAX', {
+        fallback: DEFAULT_TRADE_RATE_LIMIT_MAX,
+        min: 0,
+        max: 100000,
+        allowZero: true
+      })),
+      windowMs: Math.round(parseBoundedNumber(env.TRADE_RATE_LIMIT_WINDOW_SECONDS, 'TRADE_RATE_LIMIT_WINDOW_SECONDS', {
+        fallback: DEFAULT_TRADE_RATE_LIMIT_WINDOW_MS / 1000,
+        min: 0,
+        max: 86400,
+        allowZero: true
+      }) * 1000)
+    }
+  };
+}
+
 function getCopilotConfig(env = process.env) {
   return {
     geminiModel: readString(env, 'GEMINI_MODEL') || DEFAULT_GEMINI_MODEL,
@@ -139,9 +214,11 @@ function getCopilotConfig(env = process.env) {
 }
 
 function loadAppConfig(env = process.env) {
+  const nodeEnv = normalizeNodeEnv(env.NODE_ENV);
   return {
-    nodeEnv: normalizeNodeEnv(env.NODE_ENV),
-    corsOrigins: parseCorsOrigins(env.CORS_ORIGINS)
+    nodeEnv,
+    corsOrigins: parseCorsOrigins(env.CORS_ORIGINS),
+    trustProxy: parseTrustProxy(env.TRUST_PROXY, nodeEnv)
   };
 }
 
@@ -189,6 +266,8 @@ function loadConfig(env = process.env) {
     geminiModel: copilot.geminiModel,
     geminiTimeoutMs: copilot.geminiTimeoutMs,
     copilot,
+    trustProxy: parseTrustProxy(env.TRUST_PROXY, nodeEnv),
+    rateLimit: getRateLimitConfig(env),
     corsOrigins: parseCorsOrigins(env.CORS_ORIGINS)
   };
 }
@@ -222,12 +301,20 @@ module.exports = {
   DEFAULT_MAX_PRICE_DRIFT_PCT,
   DEFAULT_COPILOT_RATE_LIMIT_MAX,
   DEFAULT_COPILOT_RATE_LIMIT_WINDOW_MS,
+  DEFAULT_AUTH_RATE_LIMIT_MAX,
+  DEFAULT_AUTH_RATE_LIMIT_WINDOW_MS,
+  DEFAULT_AUTH_READ_RATE_LIMIT_MAX,
+  DEFAULT_AUTH_READ_RATE_LIMIT_WINDOW_MS,
+  DEFAULT_TRADE_RATE_LIMIT_MAX,
+  DEFAULT_TRADE_RATE_LIMIT_WINDOW_MS,
   loadAppConfig,
   loadConfig,
   getJwtSecret,
   getGeminiApiKey,
   isGeminiConfigured,
   getCopilotConfig,
+  getRateLimitConfig,
+  parseTrustProxy,
   isRemoteMongoUri,
   parseCorsOrigins
 };

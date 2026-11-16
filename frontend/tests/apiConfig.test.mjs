@@ -74,6 +74,35 @@ test('socket origin matches the configured API origin', () => {
   );
 });
 
+const RENDER_DOMAIN = 'onrender.com';
+const URL_PATTERN = /https?:\/\/[^\s'"`)]+/g;
+
+// Compare the parsed hostname exactly or at a dot boundary. Substring checks
+// would accept evil-onrender.com and trusted.onrender.com.attacker.example.
+function isRenderDeploymentUrl(value) {
+  const hostname = new URL(value).hostname.toLowerCase();
+  return hostname === RENDER_DOMAIN || hostname.endsWith(`.${RENDER_DOMAIN}`);
+}
+
+function renderDeploymentUrlsInSource(source) {
+  return (source.match(URL_PATTERN) || []).filter(candidate => {
+    try {
+      return isRenderDeploymentUrl(candidate);
+    } catch {
+      return false;
+    }
+  });
+}
+
+test('Render hostname detection respects domain boundaries', () => {
+  assert.equal(isRenderDeploymentUrl('https://service.onrender.com'), true);
+  assert.equal(isRenderDeploymentUrl('https://api.service.onrender.com:443/v1'), true);
+  assert.equal(isRenderDeploymentUrl('https://onrender.com'), true);
+  assert.equal(isRenderDeploymentUrl('https://evil-onrender.com'), false);
+  assert.equal(isRenderDeploymentUrl('https://trusted.onrender.com.attacker.example'), false);
+  assert.equal(isRenderDeploymentUrl('https://service.onrender.com.attacker.example'), false);
+});
+
 test('frontend sources use the centralized API helpers only', () => {
   const files = [
     '../src/App.jsx',
@@ -85,7 +114,11 @@ test('frontend sources use the centralized API helpers only', () => {
 
   for (const file of files) {
     const source = readFileSync(new URL(file, import.meta.url), 'utf8');
-    assert.ok(!source.includes('onrender.com'), `${file} still contains a hardcoded API URL`);
+    assert.deepEqual(
+      renderDeploymentUrlsInSource(source),
+      [],
+      `${file} still contains a hardcoded Render API URL`
+    );
     assert.ok(!source.includes("from 'axios'"), `${file} bypasses the shared axios client`);
   }
 
