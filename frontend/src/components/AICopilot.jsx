@@ -101,6 +101,15 @@ const AICopilot = ({ token, watchlist, onTradeComplete }) => {
       if (onTradeComplete) {
         onTradeComplete(trade.balance, trade.portfolio, trade.newTrade, trade.pendingOrders);
       }
+    } else if (result.uncertain) {
+      // The outcome is unknown, so the proposal is kept and Confirm stays
+      // active: retrying reuses the same proposal id, which the backend
+      // replays idempotently instead of executing twice.
+      setProposal(result.state);
+      setLog({
+        text: 'Execution not confirmed. Retry with the same proposal or discard it.',
+        status: 'error'
+      });
     } else {
       setProposal(null);
       if (result.reason === 'PRICE_CHANGED') {

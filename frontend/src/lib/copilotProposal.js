@@ -95,6 +95,17 @@ export function createConfirmLock() {
   return { active: false };
 }
 
+// A response-less failure, a timeout, or a 5xx means the server may have
+// executed the proposal even though the client never saw the result. Those
+// outcomes must keep the proposal and its id so a retry replays the same
+// idempotent execution instead of creating a different one.
+export function isUncertainFailure(error) {
+  if (error?.definite) return false;
+  if (!error?.response) return true;
+  const status = error.response.status;
+  return status >= 500 || status === 408;
+}
+
 export async function confirmProposal({
   http,
   state,
@@ -127,6 +138,8 @@ export async function confirmProposal({
     if (!data.success) {
       const error = new Error(data.message || 'Execution failed.');
       error.code = data.code;
+      // The server answered, so this is a definitive rejection.
+      error.definite = true;
       throw error;
     }
 
@@ -139,6 +152,22 @@ export async function confirmProposal({
     const data = error?.response?.data || {};
     const code = data.code || error?.code || 'TRADE_FAILED';
     const message = data.message || error?.message || 'Execution failed.';
+
+    if (isUncertainFailure(error)) {
+      return {
+        ok: false,
+        uncertain: true,
+        reason: 'EXECUTION_UNCONFIRMED',
+        // Status stays READY so Confirm remains available and retries reuse
+        // the same proposal id, which the backend treats as idempotent.
+        state: {
+          ...state,
+          status: PROPOSAL_STATUS.READY,
+          error: 'Execution could not be confirmed. Retry with the same proposal before it expires.'
+        }
+      };
+    }
+
     const status = code === 'PRICE_CHANGED'
       ? PROPOSAL_STATUS.PRICE_CHANGED
       : code === 'PROPOSAL_EXPIRED'

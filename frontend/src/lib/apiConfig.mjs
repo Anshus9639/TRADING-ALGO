@@ -4,12 +4,20 @@ function normalizeMode(env) {
   return String(env.MODE || env.NODE_ENV || 'development').toLowerCase();
 }
 
+// Vite sets PROD for every production bundle, including custom modes such as
+// `npm run build -- --mode staging`. The mode name alone is not proof of a
+// production build.
+function isProductionBuild(env) {
+  if (env.PROD === true || env.PROD === 'true') return true;
+  if (env.NODE_ENV === 'production') return true;
+  return normalizeMode(env) === 'production';
+}
+
 export function resolveApiUrl(env = {}) {
-  const mode = normalizeMode(env);
   const raw = typeof env.VITE_API_URL === 'string' ? env.VITE_API_URL.trim() : '';
 
   if (!raw) {
-    if (mode === 'production') {
+    if (isProductionBuild(env)) {
       throw new Error('VITE_API_URL must be set for production builds.');
     }
     return DEFAULT_DEV_API_URL;

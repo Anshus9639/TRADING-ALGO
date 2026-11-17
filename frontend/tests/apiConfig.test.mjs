@@ -39,7 +39,7 @@ test('invalid URLs are rejected', () => {
   );
 });
 
-test('production requires an explicit API URL', () => {
+test('production requires an explicit API URL regardless of the selected mode', () => {
   assert.throws(
     () => resolveApiUrl({ MODE: 'production' }),
     /VITE_API_URL must be set/
@@ -48,6 +48,17 @@ test('production requires an explicit API URL', () => {
     () => resolveApiUrl({ MODE: 'production', VITE_API_URL: '   ' }),
     /VITE_API_URL must be set/
   );
+  // `vite build --mode staging` still produces a production bundle.
+  assert.throws(
+    () => resolveApiUrl({ MODE: 'staging', PROD: true }),
+    /VITE_API_URL must be set/
+  );
+  assert.throws(
+    () => resolveApiUrl({ MODE: 'staging', NODE_ENV: 'production' }),
+    /VITE_API_URL must be set/
+  );
+  // A dev server keeps the localhost default even when MODE is custom.
+  assert.equal(resolveApiUrl({ MODE: 'staging', PROD: false }), DEFAULT_DEV_API_URL);
 });
 
 test('production accepts a valid API URL', () => {

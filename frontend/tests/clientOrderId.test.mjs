@@ -34,8 +34,13 @@ test('QuickOrder sends a clientOrderId and reuses it after network failures', ()
 
   assert.match(source, /createClientOrderId/);
   assert.match(source, /payload\.clientOrderId/);
-  assert.match(source, /pendingSubmission\.current\?\.key === requestKey/);
-  assert.match(source, /if \(err\.response\) pendingSubmission\.current = null/);
+  assert.match(source, /pendingSubmissions\.current\.get\(requestKey\)/);
+  assert.match(source, /pendingSubmissions\.current\.set\(requestKey, payload\.clientOrderId\)/);
+  // Keys are only retired once the server definitively refused the order.
+  assert.match(source, /status < 500 && status !== 408/);
+  assert.doesNotMatch(source, /if \(err\.response\) pendingSubmission\.current = null/);
+  // A new submission cannot overwrite another unresolved submission's id.
+  assert.doesNotMatch(source, /pendingSubmissions\.current = new Map\(\)/);
 });
 
 test('AICopilot discard goes through the server-side revocation controller', () => {

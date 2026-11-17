@@ -12,6 +12,7 @@ import {
   discardProposal,
   canConfirm,
   isExpired,
+  isUncertainFailure,
   formatRemaining
 } from '../src/lib/copilotProposal.js';
 
@@ -196,7 +197,70 @@ test('invalid proposal payloads are rejected', () => {
   );
 });
 
-test('AICopilot keeps its logs/layout and routes confirmation through the controller', () => {
+test('network failures keep the proposal confirmable so a retry reuses its id', async () => {
+  const networkError = Object.assign(new Error('Network Error'), { code: 'ERR_NETWORK' });
+  const http = recorder({ executeRejection: networkError });
+  const state = createProposalState(payload(), NOW);
+
+  const result = await confirmProposal({ http, state, token: 'token-1', now: NOW });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.uncertain, true);
+  assert.equal(result.reason, 'EXECUTION_UNCONFIRMED');
+  assert.equal(result.state.status, PROPOSAL_STATUS.READY);
+  assert.equal(result.state.proposalId, state.proposalId);
+  assert.equal(isExpired(result.state, NOW), false);
+  assert.equal(canConfirm(result.state, NOW), true);
+  assert.equal(http.calls.length, 1);
+  assert.deepEqual(http.calls[0].body, { proposalId: 'a'.repeat(48) });
+});
+
+test('an uncertain 5xx keeps the proposal instead of discarding it', async () => {
+  const failure = Object.assign(new Error('Request failed'), {
+    response: {
+      status: 500,
+      data: { success: false, code: 'COPILOT_ERROR', message: 'Copilot request failed.' }
+    }
+  });
+  const http = recorder({ executeRejection: failure });
+  const state = createProposalState(payload(), NOW);
+
+  const result = await confirmProposal({ http, state, token: 'token-1', now: NOW });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.uncertain, true);
+  assert.equal(result.state.status, PROPOSAL_STATUS.READY);
+  assert.equal(canConfirm(result.state, NOW), true);
+  assert.equal(isUncertainFailure(failure), true);
+  assert.equal(isUncertainFailure(Object.assign(new Error('timeout'), {
+    response: { status: 408, data: {} }
+  })), true);
+});
+
+test('a definitive 4xx rejection discards the proposal and never retries', async () => {
+  const failure = Object.assign(new Error('Request failed'), {
+    response: {
+      status: 409,
+      data: { success: false, code: 'PROPOSAL_ALREADY_USED', message: 'Already used.' }
+    }
+  });
+  const http = recorder({ executeRejection: failure });
+  const state = createProposalState(payload(), NOW);
+
+  const result = await confirmProposal({ http, state, token: 'token-1', now: NOW });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.uncertain, undefined);
+  assert.equal(result.reason, 'PROPOSAL_ALREADY_USED');
+  assert.equal(result.state.status, PROPOSAL_STATUS.ERROR);
+  assert.equal(canConfirm(result.state, NOW), false);
+  assert.equal(isUncertainFailure(failure), false);
+  // An explicit success:false body is definitive even without a status code.
+  const inline = Object.assign(new Error('Rejected'), { code: 'TRADE_REJECTED', definite: true });
+  assert.equal(isUncertainFailure(inline), false);
+});
+
+test('AICopilot keeps an unconfirmed proposal and routes confirmation through the controller', () => {
   const source = fs.readFileSync(
     path.join(here, '..', 'src', 'components', 'AICopilot.jsx'),
     'utf8'
@@ -210,5 +274,7 @@ test('AICopilot keeps its logs/layout and routes confirmation through the contro
   assert.match(source, /Discard/);
   assert.match(source, /confirmProposal/);
   assert.match(source, /requestProposal/);
+  assert.match(source, /result\.uncertain/);
+  assert.match(source, /setProposal\(result\.state\)/);
   assert.doesNotMatch(source, /api\.post\('\/api\/copilot\/execute'/);
 });

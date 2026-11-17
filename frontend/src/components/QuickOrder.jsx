@@ -8,9 +8,9 @@ const QuickOrder = ({ activeSymbol, currentPrice, token, onTradeComplete }) => {
   const [limitPrice, setLimitPrice] = useState(''); // 🚀 New: Tracks target price
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState(null); 
-  // Reused when a network failure is retried so the backend can return the
-  // original execution instead of placing a second order.
-  const pendingSubmission = useRef(null);
+  // Keyed per submission so a retry of an unresolved order reuses its original
+  // idempotency key, and a different order cannot overwrite that identity.
+  const pendingSubmissions = useRef(new Map());
 
   // 🚀 Auto-fill limit price with the current live price when switching to LIMIT tab
   useEffect(() => {
@@ -28,6 +28,7 @@ const QuickOrder = ({ activeSymbol, currentPrice, token, onTradeComplete }) => {
     if (orderType === 'LIMIT' && (!limitPrice || limitPrice <= 0)) return setMessage({ text: "Error: Enter a valid target price.", type: "error" });
 
     setLoading(true);
+    let requestKey = null;
     try {
       let endpoint = '';
       const numericQuantity = Number(quantity);
@@ -43,22 +44,22 @@ const QuickOrder = ({ activeSymbol, currentPrice, token, onTradeComplete }) => {
         payload.limitPrice = numericLimitPrice;
       }
 
-      const requestKey = [
+      requestKey = [
         endpoint,
         side,
         activeSymbol,
         numericQuantity,
         orderType === 'LIMIT' ? numericLimitPrice : 'MARKET'
       ].join('|');
-      if (pendingSubmission.current?.key === requestKey) {
-        payload.clientOrderId = pendingSubmission.current.clientOrderId;
+      const pending = pendingSubmissions.current.get(requestKey);      if (pending) {
+        payload.clientOrderId = pending;
       } else {
         payload.clientOrderId = createClientOrderId();
-        pendingSubmission.current = { key: requestKey, clientOrderId: payload.clientOrderId };
+        pendingSubmissions.current.set(requestKey, payload.clientOrderId);
       }
 
       const res = await api.post(endpoint, payload, authHeaders(token));
-      pendingSubmission.current = null;
+      pendingSubmissions.current.delete(requestKey);
 
       // Success! Show inline message
       const successText = orderType === 'LIMIT' 
@@ -73,9 +74,14 @@ const QuickOrder = ({ activeSymbol, currentPrice, token, onTradeComplete }) => {
       }
       
     } catch (err) {
-      // Only a received response proves the request reached the server. Keep
-      // the idempotency key for a retry after network failures or timeouts.
-      if (err.response) pendingSubmission.current = null;
+      // A definite 4xx/5xx answer below 500 (other than 408) proves the server
+      // rejected the request, so its key can be retired. Network failures,
+      // timeouts and 5xx responses are uncertain and keep the key so a retry
+      // replays the same order instead of placing a duplicate.
+      const status = err.response?.status;
+      if (requestKey && status && status < 500 && status !== 408) {
+        pendingSubmissions.current.delete(requestKey);
+      }
       // Error! Show inline message
       const errorMsg = err.response?.data?.message || "Trade failed due to server error.";
       setMessage({ text: `Rejected: ${errorMsg}`, type: "error" });
