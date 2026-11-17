@@ -13,6 +13,10 @@ const MAX_USERNAME_LENGTH = 50;
 // bcrypt only considers the first 72 UTF-8 bytes. Enforcing the limit on signup
 // prevents silently truncated credentials.
 const MAX_PASSWORD_LENGTH = 72;
+// Allowlist of the fields the account view reads. The password hash is never
+// loaded for session restoration; an exclusion projection would still fetch a
+// document the hash analysis treats as password-bearing.
+const ACCOUNT_VIEW_FIELDS = 'username email balance lockedBalance portfolio pendingOrders trades';
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 function readBodyObject(body) {
@@ -83,7 +87,7 @@ function createAuthRouter({ rateLimits = getRateLimitConfig() } = {}) {
     try {
       // Orders and trades are canonical collections; embedded legacy arrays are
       // still merged until the gated migration is explicitly applied.
-      const user = await User.findById(req.user.id).select('-password');
+      const user = await User.findById(req.user.id, ACCOUNT_VIEW_FIELDS).lean();
 
       if (!user) return res.status(404).json({ msg: "User not found" });
 

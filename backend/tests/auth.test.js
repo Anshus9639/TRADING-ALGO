@@ -1,6 +1,8 @@
 const request = require('supertest');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const fs = require('fs');
+const path = require('path');
 const { createApp } = require('../app');
 const User = require('../models/User');
 const { createMarketFeed } = require('../services/marketFeed');
@@ -52,6 +54,33 @@ describe('authentication and session restoration', () => {
 
     expect(me.status).toBe(200);
     expect(me.body.pendingOrders).toEqual([]);
+  });
+
+  test('session restoration never loads the password hash', async () => {
+    const user = await createLoginUser({ username: 'projection-user' });
+
+    const login = await request(app)
+      .post('/api/auth/login')
+      .send({ email: user.email, password: PASSWORD });
+
+    const me = await request(app)
+      .get('/api/auth/me')
+      .set('x-auth-token', login.body.token);
+
+    expect(me.status).toBe(200);
+    expect(me.body).not.toHaveProperty('password');
+    expect(me.body.username).toBe('projection-user');
+    expect(me.body.email).toBe(user.email);
+
+    // The legacy identity hash receives user._id from this document. Loading an
+    // allowlist projection keeps the hash and its analysis out of the flow
+    // instead of relying on a password-omitting `select`.
+    const source = fs.readFileSync(path.join(__dirname, '..', 'routes', 'auth.js'), 'utf8');
+    expect(source).not.toMatch(/\.select\(/);
+    expect(source).toMatch(/findById\(req\.user\.id, ACCOUNT_VIEW_FIELDS\)/);
+    const declaration = source.match(/const ACCOUNT_VIEW_FIELDS = '([^']*)'/);
+    expect(declaration).not.toBeNull();
+    expect(declaration[1]).not.toMatch(/password/i);
   });
 
   test('pending limit orders survive login and session refresh', async () => {
