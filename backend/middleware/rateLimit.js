@@ -24,6 +24,11 @@ function rateLimitHandler(message = RATE_LIMITED_MESSAGE) {
 // `rateLimit(rateLimitOptions(...))` directly so the middleware is explicit in
 // the Express chain.
 //
+// Limiters are installed before authentication. This bounds the work an
+// unauthenticated caller can force (JWT verification, database queries) and
+// requires an IP-based key because no user id exists yet. Express `trust proxy`
+// controls how the client IP is derived per deployment topology.
+//
 // The default store is in memory, so limits are enforced per process. A
 // multi-instance deployment would need a shared store (for example Redis) to
 // keep the effective limit consistent across instances.
@@ -45,16 +50,8 @@ function rateLimitOptions({ windowMs, max, keyGenerator, message } = {}) {
   return options;
 }
 
-// Authenticated routes pass this key so one user cannot exhaust another
-// user's budget. Public auth routes keep the library's IP key, which uses
-// Express `trust proxy` according to the deployment topology.
-function userRateLimitKey(req) {
-  return String(req.user.id);
-}
-
 module.exports = {
   RATE_LIMITED_MESSAGE,
   rateLimitHandler,
-  rateLimitOptions,
-  userRateLimitKey
+  rateLimitOptions
 };

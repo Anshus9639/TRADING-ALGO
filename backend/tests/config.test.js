@@ -8,6 +8,7 @@ const {
   isGeminiConfigured,
   getRateLimitConfig,
   parseTrustProxy,
+  isRemoteMongoUri,
   MIN_JWT_SECRET_LENGTH,
   DEFAULT_CORS_ORIGINS,
   DEFAULT_AUTH_RATE_LIMIT_MAX,
@@ -78,6 +79,25 @@ describe('backend environment configuration', () => {
   test('allows a remote database outside development without an override', () => {
     const config = loadConfig(baseEnv({ NODE_ENV: 'production', MONGO_URI: REMOTE_URI }));
     expect(config.isProduction).toBe(true);
+  });
+
+  test('every seed host decides whether a MongoDB URI is remote', () => {
+    expect(isRemoteMongoUri(LOCAL_URI)).toBe(false);
+    expect(isRemoteMongoUri(REMOTE_URI)).toBe(true);
+    expect(isRemoteMongoUri('mongodb://localhost:27017,127.0.0.1:27017/nexustrade')).toBe(false);
+    // A local seed first must not hide a remote replica-set member.
+    expect(isRemoteMongoUri(
+      'mongodb://127.0.0.1:27017,remote.example.com:27017/nexustrade?replicaSet=rs0'
+    )).toBe(true);
+    expect(isRemoteMongoUri(
+      'mongodb://remote.example.com:27017,127.0.0.1:27017/nexustrade?replicaSet=rs0'
+    )).toBe(true);
+    expect(isRemoteMongoUri('mongodb://[::1]:27017,localhost:27017/nexustrade')).toBe(false);
+  });
+
+  test('a remote seed listed after a local one still requires the development override', () => {
+    const mixedUri = 'mongodb://localhost:27017,db.internal.example:27017/nexustrade';
+    expect(() => loadConfig(baseEnv({ MONGO_URI: mixedUri }))).toThrow(/ALLOW_REMOTE_DB_IN_DEV/);
   });
 
   test('loads app-only configuration without database or JWT secrets', () => {

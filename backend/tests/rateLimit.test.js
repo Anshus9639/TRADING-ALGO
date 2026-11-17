@@ -57,7 +57,7 @@ describe('explicit rate limiting', () => {
     expect(otherRoute.status).toBe(429);
   });
 
-  test('limits manual trade endpoints per authenticated user', async () => {
+  test('limits manual trade endpoints across the shared trade budget', async () => {
     const app = createApp({
       feed: createMarketFeed(),
       trade: { rateLimit: { max: 2, windowMs: WINDOW_MS } }
@@ -72,6 +72,55 @@ describe('explicit rate limiting', () => {
     expect(limited.status).toBe(429);
     expect(limited.body.code).toBe('RATE_LIMITED');
     expect(Number(limited.headers['retry-after'])).toBeGreaterThan(0);
+  });
+
+  test('the trade limiter runs before authentication', async () => {
+    const app = createApp({
+      feed: createMarketFeed(),
+      trade: { rateLimit: { max: 1, windowMs: WINDOW_MS } }
+    });
+
+    // Unauthenticated requests must still consume the limiter budget. If auth
+    // ran first, the second request would be a 401 instead of a 429.
+    const first = await request(app).post('/api/trade/buy').send({});
+    expect(first.status).toBe(401);
+
+    const limited = await request(app).post('/api/trade/sell').send({});
+    expect(limited.status).toBe(429);
+    expect(limited.body.code).toBe('RATE_LIMITED');
+  });
+
+  test('the auth read limiter runs before authentication on /me', async () => {
+    const app = createApp({
+      feed: createMarketFeed(),
+      auth: {
+        rateLimits: {
+          auth: { max: 100, windowMs: WINDOW_MS },
+          authRead: { max: 1, windowMs: WINDOW_MS }
+        }
+      }
+    });
+
+    const first = await request(app).get('/api/auth/me');
+    expect(first.status).toBe(401);
+
+    const limited = await request(app).get('/api/auth/me');
+    expect(limited.status).toBe(429);
+    expect(limited.body.code).toBe('RATE_LIMITED');
+  });
+
+  test('the copilot limiter runs before authentication', async () => {
+    const app = createApp({
+      feed: createMarketFeed(),
+      copilot: { rateLimit: { max: 1, windowMs: WINDOW_MS } }
+    });
+
+    const first = await request(app).post('/api/copilot/parse').send({ prompt: 'buy 0.1 BTC' });
+    expect(first.status).toBe(401);
+
+    const limited = await request(app).post('/api/copilot/execute').send({});
+    expect(limited.status).toBe(429);
+    expect(limited.body.code).toBe('RATE_LIMITED');
   });
 
   test('limits the copilot revoke endpoint', async () => {

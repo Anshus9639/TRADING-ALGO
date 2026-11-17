@@ -74,20 +74,26 @@ function parseCorsOrigins(value) {
   return origins;
 }
 
-function extractMongoHost(authority) {
-  const firstHost = authority.split(',')[0].trim();
-  if (firstHost.startsWith('[')) {
-    const end = firstHost.indexOf(']');
-    return end > -1 ? firstHost.slice(1, end).toLowerCase() : '';
+function extractMongoHost(seed) {
+  const host = seed.trim();
+  if (host.startsWith('[')) {
+    const end = host.indexOf(']');
+    return end > -1 ? host.slice(1, end).toLowerCase() : '';
   }
-  return firstHost.split(':')[0].toLowerCase();
+  return host.split(':')[0].toLowerCase();
 }
 
+// A replica-set URI may list several seeds. The connection is remote if ANY
+// seed is nonlocal: the driver can route operations to that member.
 function isRemoteMongoUri(uri) {
   const match = /^mongodb(?:\+srv)?:\/\/(?:[^@/]+@)?([^/?]+)/i.exec(uri);
   if (!match) return false;
-  const host = extractMongoHost(match[1]);
-  return Boolean(host) && !LOCAL_DB_HOSTS.has(host);
+  const hosts = match[1]
+    .split(',')
+    .map(extractMongoHost)
+    .filter(Boolean);
+  if (hosts.length === 0) return false;
+  return hosts.some(host => !LOCAL_DB_HOSTS.has(host));
 }
 
 function parseBoundedNumber(value, name, { fallback, min, max, allowZero = false }) {

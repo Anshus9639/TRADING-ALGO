@@ -107,11 +107,14 @@ mongoose.connect(config.mongoUri)
       setInterval(async () => {
         try {
           const stats = await matcher.runCycle();
-          // A successful cycle clears a previous FAILED state; a failure below
-          // immediately clears ACTIVE so readiness cannot remain stale.
-          runtimeStatus.markMatcherActive();
-          if (!stats.skipped && (stats.filled > 0 || stats.failed > 0 || stats.recovered > 0)) {
-            console.log('⚡ Matcher cycle:', JSON.stringify(stats));
+          // A skipped cycle proves nothing about recovery: the previous cycle
+          // may still be running or the matcher may still be FAILED. Only a
+          // completed, non-skipped cycle may restore ACTIVE readiness.
+          if (!stats.skipped) {
+            runtimeStatus.markMatcherActive();
+            if (stats.filled > 0 || stats.failed > 0 || stats.recovered > 0) {
+              console.log('⚡ Matcher cycle:', JSON.stringify(stats));
+            }
           }
         } catch (err) {
           runtimeStatus.markMatcherFailed('MATCHER_CYCLE_FAILED', err.message);

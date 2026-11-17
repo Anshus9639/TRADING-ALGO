@@ -1,7 +1,7 @@
 const express = require('express');
 const { rateLimit } = require('express-rate-limit');
 const auth = require('../middleware/auth');
-const { rateLimitOptions, userRateLimitKey } = require('../middleware/rateLimit');
+const { rateLimitOptions } = require('../middleware/rateLimit');
 const { getRateLimitConfig } = require('../config/env');
 const { createTradeService } = require('../services/tradeService');
 const { validateClientOrderId } = require('../lib/validate');
@@ -14,7 +14,7 @@ function createTradeRouter({
   const router = express.Router();
   const tradeService = createTradeService({ feed, runtimeStatus });
   const tradeLimiter = rateLimitConfig.max > 0 && rateLimitConfig.windowMs > 0
-    ? rateLimit(rateLimitOptions({ ...rateLimitConfig, keyGenerator: userRateLimitKey }))
+    ? rateLimit(rateLimitOptions(rateLimitConfig))
     : (_req, _res, next) => next();
 
   async function send(res, work) {
@@ -55,10 +55,12 @@ function createTradeRouter({
   }
 
   // Market orders are priced exclusively by the server-side market feed.
-  router.post('/buy', auth, tradeLimiter, (req, res) => handleMarketOrder(req, res, 'BUY'));
-  router.post('/sell', auth, tradeLimiter, (req, res) => handleMarketOrder(req, res, 'SELL'));
+  // The limiter runs before `auth` so it also bounds token verification work;
+  // keying by IP is therefore required (there is no authenticated user yet).
+  router.post('/buy', tradeLimiter, auth, (req, res) => handleMarketOrder(req, res, 'BUY'));
+  router.post('/sell', tradeLimiter, auth, (req, res) => handleMarketOrder(req, res, 'SELL'));
 
-  router.post('/limit', auth, tradeLimiter, (req, res) => {
+  router.post('/limit', tradeLimiter, auth, (req, res) => {
     const clientOrderId = requireClientOrderId(req, res);
     if (!clientOrderId) return undefined;
 
@@ -74,7 +76,7 @@ function createTradeRouter({
     }));
   });
 
-  router.delete('/cancel/:orderId', auth, tradeLimiter, (req, res) => {
+  router.delete('/cancel/:orderId', tradeLimiter, auth, (req, res) => {
     return send(res, () => tradeService.cancelOrder({
       orderId: req.params.orderId,
       userId: req.user.id

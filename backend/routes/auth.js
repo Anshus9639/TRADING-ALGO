@@ -76,7 +76,10 @@ function createAuthRouter({ rateLimits = getRateLimitConfig() } = {}) {
   // @route    GET api/auth/me
   // @desc     Get current user data (The "Refresh Fix")
   // @access   Private
-  router.get('/me', auth, readLimiter, async (req, res) => {
+  // The read limiter precedes authentication so unauthenticated traffic cannot
+  // force unbounded JWT verification. Before `auth` there is no user id, so the
+  // limiter keys by client IP.
+  router.get('/me', readLimiter, auth, async (req, res) => {
     try {
       // Orders and trades are canonical collections; embedded legacy arrays are
       // still merged until the gated migration is explicitly applied.
