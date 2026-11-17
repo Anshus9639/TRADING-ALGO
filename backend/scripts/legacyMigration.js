@@ -13,6 +13,13 @@ const {
   validateNotional
 } = require('../lib/validate');
 const { roundTo } = require('../lib/numbers');
+const {
+  deterministicId,
+  legacyOrderId,
+  legacyTradeId,
+  resolveLegacyOrderId,
+  resolveLegacyTradeId
+} = require('../lib/legacyIdentity');
 
 /*
  * Legacy embedded data (pre-Batch-D) semantics:
@@ -68,14 +75,6 @@ function optionalObjectId(value) {
   if (value instanceof mongoose.Types.ObjectId) return value;
   const text = String(value);
   return mongoose.Types.ObjectId.isValid(text) ? new mongoose.Types.ObjectId(text) : null;
-}
-
-// Deterministic ids keep reruns idempotent even if an embedded subdocument
-// somehow lacks an _id. The seed contains only values already present in the
-// record, so no financial data is invented.
-function deterministicId(parts) {
-  const digest = crypto.createHash('sha256').update(parts.join('|')).digest('hex');
-  return new mongoose.Types.ObjectId(digest.slice(0, 24));
 }
 
 // Legacy orders predate clientOrderId and carry no idempotency key. Deriving it
@@ -285,14 +284,17 @@ function planAccount(user, existingOrders = [], existingTrades = [], { now = Dat
   const legacyOrders = Array.isArray(user.pendingOrders) ? user.pendingOrders : [];
   const legacyTrades = Array.isArray(user.trades) ? user.trades : [];
 
-  // Duplicate embedded _ids make ownership of the canonical twin ambiguous.
-  // Blocking the whole account is deliberate: migrating one copy would either
-  // silently discard the other or invent a second order.
-  function duplicateIdGroups(records) {
+  // Duplicate embedded identities make ownership of the canonical twin
+  // ambiguous. Blocking the whole account is deliberate: migrating one copy
+  // would either silently discard the other or invent a second order. The
+  // check resolves generated ids too, so id-less duplicates are caught by the
+  // same rule.
+  function duplicateIdentityGroups(records, resolveId) {
     const counts = new Map();
     for (const record of records) {
-      if (!record || !record._id) continue;
-      const id = String(record._id);
+      if (!record) continue;
+      const id = resolveId(userId, record);
+      if (!id) continue;
       counts.set(id, (counts.get(id) || 0) + 1);
     }
     return [...counts.entries()]
@@ -300,8 +302,8 @@ function planAccount(user, existingOrders = [], existingTrades = [], { now = Dat
       .map(([id, count]) => ({ id, count }));
   }
 
-  const duplicateOrderIds = duplicateIdGroups(legacyOrders);
-  const duplicateTradeIds = duplicateIdGroups(legacyTrades);
+  const duplicateOrderIds = duplicateIdentityGroups(legacyOrders, resolveLegacyOrderId);
+  const duplicateTradeIds = duplicateIdentityGroups(legacyTrades, resolveLegacyTradeId);
 
   for (const group of duplicateOrderIds) {
     issues.push(issue('DUPLICATE_LEGACY_ID', SEVERITY.ERROR, userId, group.id, `${group.count} embedded pending orders share this _id; the account is blocked pending manual remediation.`));
@@ -337,9 +339,7 @@ function planAccount(user, existingOrders = [], existingTrades = [], { now = Dat
   for (let index = 0; index < legacyOrders.length; index += 1) {
     const raw = legacyOrders[index] || {};
     const providedId = optionalObjectId(raw._id);
-    const legacyId = providedId || deterministicId([
-      'order', String(userId), index, raw.symbol, raw.type, raw.quantity, raw.limitPrice
-    ]);
+    const legacyId = providedId || legacyOrderId(userId, raw);
     const legacyIdText = String(legacyId);
 
     if (seenOrderIds.has(legacyIdText)) {
@@ -393,9 +393,7 @@ function planAccount(user, existingOrders = [], existingTrades = [], { now = Dat
   for (let index = 0; index < legacyTrades.length; index += 1) {
     const raw = legacyTrades[index] || {};
     const providedId = optionalObjectId(raw._id);
-    const legacyId = providedId || deterministicId([
-      'trade', String(userId), index, raw.symbol, raw.type, raw.quantity, raw.price, raw.timestamp
-    ]);
+    const legacyId = providedId || legacyTradeId(userId, raw);
     const legacyIdText = String(legacyId);
 
     if (seenTradeIds.has(legacyIdText)) {
@@ -490,8 +488,13 @@ function planAccount(user, existingOrders = [], existingTrades = [], { now = Dat
       issues.push(issue('MISSING_COST_BASIS', SEVERITY.WARNING, userId, doc.symbol, 'Reconstructed position has no recoverable cost basis; avgPrice remains null and UNKNOWN.'));
     }
     // The legacy engine deducted holdings when the SELL limit was placed.
-    // Restore the total holding and mark it locked.
+    // Restore the total holding and mark it locked. Legacy orders carry no
+    // purchase price, so a position with no recoverable average price must be
+    // UNKNOWN once holdings become positive again.
     position.quantity = roundTo(position.quantity + doc.quantity);
+    if (normalizeAvgPrice(position.avgPrice) === null) {
+      position.costBasisStatus = 'UNKNOWN';
+    }
     lockedBySymbol.set(
       doc.symbol,
       roundTo((lockedBySymbol.get(doc.symbol) || 0) + doc.quantity)
@@ -959,6 +962,16 @@ async function verifyMigration(modelsInput = {}, { backupFile = null, now = Date
     if (pendingTrades.length > 0) {
       mismatches.push({ code: 'UNMIGRATED_TRADES', userId: plan.userId, detail: `${pendingTrades.length} valid legacy trade(s) are not in the canonical collection.` });
     }
+    // A canonical twin with different financial fields is a reconciliation
+    // failure in its own right, independent of how locks happen to line up.
+    const conflictingOrders = plan.orders.filter(item => item.action === 'conflict');
+    const conflictingTrades = plan.trades.filter(item => item.action === 'conflict');
+    if (conflictingOrders.length > 0) {
+      mismatches.push({ code: 'CONFLICTING_ORDERS', userId: plan.userId, detail: `${conflictingOrders.length} canonical order(s) disagree with the embedded legacy record.` });
+    }
+    if (conflictingTrades.length > 0) {
+      mismatches.push({ code: 'CONFLICTING_TRADES', userId: plan.userId, detail: `${conflictingTrades.length} canonical trade(s) disagree with the embedded legacy record.` });
+    }
 
     const user = dataset.users.find(item => String(item._id) === plan.userId);
     if (!user) {
@@ -1063,7 +1076,10 @@ async function verifyMigration(modelsInput = {}, { backupFile = null, now = Date
     ambiguity: {
       total: issues.length,
       errors: issues.filter(entry => entry.severity === SEVERITY.ERROR).length,
-      warnings: issues.filter(entry => entry.severity === SEVERITY.WARNING).length
+      warnings: issues.filter(entry => entry.severity === SEVERITY.WARNING).length,
+      // Strict verification (--strict) inspects these entries, so the producer
+      // must expose them exactly as the audit path does.
+      issues
     },
     backup
   };

@@ -15,6 +15,7 @@ const {
   validateLimitPrice,
   validateNotional
 } = require('../lib/validate');
+const { resolveLegacyOrderId } = require('../lib/legacyIdentity');
 
 function orderValidationError(raw) {
   const symbol = validateSymbol(raw.symbol);
@@ -56,14 +57,27 @@ async function findLegacyOrderBlockers({ User, Order, limit = 100 } = {}) {
     const pending = user.pendingOrders || [];
     if (pending.length === 0) continue;
 
-    const ids = pending.map(order => order._id).filter(Boolean);
+    const resolvedIds = pending.map(order => (order ? resolveLegacyOrderId(user._id, order) : null));
+    const ids = resolvedIds.filter(Boolean);
     const canonicalIds = new Set();
     if (ids.length > 0) {
-      const canonical = await Order.find({ _id: { $in: ids } }).select('_id').lean();
+      // Canonical twins must belong to this user: another account's order must
+      // never satisfy this account's migration gate.
+      const canonical = await Order.find({ userId: user._id, _id: { $in: ids } }).select('_id').lean();
       for (const order of canonical) canonicalIds.add(String(order._id));
     }
 
-    const duplicateGroups = duplicateIdGroups(pending);
+    // Count identities after resolution so records without an _id are included.
+    // Two id-less records with identical content collide, which is the same
+    // ambiguity as a duplicated explicit _id.
+    const identityCounts = new Map();
+    for (const id of resolvedIds) {
+      if (!id) continue;
+      identityCounts.set(id, (identityCounts.get(id) || 0) + 1);
+    }
+    const duplicateGroups = [...identityCounts.entries()]
+      .filter(([, count]) => count > 1)
+      .map(([legacyOrderId, count]) => ({ legacyOrderId, count }));
     const duplicateIds = new Set(duplicateGroups.map(group => group.legacyOrderId));
     const reasons = new Set();
     let count = 0;
@@ -71,17 +85,22 @@ async function findLegacyOrderBlockers({ User, Order, limit = 100 } = {}) {
     let invalidOrders = 0;
     let unmigratedOrders = 0;
 
-    for (const order of pending) {
-      if (!order || !order._id) {
-        missingOrderIds += 1;
-        reasons.add('MISSING_ORDER_ID');
+    for (let index = 0; index < pending.length; index += 1) {
+      const order = pending[index];
+      if (!order) continue;
+      const id = resolvedIds[index];
+
+      if (duplicateIds.has(id)) {
+        reasons.add('DUPLICATE_ORDER_ID');
         count += 1;
         continue;
       }
 
-      const id = String(order._id);
-      if (duplicateIds.has(id)) {
-        reasons.add('DUPLICATE_ORDER_ID');
+      // A generated identity that already has a canonical twin is migrated;
+      // the embedded record was never given an _id by the legacy engine.
+      if (!order._id && !canonicalIds.has(id)) {
+        missingOrderIds += 1;
+        reasons.add('MISSING_ORDER_ID');
         count += 1;
         continue;
       }

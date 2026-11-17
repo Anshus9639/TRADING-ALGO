@@ -203,19 +203,38 @@ describe('unknown historical cost basis', () => {
     expect(trade.realizedPnl).toBeNull();
   });
 
-  test('strict verification blocks ambiguity unless unknown basis is explicitly accepted', () => {
-    const report = {
-      ambiguity: {
-        issues: [
-          { code: 'MISSING_COST_BASIS' },
-          { code: 'DUPLICATE_LEGACY_ID' }
-        ]
-      }
+  test('strict verification blocks ambiguity from a real verifyMigration report', async () => {
+    const sharedId = new mongoose.Types.ObjectId();
+    const user = await createTestUser({
+      portfolio: [{ symbol: 'BTCUSDT', quantity: 1, avgPrice: 0 }]
+    });
+    const embedded = {
+      _id: sharedId,
+      symbol: 'BTCUSDT',
+      type: 'BUY',
+      quantity: 0.1,
+      limitPrice: 5000,
+      timestamp: new Date('2026-01-01T00:00:00.000Z')
     };
+    await User.collection.updateOne(
+      { _id: user._id },
+      { $set: { pendingOrders: [embedded, { ...embedded }] } }
+    );
 
-    expect(strictBlockingIssues(report)).toHaveLength(2);
+    // The producer must expose the same issues the strict consumer inspects.
+    const report = await verifyMigration(models());
+    expect(report.ok).toBe(false);
+    expect(report.ambiguity.issues.map(entry => entry.code)).toEqual(
+      expect.arrayContaining(['MISSING_COST_BASIS', 'DUPLICATE_LEGACY_ID'])
+    );
+
+    const blocking = strictBlockingIssues(report);
+    expect(blocking.map(entry => entry.code).sort()).toEqual([
+      'DUPLICATE_LEGACY_ID',
+      'MISSING_COST_BASIS'
+    ]);
     expect(strictBlockingIssues(report, { acceptUnknownBasis: true })).toEqual([
-      { code: 'DUPLICATE_LEGACY_ID' }
+      expect.objectContaining({ code: 'DUPLICATE_LEGACY_ID' })
     ]);
     expect(strictBlockingIssues({ ambiguity: { issues: [] } })).toEqual([]);
     expect(strictBlockingIssues(null)).toEqual([]);

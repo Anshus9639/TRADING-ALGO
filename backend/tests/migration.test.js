@@ -10,7 +10,8 @@ const { loadAccountView } = require('../services/accountView');
 const { createMarketFeed } = require('../services/marketFeed');
 const { createTradeService } = require('../services/tradeService');
 const { createMatcher } = require('../services/matcher');
-const { findUnmigratedLegacyOrders } = require('../services/legacyOrders');
+const { findUnmigratedLegacyOrders, findLegacyOrderBlockers } = require('../services/legacyOrders');
+const { resolveLegacyOrderId } = require('../lib/legacyIdentity');
 const { checkIdempotencyIndex } = require('../scripts/check-idempotency-index');
 const {
   planAccount,
@@ -563,5 +564,172 @@ describe('legacy embedded data migration', () => {
       lockedQuantity: 0.1
     });
     expect(plan.portfolio.changed).toBe(false);
+  });
+
+  test('restoring a legacy SELL keeps an unknown cost basis UNKNOWN', async () => {
+    const legacySell = legacyOrder('BTCUSDT', 'SELL', 0.5, 60000, new Date('2025-02-01T00:00:00Z'));
+    const user = await createTestUser({
+      balance: 0,
+      portfolio: [{ symbol: 'BTCUSDT', quantity: 0, avgPrice: null }],
+      pendingOrders: [legacySell]
+    });
+
+    const report = await runMigration({ ...models(), mongoose, mode: 'apply' });
+    expect(report.usersFailed).toBe(0);
+
+    const stored = await User.findById(user._id).lean();
+    expect(stored.portfolio).toEqual([
+      expect.objectContaining({
+        symbol: 'BTCUSDT',
+        quantity: 0.5,
+        lockedQuantity: 0.5,
+        avgPrice: null,
+        costBasisStatus: 'UNKNOWN'
+      })
+    ]);
+
+    const verification = await verifyMigration(models());
+    expect(verification.mismatches).toEqual([]);
+    expect(verification.ok).toBe(true);
+    expect(verification.costBasis.unknownPositions).toEqual([
+      { userId: String(user._id), symbol: 'BTCUSDT', quantity: 0.5, status: 'UNKNOWN' }
+    ]);
+  });
+
+  test('restoring a legacy SELL preserves a verified cost basis', async () => {
+    const legacySell = legacyOrder('ETHUSDT', 'SELL', 0.3, 2000, new Date('2025-02-02T00:00:00Z'));
+    const user = await createTestUser({
+      balance: 0,
+      portfolio: [{ symbol: 'ETHUSDT', quantity: 0.2, avgPrice: 1500 }],
+      pendingOrders: [legacySell]
+    });
+
+    await runMigration({ ...models(), mongoose, mode: 'apply' });
+
+    const stored = await User.findById(user._id).lean();
+    expect(stored.portfolio).toEqual([
+      expect.objectContaining({
+        symbol: 'ETHUSDT',
+        quantity: 0.5,
+        lockedQuantity: 0.3,
+        avgPrice: 1500,
+        costBasisStatus: 'KNOWN'
+      })
+    ]);
+  });
+
+  test('records without an _id share one deterministic id in readers, the gate and migration', async () => {
+    const raw = {
+      symbol: 'BTCUSDT',
+      type: 'BUY',
+      quantity: 0.1,
+      limitPrice: 40000,
+      timestamp: new Date('2025-03-01T00:00:00Z')
+    };
+    const user = await createTestUser({ balance: 9500, lockedBalance: 500, pendingOrders: [] });
+    // Bypass Mongoose so the embedded document really has no _id.
+    await User.collection.updateOne({ _id: user._id }, { $set: { pendingOrders: [raw] } });
+    const expectedId = resolveLegacyOrderId(user._id, raw);
+
+    const gateBefore = await findLegacyOrderBlockers(models());
+    expect(gateBefore).toHaveLength(1);
+    expect(gateBefore[0].reasons).toEqual(['MISSING_ORDER_ID']);
+    expect(gateBefore[0].missingOrderIds).toBe(1);
+
+    const applied = await runMigration({ ...models(), mongoose, mode: 'apply' });
+    expect(applied.usersFailed).toBe(0);
+    expect(applied.writes.orders).toBe(1);
+
+    const canonical = await Order.find({ userId: user._id }).lean();
+    expect(canonical).toHaveLength(1);
+    expect(String(canonical[0]._id)).toBe(expectedId);
+
+    // The gate and the reader resolve the same derived id, so the migrated
+    // record is recognised instead of looking unmigrated or appearing twice.
+    expect(await findLegacyOrderBlockers(models())).toEqual([]);
+
+    const view = await loadAccountView(await User.findById(user._id));
+    expect(view.pendingOrders).toHaveLength(1);
+    expect(String(view.pendingOrders[0]._id)).toBe(expectedId);
+    expect(view.pendingOrders[0].legacy).toBeUndefined();
+
+    const rerun = await runMigration({ ...models(), mongoose, mode: 'apply' });
+    expect(rerun.writes.orders).toBe(0);
+    expect(await Order.countDocuments({ userId: user._id })).toBe(1);
+  });
+
+  test('another account\'s canonical order cannot satisfy this account\'s migration gate', async () => {
+    const sharedId = new mongoose.Types.ObjectId();
+    const owner = await createTestUser({ balance: 9500, lockedBalance: 4000 });
+    const stranger = await createTestUser({ username: 'stranger' });
+    await User.collection.updateOne(
+      { _id: owner._id },
+      {
+        $set: {
+          pendingOrders: [{
+            _id: sharedId,
+            symbol: 'BTCUSDT',
+            type: 'BUY',
+            quantity: 0.1,
+            limitPrice: 40000,
+            timestamp: new Date('2025-04-01T00:00:00Z')
+          }]
+        }
+      }
+    );
+    await Order.create({
+      _id: sharedId,
+      userId: stranger._id,
+      symbol: 'BTCUSDT',
+      side: 'BUY',
+      orderType: 'LIMIT',
+      quantity: 0.1,
+      remainingQuantity: 0.1,
+      limitPrice: 40000,
+      status: 'OPEN',
+      clientOrderId: `legacy:${stranger._id}:${sharedId}`
+    });
+
+    const blockers = await findLegacyOrderBlockers({ User, Order });
+    expect(blockers).toHaveLength(1);
+    expect(blockers[0]).toMatchObject({
+      userId: owner._id,
+      reasons: ['UNMIGRATED_ORDER'],
+      unmigratedOrders: 1
+    });
+
+    const view = await loadAccountView(await User.findById(owner._id));
+    expect(view.pendingOrders).toHaveLength(1);
+    expect(view.pendingOrders[0].legacy).toBe(true);
+  });
+
+  test('a canonical order conflict makes verification fail', async () => {
+    const order = legacyOrder('BTCUSDT', 'BUY', 0.1, 40000, new Date('2025-05-01T00:00:00Z'));
+    const user = await createTestUser({
+      balance: 6000,
+      lockedBalance: 8000,
+      pendingOrders: [order]
+    });
+    await Order.create({
+      _id: order._id,
+      userId: user._id,
+      symbol: 'BTCUSDT',
+      side: 'BUY',
+      orderType: 'LIMIT',
+      quantity: 0.2,
+      remainingQuantity: 0.2,
+      limitPrice: 40000,
+      status: 'OPEN',
+      clientOrderId: `legacy:${user._id}:${order._id}`
+    });
+
+    const verification = await verifyMigration(models());
+
+    expect(verification.ok).toBe(false);
+    expect(verification.mismatches.map(item => item.code)).toContain('CONFLICTING_ORDERS');
+    expect(verification.ambiguity.issues.map(item => item.code)).toContain('CONFLICTING_EXISTING_ORDER');
+
+    const untouched = await Order.findById(order._id).lean();
+    expect(untouched.quantity).toBe(0.2);
   });
 });

@@ -1,5 +1,11 @@
 const Order = require('../models/Order');
 const Trade = require('../models/Trade');
+const {
+  legacyOrderId,
+  legacyTradeId,
+  resolveLegacyOrderId,
+  resolveLegacyTradeId
+} = require('../lib/legacyIdentity');
 
 function toPlainPosition(position) {
   const quantity = position.quantity || 0;
@@ -19,11 +25,10 @@ function toPlainPosition(position) {
   return mapped;
 }
 
-function duplicateLegacyIds(records) {
+function duplicateIdsFromList(ids) {
   const counts = new Map();
-  for (const record of records) {
-    if (!record || !record._id) continue;
-    const id = String(record._id);
+  for (const id of ids) {
+    if (!id) continue;
     counts.set(id, (counts.get(id) || 0) + 1);
   }
   return new Set([...counts.entries()].filter(([, count]) => count > 1).map(([id]) => id));
@@ -111,10 +116,17 @@ async function loadPendingOrders(user) {
   const canonicalIds = new Set(
     (await Order.find({ userId: user._id }).select('_id').lean()).map(order => String(order._id))
   );
-  // Duplicate embedded ids cannot be matched to a single canonical twin. Show
+  // Resolve the same identity the migration uses, so an id-less record that
+  // was migrated is not returned a second time.
+  const legacyIds = legacy.map(order => (order ? resolveLegacyOrderId(user._id, order) : null));
+  // Mongoose invents an in-memory _id for embedded subdocuments stored without
+  // one, so the content-derived id is checked as well: the migration stores it
+  // as the canonical _id.
+  const derivedIds = legacy.map(order => (order ? String(legacyOrderId(user._id, order)) : null));
+  // Duplicate identities cannot be matched to a single canonical twin. Show
   // every affected record with an explicit ambiguity flag instead of silently
   // dropping the copies whose id happens to exist canonically.
-  const duplicateIds = duplicateLegacyIds(legacy);
+  const duplicateIds = duplicateIdsFromList(legacyIds);
 
   const canonical = orders.map(order => {
     const mapped = mapOrder(order);
@@ -122,18 +134,16 @@ async function loadPendingOrders(user) {
     return mapped;
   });
 
-  const pending = legacy
-    .filter(order => {
-      if (!order._id) return true;
-      const id = String(order._id);
-      if (duplicateIds.has(id)) return true;
-      return !canonicalIds.has(id);
-    })
-    .map(order => {
-      const mapped = mapLegacyOrder(order);
-      if (order._id && duplicateIds.has(String(order._id))) mapped.ambiguous = true;
-      return mapped;
-    });
+  const pending = [];
+  legacy.forEach((order, index) => {
+    if (!order) return;
+    const id = legacyIds[index];
+    const migrated = canonicalIds.has(id) || canonicalIds.has(derivedIds[index]);
+    if (!duplicateIds.has(id) && migrated) return;
+    const mapped = mapLegacyOrder(order);
+    if (duplicateIds.has(id)) mapped.ambiguous = true;
+    pending.push(mapped);
+  });
 
   return [...canonical, ...pending].sort(compareByTimeThenId);
 }
@@ -142,7 +152,9 @@ async function loadTrades(user) {
   const trades = await Trade.find({ userId: user._id }).sort({ timestamp: 1, _id: 1 }).lean();
   const canonicalIds = new Set(trades.map(trade => String(trade._id)));
   const legacyRaw = user.trades || [];
-  const duplicateIds = duplicateLegacyIds(legacyRaw);
+  const legacyIds = legacyRaw.map(trade => (trade ? resolveLegacyTradeId(user._id, trade) : null));
+  const derivedIds = legacyRaw.map(trade => (trade ? String(legacyTradeId(user._id, trade)) : null));
+  const duplicateIds = duplicateIdsFromList(legacyIds);
 
   const canonical = trades.map(trade => {
     const mapped = mapTrade(trade);
@@ -150,26 +162,28 @@ async function loadTrades(user) {
     return mapped;
   });
 
-  const legacy = legacyRaw
-    .filter(trade => {
-      if (!trade._id) return true;
-      const id = String(trade._id);
-      if (duplicateIds.has(id)) return true;
-      return !canonicalIds.has(id);
-    })
-    .map(trade => {
-      const mapped = mapLegacyTrade(trade);
-      if (trade._id && duplicateIds.has(String(trade._id))) mapped.ambiguous = true;
-      return mapped;
-    });
+  const legacy = [];
+  legacyRaw.forEach((trade, index) => {
+    if (!trade) return;
+    const id = legacyIds[index];
+    const migrated = canonicalIds.has(id) || canonicalIds.has(derivedIds[index]);
+    if (!duplicateIds.has(id) && migrated) return;
+    const mapped = mapLegacyTrade(trade);
+    if (duplicateIds.has(id)) mapped.ambiguous = true;
+    legacy.push(mapped);
+  });
 
   return [...canonical, ...legacy].sort(compareByTimeThenId);
 }
 
 async function loadAccountView(user) {
   if (!user) return null;
-  const pendingOrderIds = [...duplicateLegacyIds(user.pendingOrders || [])];
-  const tradeIds = [...duplicateLegacyIds(user.trades || [])];
+  const pendingOrderIds = [...duplicateIdsFromList(
+    (user.pendingOrders || []).map(order => (order ? resolveLegacyOrderId(user._id, order) : null))
+  )];
+  const tradeIds = [...duplicateIdsFromList(
+    (user.trades || []).map(trade => (trade ? resolveLegacyTradeId(user._id, trade) : null))
+  )];
   const [portfolio, trades, pendingOrders] = await Promise.all([
     Promise.resolve((user.portfolio || []).map(toPlainPosition)),
     loadTrades(user),
