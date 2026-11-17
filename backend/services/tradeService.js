@@ -36,6 +36,11 @@ function reject(status, message, code = null) {
 
 const IDEMPOTENCY_CONFLICT = 'IDEMPOTENCY_CONFLICT';
 const PARAMETER_TOLERANCE = 1e-9;
+const ESCROW_TOLERANCE = 1e-9;
+// Matches the market feed's default staleness window. A quote accepted just
+// before a claim or transaction can otherwise settle long after it expired.
+const EXECUTION_QUOTE_MAX_AGE_MS = 15000;
+const ACTIVE_ORDER_STATUSES = ['OPEN', 'FILLING'];
 
 // Legacy holdings may have no recoverable purchase price. A null/UNKNOWN basis
 // is never coerced to zero: doing so would invent realized profit on every sale.
@@ -116,6 +121,15 @@ function validateExecutionQuote(quote, symbol) {
     return { ok: false, error: 'Execution quote symbol does not match the order.' };
   }
   return { ok: true, price };
+}
+
+// Settlement can be delayed by claim acquisition, transaction retries or slow
+// database writes. The original observation must still be fresh when it is
+// used, so its timestamp is re-checked inside every transaction attempt.
+function isFreshExecutionQuote(quote, nowMs) {
+  if (!quote || typeof quote.ts !== 'number' || !Number.isFinite(quote.ts)) return false;
+  const ageMs = nowMs - quote.ts;
+  return ageMs >= 0 && ageMs <= EXECUTION_QUOTE_MAX_AGE_MS;
 }
 
 function isDuplicateKeyError(err) {
@@ -284,6 +298,17 @@ function createTradeService({
 
     try {
       const outcome = await runTransaction(async session => {
+        // The quote was validated before the transaction was opened. Re-check
+        // its timestamp now: a retry or a slow commit must never settle at a
+        // price that has already expired.
+        if (executionQuote && !isFreshExecutionQuote(executionQuote, now())) {
+          throw new TradeRejection(
+            409,
+            'Execution quote expired before settlement. Request a fresh proposal.',
+            'PRICE_CHANGED'
+          );
+        }
+
         const duplicate = await Order.findOne({ userId, clientOrderId: idempotencyKey }).session(session).lean();
         if (duplicate) return { duplicate };
 
@@ -568,6 +593,9 @@ function createTradeService({
 
         const quoteCheck = validateExecutionQuote(executionQuote, order.symbol);
         if (!quoteCheck.ok) return { status: 503, code: 'QUOTE_UNAVAILABLE' };
+        if (!isFreshExecutionQuote(executionQuote, now())) {
+          return { status: 503, code: 'QUOTE_UNAVAILABLE' };
+        }
         const fillPrice = quoteCheck.price;
 
         if (!shouldExecuteLimitOrder({ type: order.side, limitPrice: order.limitPrice }, {
@@ -690,6 +718,60 @@ function createTradeService({
     );
   }
 
+  function sumBuyReservations(orders) {
+    return orders.reduce((sum, item) => {
+      const remaining = Number(item.remainingQuantity);
+      const price = Number(item.limitPrice);
+      if (!Number.isFinite(remaining) || remaining <= 0) return sum;
+      if (!Number.isFinite(price) || price <= 0) return sum;
+      return roundTo(sum + roundTo(remaining * price));
+    }, 0);
+  }
+
+  function sumSellReservations(orders) {
+    return orders.reduce((sum, item) => {
+      const remaining = Number(item.remainingQuantity);
+      return Number.isFinite(remaining) && remaining > 0
+        ? roundTo(sum + roundTo(remaining))
+        : sum;
+    }, 0);
+  }
+
+  // Escrow is aggregated per account (lockedBalance) and per position
+  // (lockedQuantity), so it is shared by every active order. A failed order may
+  // only refund its own reservation while the pool still covers all active
+  // reservations. When the pool is short, ownership of the missing funds is
+  // ambiguous; releasing anything would silently consume a sibling order's
+  // escrow, so the record is quarantined instead.
+  async function verifyBuyEscrow({ order, user, reservedAmount, session }) {
+    if (reservedAmount <= 0) return { ok: true, amount: 0 };
+    const active = await Order.find({
+      userId: order.userId,
+      side: 'BUY',
+      status: { $in: ACTIVE_ORDER_STATUSES }
+    }).session(session).lean();
+    const required = sumBuyReservations(active);
+    const locked = roundTo(user.lockedBalance || 0);
+    if (locked + ESCROW_TOLERANCE < required) return { ok: false, amount: 0 };
+    return { ok: true, amount: reservedAmount };
+  }
+
+  async function verifySellEscrow({ order, user, quantity, session }) {
+    if (quantity <= 0) return { ok: true, amount: 0 };
+    const active = await Order.find({
+      userId: order.userId,
+      side: 'SELL',
+      symbol: order.symbol,
+      status: { $in: ACTIVE_ORDER_STATUSES }
+    }).session(session).lean();
+    const required = sumSellReservations(active);
+    const position = (user.portfolio || []).find(item => item.symbol === order.symbol);
+    if (!position) return { ok: false, amount: 0 };
+    const locked = roundTo(position.lockedQuantity || 0);
+    if (locked + ESCROW_TOLERANCE < required) return { ok: false, amount: 0 };
+    return { ok: true, amount: quantity };
+  }
+
   async function failOrder({ orderId, workerId, error = null }) {
     try {
       return await runTransaction(async session => {
@@ -711,25 +793,34 @@ function createTradeService({
         const rawQuantity = Number(order.remainingQuantity);
         const rawLimitPrice = Number(order.limitPrice);
         const quantity = Number.isFinite(rawQuantity) && rawQuantity > 0 ? roundTo(rawQuantity) : 0;
+        const escrowIssues = [];
+
         if (order.side === 'BUY') {
           const reservedAmount = Number.isFinite(rawLimitPrice) && rawLimitPrice > 0
             ? roundTo(quantity * rawLimitPrice)
             : 0;
-          const release = Math.max(0, Math.min(reservedAmount, user.lockedBalance || 0));
-          user.lockedBalance = roundTo((user.lockedBalance || 0) - release);
-          user.balance = roundTo(user.balance + release);
+          const escrow = await verifyBuyEscrow({ order, user, reservedAmount, session });
+          if (escrow.ok) {
+            user.lockedBalance = roundTo((user.lockedBalance || 0) - escrow.amount);
+            user.balance = roundTo(user.balance + escrow.amount);
+          } else {
+            escrowIssues.push('BUY escrow could not be verified; no funds were released.');
+          }
         } else {
-          const assetIndex = user.portfolio.findIndex(p => p.symbol === order.symbol);
-          if (assetIndex > -1) {
-            const position = user.portfolio[assetIndex];
-            const release = Math.max(0, Math.min(quantity, position.lockedQuantity || 0));
-            position.lockedQuantity = roundTo((position.lockedQuantity || 0) - release);
+          const escrow = await verifySellEscrow({ order, user, quantity, session });
+          if (escrow.ok) {
+            const position = user.portfolio.find(item => item.symbol === order.symbol);
+            if (position) {
+              position.lockedQuantity = roundTo((position.lockedQuantity || 0) - escrow.amount);
+            }
+          } else {
+            escrowIssues.push('SELL escrow could not be verified; no holdings were unlocked.');
           }
         }
 
         assertTransition(order.status, 'FAILED');
         order.status = 'FAILED';
-        order.lastError = error;
+        order.lastError = [error, ...escrowIssues].filter(Boolean).join(' ') || null;
         order.claimedBy = null;
         order.claimedAt = null;
         order.leaseExpiresAt = null;
@@ -818,9 +909,16 @@ function createTradeService({
         } else if (legacy.type === 'SELL') {
           const assetIndex = user.portfolio.findIndex(p => p.symbol === legacy.symbol);
           if (assetIndex > -1) {
-            user.portfolio[assetIndex].quantity = roundTo(
-              user.portfolio[assetIndex].quantity + legacy.quantity
-            );
+            const position = user.portfolio[assetIndex];
+            position.quantity = roundTo(position.quantity + legacy.quantity);
+            // The restored units came from this position, so a verified basis
+            // still applies to them. Without one the basis must stay UNKNOWN
+            // rather than inventing a purchase price for the restored units.
+            const basis = Number(position.avgPrice);
+            if (!Number.isFinite(basis) || basis <= 0) {
+              position.avgPrice = null;
+              position.costBasisStatus = 'UNKNOWN';
+            }
           } else {
             user.portfolio.push({
               symbol: legacy.symbol,

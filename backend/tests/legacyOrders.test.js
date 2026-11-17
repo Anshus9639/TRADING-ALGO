@@ -133,6 +133,34 @@ describe('legacy embedded pending orders', () => {
     ]);
   });
 
+  test('cancelling a legacy SELL keeps an unknown cost basis UNKNOWN', async () => {
+    const user = await createTestUser({
+      balance: 0,
+      portfolio: [{ symbol: 'ETHUSDT', quantity: 2, avgPrice: null, costBasisStatus: 'UNKNOWN' }],
+      pendingOrders: [legacyOrder('ETHUSDT', 'SELL', 1, 4000)]
+    });
+
+    const cancel = await service.cancelOrder({
+      orderId: user.pendingOrders[0]._id,
+      userId: user._id
+    });
+
+    expect(cancel.status).toBe(200);
+    const stored = await User.findById(user._id).lean();
+    expect(stored.portfolio).toEqual([
+      expect.objectContaining({
+        symbol: 'ETHUSDT',
+        quantity: 3,
+        avgPrice: null,
+        costBasisStatus: 'UNKNOWN'
+      })
+    ]);
+
+    const view = await loadAccountView(await User.findById(user._id));
+    expect(view.portfolio[0].costBasisStatus).toBe('UNKNOWN');
+    expect(view.portfolio[0].avgPrice).toBeNull();
+  });
+
   test('after migration legacy orders fill once with no double matching', async () => {
     const buyUser = await createLegacyBuyUser();
     const sellUser = await createLegacySellUser();

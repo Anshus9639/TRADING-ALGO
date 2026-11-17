@@ -207,4 +207,64 @@ describe('trade service market execution', () => {
     expect(result.body.message).toMatch(/clientOrderId/);
     expect(await snapshotUser(user._id)).toEqual(before);
   });
+
+  test('settles at the caller-supplied quote when it is still fresh', async () => {
+    const clocked = createTradeService({ feed, now: () => now });
+    const user = await createTestUser({ balance: 10000 });
+    feed.setQuote('BTCUSDT', 50000);
+
+    const result = await clocked.executeMarketOrder({
+      userId: user._id,
+      side: 'BUY',
+      symbol: 'BTCUSDT',
+      quantity: 0.1,
+      clientOrderId: 'fresh-execution-quote',
+      executionQuote: { symbol: 'BTCUSDT', price: 50100, ts: now }
+    });
+
+    expect(result.status).toBe(200);
+    expect(result.body.executedPrice).toBe(50100);
+  });
+
+  test('rejects an execution quote that expired before settlement without mutating', async () => {
+    const clocked = createTradeService({ feed, now: () => now });
+    const user = await createTestUser({ balance: 10000 });
+    feed.setQuote('BTCUSDT', 50000);
+    const before = await snapshotUser(user._id);
+
+    // The feed quote is still fresh, so only the revalidation of the original
+    // observation timestamp can reject this settlement.
+    const result = await clocked.executeMarketOrder({
+      userId: user._id,
+      side: 'BUY',
+      symbol: 'BTCUSDT',
+      quantity: 0.1,
+      clientOrderId: 'expired-execution-quote',
+      executionQuote: { symbol: 'BTCUSDT', price: 50000, ts: now - 15001 }
+    });
+
+    expect(result.status).toBe(409);
+    expect(result.body.code).toBe('PRICE_CHANGED');
+    expect(await snapshotUser(user._id)).toEqual(before);
+  });
+
+  test('rejects a future-dated execution quote timestamp', async () => {
+    const clocked = createTradeService({ feed, now: () => now });
+    const user = await createTestUser({ balance: 10000 });
+    feed.setQuote('BTCUSDT', 50000);
+    const before = await snapshotUser(user._id);
+
+    const result = await clocked.executeMarketOrder({
+      userId: user._id,
+      side: 'BUY',
+      symbol: 'BTCUSDT',
+      quantity: 0.1,
+      clientOrderId: 'future-execution-quote',
+      executionQuote: { symbol: 'BTCUSDT', price: 50000, ts: now + 1 }
+    });
+
+    expect(result.status).toBe(409);
+    expect(result.body.code).toBe('PRICE_CHANGED');
+    expect(await snapshotUser(user._id)).toEqual(before);
+  });
 });
