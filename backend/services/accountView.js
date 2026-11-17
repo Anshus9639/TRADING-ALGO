@@ -1,8 +1,6 @@
 const Order = require('../models/Order');
 const Trade = require('../models/Trade');
 const {
-  legacyOrderId,
-  legacyTradeId,
   resolveLegacyOrderId,
   resolveLegacyTradeId
 } = require('../lib/legacyIdentity');
@@ -117,12 +115,11 @@ async function loadPendingOrders(user) {
     (await Order.find({ userId: user._id }).select('_id').lean()).map(order => String(order._id))
   );
   // Resolve the same identity the migration uses, so an id-less record that
-  // was migrated is not returned a second time.
+  // was migrated is not returned a second time. A record with a persisted
+  // explicit _id keeps that identity even when its content would hash to a
+  // different id; only records that never stored an _id (including the
+  // synthetic id Mongoose invents while hydrating) fall back to content.
   const legacyIds = legacy.map(order => (order ? resolveLegacyOrderId(user._id, order) : null));
-  // Mongoose invents an in-memory _id for embedded subdocuments stored without
-  // one, so the content-derived id is checked as well: the migration stores it
-  // as the canonical _id.
-  const derivedIds = legacy.map(order => (order ? String(legacyOrderId(user._id, order)) : null));
   // Duplicate identities cannot be matched to a single canonical twin. Show
   // every affected record with an explicit ambiguity flag instead of silently
   // dropping the copies whose id happens to exist canonically.
@@ -138,8 +135,7 @@ async function loadPendingOrders(user) {
   legacy.forEach((order, index) => {
     if (!order) return;
     const id = legacyIds[index];
-    const migrated = canonicalIds.has(id) || canonicalIds.has(derivedIds[index]);
-    if (!duplicateIds.has(id) && migrated) return;
+    if (!duplicateIds.has(id) && canonicalIds.has(id)) return;
     const mapped = mapLegacyOrder(order);
     if (duplicateIds.has(id)) mapped.ambiguous = true;
     pending.push(mapped);
@@ -153,7 +149,6 @@ async function loadTrades(user) {
   const canonicalIds = new Set(trades.map(trade => String(trade._id)));
   const legacyRaw = user.trades || [];
   const legacyIds = legacyRaw.map(trade => (trade ? resolveLegacyTradeId(user._id, trade) : null));
-  const derivedIds = legacyRaw.map(trade => (trade ? String(legacyTradeId(user._id, trade)) : null));
   const duplicateIds = duplicateIdsFromList(legacyIds);
 
   const canonical = trades.map(trade => {
@@ -166,8 +161,7 @@ async function loadTrades(user) {
   legacyRaw.forEach((trade, index) => {
     if (!trade) return;
     const id = legacyIds[index];
-    const migrated = canonicalIds.has(id) || canonicalIds.has(derivedIds[index]);
-    if (!duplicateIds.has(id) && migrated) return;
+    if (!duplicateIds.has(id) && canonicalIds.has(id)) return;
     const mapped = mapLegacyTrade(trade);
     if (duplicateIds.has(id)) mapped.ambiguous = true;
     legacy.push(mapped);

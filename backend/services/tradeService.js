@@ -298,9 +298,15 @@ function createTradeService({
 
     try {
       const outcome = await runTransaction(async session => {
-        // The quote was validated before the transaction was opened. Re-check
-        // its timestamp now: a retry or a slow commit must never settle at a
-        // price that has already expired.
+        // A retry can reach its transaction after the original request has
+        // committed. The existing order wins over an expired quote: the trade
+        // already happened with the observation the caller is reusing.
+        const duplicate = await Order.findOne({ userId, clientOrderId: idempotencyKey }).session(session).lean();
+        if (duplicate) return { duplicate };
+
+        // For a genuinely new order the quote was validated before the
+        // transaction was opened. Re-check its timestamp now: a retry or a
+        // slow commit must never settle at a price that has already expired.
         if (executionQuote && !isFreshExecutionQuote(executionQuote, now())) {
           throw new TradeRejection(
             409,
@@ -308,9 +314,6 @@ function createTradeService({
             'PRICE_CHANGED'
           );
         }
-
-        const duplicate = await Order.findOne({ userId, clientOrderId: idempotencyKey }).session(session).lean();
-        if (duplicate) return { duplicate };
 
         const user = await User.findById(userId).session(session);
         if (!user) throw new TradeRejection(404, 'User not found in database.');

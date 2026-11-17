@@ -5,7 +5,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   createPendingSubmissionMap,
-  readTokenScope
+  readTokenScope,
+  shouldRetirePendingKey
 } from '../src/lib/pendingOrders.mjs';
 import { createClientOrderId } from '../src/lib/orderId.mjs';
 
@@ -27,6 +28,12 @@ function createStorage() {
   const data = new Map();
   return {
     data,
+    get length() {
+      return data.size;
+    },
+    key(index) {
+      return [...data.keys()][index] ?? null;
+    },
     getItem(key) {
       return data.has(key) ? data.get(key) : null;
     },
@@ -141,4 +148,131 @@ test('QuickOrder persists unresolved keys without persisting the token', () => {
   assert.match(source, /An earlier submission is unresolved/);
   assert.doesNotMatch(source, /localStorage/);
   assert.doesNotMatch(source, /pendingSubmissions\.current = new Map\(\)/);
+});
+
+test('a 429 keeps the pending id so a retry reuses the original id', () => {
+  const storage = createStorage();
+  const token = tokenFor('user-123');
+  const requestKey = '/api/trade/buy|BUY|BTCUSDT|0.1|MARKET';
+  const submissions = createPendingSubmissionMap({ token, storage });
+  const id = createClientOrderId();
+  submissions.set(requestKey, id);
+
+  // The rate limiter can answer before idempotency is checked, so the key must
+  // survive that outcome exactly like a network error.
+  if (shouldRetirePendingKey(429)) submissions.delete(requestKey);
+  assert.equal(submissions.get(requestKey), id);
+
+  const retry = createPendingSubmissionMap({ token, storage });
+  assert.equal(retry.get(requestKey), id);
+
+  // Only a definitive rejection retires the key.
+  assert.equal(shouldRetirePendingKey(400), true);
+  assert.equal(shouldRetirePendingKey(409), true);
+  assert.equal(shouldRetirePendingKey(408), false);
+  assert.equal(shouldRetirePendingKey(429), false);
+  assert.equal(shouldRetirePendingKey(500), false);
+  assert.equal(shouldRetirePendingKey(undefined), false);
+
+  if (shouldRetirePendingKey(400)) retry.delete(requestKey);
+  assert.equal(retry.get(requestKey), undefined);
+});
+
+test('two tabs initialized before writing each keep their own pending entry', () => {
+  const storage = createStorage();
+  const token = tokenFor('user-123');
+  const now = () => 1_700_000_000_000;
+  const requestA = '/api/trade/buy|BUY|BTCUSDT|0.1|MARKET';
+  const requestB = '/api/trade/limit|SELL|ETHUSDT|2|2500';
+  const idA = createClientOrderId();
+  const idB = createClientOrderId();
+
+  // Both instances load an empty snapshot before either writes.
+  const tabA = createPendingSubmissionMap({ token, storage, now });
+  const tabB = createPendingSubmissionMap({ token, storage, now });
+  assert.equal(tabA.size(), 0);
+  assert.equal(tabB.size(), 0);
+
+  tabA.set(requestA, idA);
+  tabB.set(requestB, idB);
+
+  // Per-key storage means one tab cannot overwrite the other's snapshot.
+  const reloaded = createPendingSubmissionMap({ token, storage, now });
+  assert.equal(reloaded.size(), 2);
+  assert.equal(reloaded.get(requestA), idA);
+  assert.equal(reloaded.get(requestB), idB);
+});
+
+test('a deleted key is not resurrected by a stale tab or an old snapshot', () => {
+  const storage = createStorage();
+  const token = tokenFor('user-123');
+  const now = () => 1_700_000_000_000;
+  const requestA = '/api/trade/buy|BUY|BTCUSDT|0.1|MARKET';
+  const requestB = '/api/trade/buy|SELL|BTCUSDT|0.1|MARKET';
+  const requestC = '/api/trade/limit|BUY|SOLUSDT|5|140';
+  const idA = createClientOrderId();
+  const idB = createClientOrderId();
+  const idC = createClientOrderId();
+
+  const tabA = createPendingSubmissionMap({ token, storage, now });
+  const tabB = createPendingSubmissionMap({ token, storage, now });
+  tabA.set(requestA, idA);
+  tabB.set(requestB, idB);
+
+  tabA.delete(requestA);
+
+  // The other tab still holds an older in-memory view and keeps writing.
+  tabB.set(requestC, idC);
+
+  const reloaded = createPendingSubmissionMap({ token, storage, now });
+  assert.equal(reloaded.get(requestA), undefined);
+  assert.equal(reloaded.get(requestB), idB);
+  assert.equal(reloaded.get(requestC), idC);
+  assert.equal(reloaded.size(), 2);
+
+  // An old bundle rewriting a whole-map snapshot cannot bring the key back.
+  storage.setItem(reloaded.storageKey, JSON.stringify({
+    version: 1,
+    entries: {
+      [requestA]: { clientOrderId: idA, savedAt: now() },
+      [requestB]: { clientOrderId: idB, savedAt: now() }
+    }
+  }));
+
+  const afterLegacy = createPendingSubmissionMap({ token, storage, now });
+  assert.equal(afterLegacy.get(requestA), undefined);
+  assert.equal(afterLegacy.get(requestB), idB);
+});
+
+test('setting the same request key after a deletion clears its tombstone', () => {
+  const storage = createStorage();
+  const token = tokenFor('user-123');
+  const requestKey = '/api/trade/buy|BUY|BTCUSDT|0.1|MARKET';
+  const first = createPendingSubmissionMap({
+    token,
+    storage,
+    now: () => 1_700_000_000_000
+  });
+  first.set(requestKey, createClientOrderId());
+  first.delete(requestKey);
+  assert.equal(
+    createPendingSubmissionMap({ token, storage, now: () => 1_700_000_000_000 }).size(),
+    0
+  );
+
+  const retry = createPendingSubmissionMap({
+    token,
+    storage,
+    now: () => 1_700_000_001_000
+  });
+  const id = createClientOrderId();
+  retry.set(requestKey, id);
+
+  const reloaded = createPendingSubmissionMap({
+    token,
+    storage,
+    now: () => 1_700_000_001_000
+  });
+  assert.equal(reloaded.size(), 1);
+  assert.equal(reloaded.get(requestKey), id);
 });

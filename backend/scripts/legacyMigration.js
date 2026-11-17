@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const fs = require('fs');
+const { StringDecoder } = require('string_decoder');
 const mongoose = require('mongoose');
 
 const DefaultUser = require('../models/User');
@@ -651,11 +652,56 @@ function normalizeBatchSize(batchSize) {
   return Number.isInteger(batchSize) && batchSize > 0 ? batchSize : DEFAULT_BATCH_SIZE;
 }
 
+// planAccount only needs three things from the canonical collections: OPEN
+// orders for lock reconciliation, canonical orders that a legacy record
+// resolves to, and canonical trades that a legacy trade resolves to. Reading a
+// user's entire trade history could exhaust memory for a large account, so the
+// lookup ids are computed first and passed to the database as a filter.
+function collectLegacyLookupIds(users) {
+  const orderIds = [];
+  const orderClientIds = [];
+  const tradeIds = [];
+
+  for (const user of users) {
+    for (const raw of Array.isArray(user.pendingOrders) ? user.pendingOrders : []) {
+      if (!raw) continue;
+      const legacyId = optionalObjectId(raw._id) || legacyOrderId(user._id, raw);
+      orderIds.push(legacyId);
+      orderClientIds.push(legacyOrderKey(user._id, legacyId));
+    }
+    for (const raw of Array.isArray(user.trades) ? user.trades : []) {
+      if (!raw) continue;
+      tradeIds.push(optionalObjectId(raw._id) || legacyTradeId(user._id, raw));
+    }
+  }
+
+  return { orderIds, orderClientIds, tradeIds };
+}
+
+function canonicalOrderFilter(userIdMatcher, { orderIds, orderClientIds }) {
+  const filter = { userId: userIdMatcher };
+  if (orderIds.length > 0 || orderClientIds.length > 0) {
+    filter.$or = [
+      { status: 'OPEN' },
+      { _id: { $in: orderIds } },
+      { clientOrderId: { $in: orderClientIds } }
+    ];
+  } else {
+    filter.status = 'OPEN';
+  }
+  return filter;
+}
+
 async function loadBatchRecords(models, users) {
   const userIds = users.map(user => user._id);
+  const lookups = collectLegacyLookupIds(users);
+  const tradeFilter = lookups.tradeIds.length > 0
+    ? { userId: { $in: userIds }, _id: { $in: lookups.tradeIds } }
+    : null;
+
   const [orders, trades] = await Promise.all([
-    models.Order.collection.find({ userId: { $in: userIds } }).toArray(),
-    models.Trade.collection.find({ userId: { $in: userIds } }).toArray()
+    models.Order.collection.find(canonicalOrderFilter({ $in: userIds }, lookups)).toArray(),
+    tradeFilter ? models.Trade.collection.find(tradeFilter).toArray() : []
   ]);
   const ordersByUser = groupByUser(orders);
   const tradesByUser = groupByUser(trades);
@@ -739,9 +785,16 @@ async function applyUserPlan({ User, Order, Trade, mongoose: mongooseInstance, u
         result = { userId: String(userId), action: 'missing', ordersInserted: 0, tradesInserted: 0 };
         return;
       }
+      const lookups = collectLegacyLookupIds([rawUser]);
+      const tradesQuery = lookups.tradeIds.length > 0
+        ? Trade.collection.find(
+          { userId, _id: { $in: lookups.tradeIds } },
+          { session }
+        ).toArray()
+        : Promise.resolve([]);
       const [existingOrders, existingTrades] = await Promise.all([
-        Order.collection.find({ userId }, { session }).toArray(),
-        Trade.collection.find({ userId }, { session }).toArray()
+        Order.collection.find(canonicalOrderFilter(userId, lookups), { session }).toArray(),
+        tradesQuery
       ]);
 
       const plan = planAccount(rawUser, existingOrders, existingTrades, { now });
@@ -1241,52 +1294,341 @@ async function createBackup({ User }, file, { now = new Date(), batchSize = DEFA
   }
 }
 
-function readBackup(file) {
-  let payload;
-  try {
-    payload = JSON.parse(fs.readFileSync(file, 'utf8'));
-  } catch (err) {
-    return { ok: false, error: `Backup file could not be read: ${err.message}` };
+const BACKUP_READ_CHUNK_SIZE = 512 * 1024;
+
+// Streaming JSON reader over a file descriptor. It retains only the bytes of
+// the value currently being parsed, so a backup of any size can be validated
+// and walked without ever holding the whole document in memory.
+function createBackupReader(fd, chunkSize) {
+  const size = Number.isInteger(chunkSize) && chunkSize > 0 ? chunkSize : BACKUP_READ_CHUNK_SIZE;
+  const chunk = Buffer.alloc(size);
+  const decoder = new StringDecoder('utf8');
+  let text = '';
+  let index = 0;
+  let ended = false;
+
+  function fill() {
+    if (ended) return;
+    const bytes = fs.readSync(fd, chunk, 0, size, null);
+    if (bytes === 0) {
+      ended = true;
+      text += decoder.end();
+      return;
+    }
+    text += decoder.write(chunk.subarray(0, bytes));
   }
-  if (!payload || payload.version !== BACKUP_VERSION || !Array.isArray(payload.users)) {
-    return { ok: false, error: `Backup file is not a version ${BACKUP_VERSION} migration backup.` };
+
+  function available() {
+    return text.length - index;
   }
-  const expected = backupHash(payload.users);
-  if (payload.sha256 !== expected) {
-    return { ok: false, error: 'Backup checksum does not match its contents.' };
+
+  function ensure(count) {
+    while (available() < count && !ended) fill();
   }
-  return { ok: true, payload };
-}
 
-async function verifyBackup({ User }, file, { batchSize = DEFAULT_BATCH_SIZE } = {}) {
-  const read = readBackup(file);
-  if (!read.ok) return read;
-  const { payload } = read;
+  function peek(offset = 0) {
+    ensure(offset + 1);
+    const position = index + offset;
+    return position < text.length ? text[position] : null;
+  }
 
-  const backupById = new Map(payload.users.map(user => [String(user._id), user]));
-  const seen = new Set();
-  const missingUsers = [];
-  const changedEmbedded = [];
-  let currentUserCount = 0;
+  function next() {
+    const value = peek();
+    if (value !== null) index += 1;
+    return value;
+  }
 
-  const cursor = User.collection.find({}).sort({ _id: 1 }).batchSize(normalizeBatchSize(batchSize));
-  for await (const current of cursor) {
-    currentUserCount += 1;
-    const key = String(current._id);
-    const backupUser = backupById.get(key);
-    if (!backupUser) continue;
-    seen.add(key);
-
-    // The embedded arrays are intentionally retained, so a correct migration
-    // must leave them byte-for-byte equivalent to the backup.
-    if (JSON.stringify(backupUser.pendingOrders || []) !== JSON.stringify(current.pendingOrders || [])
-      || JSON.stringify(backupUser.trades || []) !== JSON.stringify(current.trades || [])) {
-      changedEmbedded.push(key);
+  function skipWhitespace() {
+    while (true) {
+      const value = peek();
+      if (value === ' ' || value === '\t' || value === '\n' || value === '\r') {
+        index += 1;
+        continue;
+      }
+      break;
     }
   }
 
-  for (const key of backupById.keys()) {
-    if (!seen.has(key)) missingUsers.push(key);
+  function readStringRaw() {
+    const start = index;
+    if (next() !== '"') throw new SyntaxError('Expected a JSON string.');
+    let escaped = false;
+    while (true) {
+      const value = next();
+      if (value === null) throw new SyntaxError('Unterminated JSON string.');
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (value === '\\') {
+        escaped = true;
+        continue;
+      }
+      if (value === '"') return text.slice(start, index);
+    }
+  }
+
+  function readScalarRaw() {
+    const start = index;
+    while (true) {
+      const value = peek();
+      if (value === null || value === ',' || value === '}' || value === ']'
+        || value === ' ' || value === '\t' || value === '\n' || value === '\r') break;
+      index += 1;
+    }
+    if (index === start) throw new SyntaxError('Expected a JSON value.');
+    return text.slice(start, index);
+  }
+
+  function readCompositeRaw() {
+    const start = index;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    while (true) {
+      const value = next();
+      if (value === null) throw new SyntaxError('Unexpected end of JSON input.');
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (value === '\\') escaped = true;
+        else if (value === '"') inString = false;
+        continue;
+      }
+      if (value === '"') inString = true;
+      else if (value === '{' || value === '[') depth += 1;
+      else if (value === '}' || value === ']') {
+        depth -= 1;
+        if (depth === 0) return text.slice(start, index);
+        if (depth < 0) throw new SyntaxError('Unexpected closing character.');
+      }
+    }
+  }
+
+  function readAnyRaw() {
+    const value = peek();
+    if (value === '"') return readStringRaw();
+    if (value === '{' || value === '[') return readCompositeRaw();
+    return readScalarRaw();
+  }
+
+  function compact() {
+    if (index > size) {
+      text = text.slice(index);
+      index = 0;
+    }
+  }
+
+  return { peek, next, skipWhitespace, readStringRaw, readAnyRaw, compact };
+}
+
+// Yields every user and, after the array ends, the checksum computed over the
+// same compact serialization that backupHash produces.
+function* readBackupEvents(file, { chunkSize } = {}) {
+  const fd = fs.openSync(file, 'r');
+  const reader = createBackupReader(fd, chunkSize);
+  try {
+    reader.skipWhitespace();
+    if (reader.next() !== '{') throw new SyntaxError('Backup file is not a JSON object.');
+
+    const meta = {};
+    let usersSeen = false;
+    let userCount = 0;
+    let hash = null;
+
+    reader.skipWhitespace();
+    if (reader.peek() === '}') {
+      reader.next();
+    } else {
+      members: while (true) {
+        reader.skipWhitespace();
+        const key = JSON.parse(reader.readStringRaw());
+        reader.skipWhitespace();
+        if (reader.next() !== ':') throw new SyntaxError('Expected ":" in the backup object.');
+        reader.skipWhitespace();
+
+        if (key === 'users') {
+          if (usersSeen) throw new SyntaxError('Duplicate "users" member in the backup.');
+          usersSeen = true;
+          if (reader.next() !== '[') throw new SyntaxError('Backup "users" is not an array.');
+          hash = crypto.createHash('sha256');
+          hash.update('[');
+          reader.skipWhitespace();
+          if (reader.peek() === ']') {
+            reader.next();
+          } else {
+            while (true) {
+              reader.skipWhitespace();
+              const raw = reader.readAnyRaw();
+              const user = JSON.parse(raw);
+              hash.update(userCount === 0 ? JSON.stringify(user) : `,${JSON.stringify(user)}`);
+              userCount += 1;
+              yield { type: 'user', user };
+              reader.compact();
+              reader.skipWhitespace();
+              const separator = reader.next();
+              if (separator === ',') continue;
+              if (separator === ']') break;
+              throw new SyntaxError('Expected "," or "]" in the backup "users" array.');
+            }
+          }
+          hash.update(']');
+        } else {
+          meta[key] = JSON.parse(reader.readAnyRaw());
+          reader.compact();
+        }
+
+        reader.skipWhitespace();
+        const separator = reader.next();
+        if (separator === ',') continue members;
+        if (separator === '}') break;
+        throw new SyntaxError('Expected "," or "}" in the backup object.');
+      }
+    }
+
+    reader.skipWhitespace();
+    if (reader.peek() !== null) throw new SyntaxError('Unexpected content after the backup object.');
+
+    yield {
+      type: 'checksum',
+      usersSeen,
+      userCount,
+      sha256: hash ? hash.digest('hex') : null,
+      meta
+    };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+async function* iterateBackupUsers(file, { chunkSize } = {}) {
+  for (const event of readBackupEvents(file, { chunkSize })) {
+    if (event.type === 'user') yield event.user;
+  }
+}
+
+// Validates structure and checksum without retaining the users array. The
+// returned payload holds metadata only; use iterateBackupUsers to walk it.
+function readBackup(file, { chunkSize } = {}) {
+  let checksum = null;
+  try {
+    for (const event of readBackupEvents(file, { chunkSize })) {
+      if (event.type === 'checksum') checksum = event;
+    }
+  } catch (err) {
+    return { ok: false, error: `Backup file could not be read: ${err.message}` };
+  }
+
+  const payload = checksum
+    ? {
+      version: checksum.meta.version,
+      createdAt: checksum.meta.createdAt === undefined ? null : checksum.meta.createdAt,
+      userCount: checksum.meta.userCount,
+      sha256: checksum.meta.sha256
+    }
+    : null;
+
+  if (!payload || !checksum.usersSeen || payload.version !== BACKUP_VERSION) {
+    return { ok: false, error: `Backup file is not a version ${BACKUP_VERSION} migration backup.` };
+  }
+  if (payload.sha256 !== checksum.sha256) {
+    return { ok: false, error: 'Backup checksum does not match its contents.' };
+  }
+  return { ok: true, payload, userCount: checksum.userCount };
+}
+
+// Merge-joins the id-sorted backup against the id-sorted user cursor. Only one
+// record from each side is held at a time, so verification stays bounded even
+// for a collection with a very large number of users.
+async function verifyBackup({ User }, file, { batchSize = DEFAULT_BATCH_SIZE, chunkSize } = {}) {
+  const read = readBackup(file, { chunkSize });
+  if (!read.ok) return read;
+  const { payload } = read;
+
+  const missingUsers = [];
+  const changedEmbedded = [];
+  let currentUserCount = 0;
+  let backupUsersChecked = 0;
+  let previousBackupId = null;
+  let outOfOrder = false;
+
+  // createBackup writes users sorted by _id, which is what makes the merge
+  // possible without a lookup map. Anything else is rejected rather than
+  // silently producing an incomplete comparison.
+  const backupIterator = iterateBackupUsers(file, { chunkSize })[Symbol.asyncIterator]();
+  let backupEntry = null;
+
+  async function advanceBackup() {
+    const next = await backupIterator.next();
+    backupEntry = next.done ? null : next.value;
+    if (!backupEntry) return backupEntry;
+    const key = String(backupEntry._id);
+    if (previousBackupId !== null && key <= previousBackupId) outOfOrder = true;
+    previousBackupId = key;
+    return backupEntry;
+  }
+
+  try {
+    await advanceBackup();
+    const cursor = User.collection.find({}).sort({ _id: 1 }).batchSize(normalizeBatchSize(batchSize));
+    for await (const current of cursor) {
+      currentUserCount += 1;
+      const key = String(current._id);
+
+      while (backupEntry && String(backupEntry._id) < key) {
+        missingUsers.push(String(backupEntry._id));
+        backupUsersChecked += 1;
+        await advanceBackup();
+      }
+
+      if (backupEntry && String(backupEntry._id) === key) {
+        backupUsersChecked += 1;
+        // The embedded arrays are intentionally retained, so a correct
+        // migration must leave them byte-for-byte equivalent to the backup.
+        if (JSON.stringify(backupEntry.pendingOrders || []) !== JSON.stringify(current.pendingOrders || [])
+          || JSON.stringify(backupEntry.trades || []) !== JSON.stringify(current.trades || [])) {
+          changedEmbedded.push(key);
+        }
+        await advanceBackup();
+      }
+    }
+
+    while (backupEntry) {
+      missingUsers.push(String(backupEntry._id));
+      backupUsersChecked += 1;
+      await advanceBackup();
+    }
+  } catch (err) {
+    return {
+      ok: false,
+      file,
+      version: payload.version,
+      createdAt: payload.createdAt,
+      userCount: payload.userCount,
+      currentUserCount,
+      missingUsers,
+      changedEmbedded,
+      error: `Backup verification failed while reading users: ${err.message}`
+    };
+  } finally {
+    try {
+      await backupIterator.return();
+    } catch {
+      // The original result is more useful than a cleanup failure.
+    }
+  }
+
+  if (outOfOrder) {
+    return {
+      ok: false,
+      file,
+      version: payload.version,
+      createdAt: payload.createdAt,
+      userCount: payload.userCount,
+      currentUserCount,
+      missingUsers,
+      changedEmbedded,
+      error: 'Backup users are not sorted by _id; bounded verification cannot continue.'
+    };
   }
 
   return {
@@ -1296,6 +1638,7 @@ async function verifyBackup({ User }, file, { batchSize = DEFAULT_BATCH_SIZE } =
     createdAt: payload.createdAt,
     userCount: payload.userCount,
     currentUserCount,
+    backupUsersChecked,
     missingUsers,
     changedEmbedded,
     error: missingUsers.length > 0 ? 'Backup users are missing from the database.' : null
@@ -1323,6 +1666,7 @@ module.exports = {
   verifyMigration,
   createBackup,
   readBackup,
+  iterateBackupUsers,
   verifyBackup,
   backupHash
 };

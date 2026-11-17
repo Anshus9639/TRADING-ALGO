@@ -20,6 +20,7 @@ const {
   verifyMigration,
   createBackup,
   readBackup,
+  iterateBackupUsers,
   verifyBackup,
   backupHash
 } = require('../scripts/legacyMigration');
@@ -62,14 +63,16 @@ function legacyOrder(symbol, type, quantity, limitPrice, timestamp) {
 // Wraps the canonical models so tests can observe how many users are read at a
 // time and which user ids each associated-collection query requests.
 function trackedModels() {
-  const calls = { orderBatches: [], tradeBatches: [] };
-  const wrap = (Model, sink) => ({
+  const calls = { orderBatches: [], tradeBatches: [], orderFilters: [], tradeFilters: [] };
+  const wrap = (Model, sink, filterSink) => ({
     collection: {
       find(filter, ...rest) {
         const ids = filter && filter.userId && filter.userId.$in;
         if (Array.isArray(ids)) sink.push(ids.map(String));
+        filterSink.push(filter);
         return Model.collection.find(filter, ...rest);
       },
+      insertOne: (...args) => Model.collection.insertOne(...args),
       countDocuments: (...args) => Model.collection.countDocuments(...args)
     }
   });
@@ -78,8 +81,8 @@ function trackedModels() {
     calls,
     models: {
       User,
-      Order: wrap(Order, calls.orderBatches),
-      Trade: wrap(Trade, calls.tradeBatches)
+      Order: wrap(Order, calls.orderBatches, calls.orderFilters),
+      Trade: wrap(Trade, calls.tradeBatches, calls.tradeFilters)
     }
   };
 }
@@ -833,9 +836,14 @@ describe('legacy embedded data migration', () => {
       expect(read.ok).toBe(true);
       expect(read.payload.version).toBe(1);
       expect(read.payload.userCount).toBe(3);
-      expect(read.payload.users).toHaveLength(3);
-      expect(read.payload.sha256).toBe(backupHash(read.payload.users));
       expect(read.payload.sha256).toBe(backup.sha256);
+      // Metadata is returned without retaining the users array in memory.
+      expect(read.payload.users).toBeUndefined();
+
+      const backedUpUsers = [];
+      for await (const user of iterateBackupUsers(backupFile)) backedUpUsers.push(user);
+      expect(backedUpUsers).toHaveLength(3);
+      expect(read.payload.sha256).toBe(backupHash(backedUpUsers));
 
       const applied = await runMigration({ ...models(), mongoose, mode: 'apply', batchSize: 2 });
       expect(applied.usersFailed).toBe(0);
@@ -853,6 +861,83 @@ describe('legacy embedded data migration', () => {
       expect(verification.users).toBe(3);
       expect(verification.migrated).toEqual({ orders: 3, trades: 3, pending: 0 });
       expect(verification.backup.ok).toBe(true);
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test('backup streaming handles tiny chunks, unicode and escaped braces', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'nexustrade-migration-'));
+    const backupFile = path.join(directory, 'users-backup.json');
+    try {
+      const users = [
+        {
+          _id: '000000000000000000000001',
+          username: 'café-😀-{tricky}',
+          note: 'quote " and backslash \\ and ] bracket',
+          pendingOrders: [{ symbol: 'BTCUSDT', note: '}{[', nested: { deep: [1, 2, 3] } }],
+          trades: []
+        },
+        {
+          _id: '000000000000000000000002',
+          username: 'braces } { [',
+          pendingOrders: [],
+          trades: [{ price: 1.5 }]
+        }
+      ];
+      fs.writeFileSync(backupFile, `${JSON.stringify({
+        version: 1,
+        createdAt: '2025-01-01T00:00:00.000Z',
+        userCount: users.length,
+        users,
+        sha256: backupHash(users)
+      }, null, 2)}\n`);
+
+      const read = readBackup(backupFile, { chunkSize: 7 });
+      expect(read.ok).toBe(true);
+      expect(read.userCount).toBe(2);
+      expect(read.payload.sha256).toBe(backupHash(users));
+
+      const streamed = [];
+      for await (const user of iterateBackupUsers(backupFile, { chunkSize: 5 })) {
+        streamed.push(user);
+      }
+      expect(streamed).toEqual(users);
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test('backup structure and checksum are validated while streaming', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'nexustrade-migration-'));
+    const backupFile = path.join(directory, 'users-backup.json');
+    try {
+      const users = [{ _id: '000000000000000000000001', pendingOrders: [], trades: [] }];
+      fs.writeFileSync(backupFile, JSON.stringify({
+        version: 1,
+        createdAt: '2025-01-01T00:00:00.000Z',
+        userCount: users.length,
+        users,
+        sha256: backupHash(users)
+      }));
+      expect(readBackup(backupFile).ok).toBe(true);
+
+      fs.writeFileSync(backupFile, JSON.stringify({
+        version: 1,
+        userCount: 1,
+        users: [{ _id: '000000000000000000000001', pendingOrders: [{ symbol: 'ETHUSDT' }], trades: [] }],
+        sha256: backupHash(users)
+      }));
+      expect(readBackup(backupFile)).toMatchObject({
+        ok: false,
+        error: 'Backup checksum does not match its contents.'
+      });
+
+      fs.writeFileSync(backupFile, JSON.stringify({ version: 2, users: [], sha256: backupHash([]) }));
+      expect(readBackup(backupFile).error).toMatch(/not a version 1 migration backup/);
+
+      fs.writeFileSync(backupFile, '{not json');
+      expect(readBackup(backupFile).error).toMatch(/could not be read/);
     } finally {
       fs.rmSync(directory, { recursive: true, force: true });
     }
@@ -908,6 +993,54 @@ describe('legacy embedded data migration', () => {
     expect(verification.migrated).toEqual({ orders: 5, trades: 5, pending: 0 });
     expect(calls.orderBatches.map(batch => batch.length)).toEqual([2, 2, 1]);
     expect(calls.tradeBatches.map(batch => batch.length)).toEqual([2, 2, 1]);
+  });
+
+  test('a large unrelated canonical history is never loaded for migration or verification', async () => {
+    const trade = legacyTrade('BTCUSDT', 'BUY', 0.1, 40000, new Date('2025-01-01T00:00:00Z'));
+    const user = await createTestUser({
+      balance: 6000,
+      portfolio: [{ symbol: 'BTCUSDT', quantity: 0.1, avgPrice: 40000 }],
+      trades: [trade]
+    });
+
+    // This account has thousands of canonical trades that the legacy data does
+    // not reference. They must be filtered in the database, not fetched and
+    // discarded in memory.
+    const unrelated = [];
+    for (let index = 0; index < 2000; index += 1) {
+      unrelated.push({
+        userId: user._id,
+        symbol: 'ETHUSDT',
+        side: 'BUY',
+        quantity: 1,
+        executionPrice: 1000 + index,
+        notional: 1000 + index,
+        timestamp: new Date('2024-01-01T00:00:00Z')
+      });
+    }
+    await Trade.insertMany(unrelated);
+
+    const verificationRun = trackedModels();
+    const report = await verifyMigration(verificationRun.models, { batchSize: 2 });
+
+    expect(report.mismatches.map(item => item.code)).toContain('UNMIGRATED_TRADES');
+    const tradeFilter = verificationRun.calls.tradeFilters[0];
+    expect(tradeFilter.userId.$in.map(String)).toEqual([String(user._id)]);
+    expect(tradeFilter._id.$in).toHaveLength(1);
+    expect(String(tradeFilter._id.$in[0])).toBe(String(trade._id));
+
+    const applyRun = trackedModels();
+    const applied = await runMigration({
+      ...applyRun.models,
+      mongoose,
+      mode: 'apply',
+      batchSize: 2
+    });
+
+    expect(applied.usersFailed).toBe(0);
+    expect(applied.writes).toEqual({ users: 1, orders: 0, trades: 1 });
+    expect(applyRun.calls.tradeFilters[0]._id.$in).toHaveLength(1);
+    expect(await Trade.countDocuments({ userId: user._id })).toBe(2001);
   });
 
   test('a canonical order conflict makes verification fail', async () => {    const order = legacyOrder('BTCUSDT', 'BUY', 0.1, 40000, new Date('2025-05-01T00:00:00Z'));

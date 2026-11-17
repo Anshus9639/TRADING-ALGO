@@ -1,11 +1,31 @@
 const { createMarketFeed } = require('../services/marketFeed');
 const { createTradeService } = require('../services/tradeService');
+const Order = require('../models/Order');
+const Trade = require('../models/Trade');
 const {
   startTestDb,
   stopTestDb,
   createTestUser,
   snapshotUser
 } = require('./helpers');
+
+// Simulates the race where the pre-transaction lookup misses an order that
+// becomes visible to the transaction's snapshot.
+function missFirstLookup(OrderModel) {
+  let skipped = false;
+  return new Proxy(OrderModel, {
+    get(target, property, receiver) {
+      if (property !== 'findOne') return Reflect.get(target, property, receiver);
+      return (filter, ...args) => {
+        if (!skipped && filter && filter.clientOrderId) {
+          skipped = true;
+          return { lean: async () => null, session: () => ({ lean: async () => null }) };
+        }
+        return target.findOne(filter, ...args);
+      };
+    }
+  });
+}
 
 describe('trade service market execution', () => {
   let feed;
@@ -266,5 +286,108 @@ describe('trade service market execution', () => {
     expect(result.status).toBe(409);
     expect(result.body.code).toBe('PRICE_CHANGED');
     expect(await snapshotUser(user._id)).toEqual(before);
+  });
+
+  test('a retry with an expired quote returns the order committed by the original attempt', async () => {
+    const user = await createTestUser({ balance: 10000 });
+    feed.setQuote('BTCUSDT', 50000);
+    const key = 'expired-quote-committed-retry';
+
+    const clocked = createTradeService({ feed, now: () => now });
+    const original = await clocked.executeMarketOrder({
+      userId: user._id,
+      side: 'BUY',
+      symbol: 'BTCUSDT',
+      quantity: 0.1,
+      clientOrderId: key,
+      executionQuote: { symbol: 'BTCUSDT', price: 50000, ts: now }
+    });
+    expect(original.status).toBe(200);
+    const afterOriginal = await snapshotUser(user._id);
+
+    // The pre-check misses the committed order, so the transaction's duplicate
+    // lookup must run before the quote-expiry rejection to find it.
+    const retryService = createTradeService({
+      feed,
+      now: () => now,
+      Order: missFirstLookup(Order)
+    });
+    const retry = await retryService.executeMarketOrder({
+      userId: user._id,
+      side: 'BUY',
+      symbol: 'BTCUSDT',
+      quantity: 0.1,
+      clientOrderId: key,
+      executionQuote: { symbol: 'BTCUSDT', price: 50000, ts: now - 20000 }
+    });
+
+    expect(retry.status).toBe(200);
+    expect(retry.body.success).toBe(true);
+    expect(retry.body.idempotent).toBe(true);
+    expect(retry.body.executedPrice).toBe(50000);
+    expect(await snapshotUser(user._id)).toEqual(afterOriginal);
+    expect(await Order.countDocuments({ userId: user._id, clientOrderId: key })).toBe(1);
+    expect(await Trade.countDocuments({ userId: user._id, clientOrderId: key })).toBe(1);
+  });
+
+  test('an expired quote for a genuinely new order is rejected before mutating', async () => {
+    const user = await createTestUser({ balance: 10000 });
+    feed.setQuote('BTCUSDT', 50000);
+    const before = await snapshotUser(user._id);
+
+    const freshService = createTradeService({
+      feed,
+      now: () => now,
+      Order: missFirstLookup(Order)
+    });
+    const result = await freshService.executeMarketOrder({
+      userId: user._id,
+      side: 'BUY',
+      symbol: 'BTCUSDT',
+      quantity: 0.1,
+      clientOrderId: 'expired-quote-new-order',
+      executionQuote: { symbol: 'BTCUSDT', price: 50000, ts: now - 20000 }
+    });
+
+    expect(result.status).toBe(409);
+    expect(result.body.code).toBe('PRICE_CHANGED');
+    expect(await snapshotUser(user._id)).toEqual(before);
+    expect(await Order.countDocuments({ userId: user._id })).toBe(0);
+    expect(await Trade.countDocuments({ userId: user._id })).toBe(0);
+  });
+
+  test('a mismatched retry for a committed order is still an idempotency conflict', async () => {
+    const user = await createTestUser({ balance: 10000 });
+    feed.setQuote('BTCUSDT', 50000);
+    const key = 'expired-quote-conflict';
+
+    const clocked = createTradeService({ feed, now: () => now });
+    const original = await clocked.executeMarketOrder({
+      userId: user._id,
+      side: 'BUY',
+      symbol: 'BTCUSDT',
+      quantity: 0.1,
+      clientOrderId: key,
+      executionQuote: { symbol: 'BTCUSDT', price: 50000, ts: now }
+    });
+    expect(original.status).toBe(200);
+
+    const retryService = createTradeService({
+      feed,
+      now: () => now,
+      Order: missFirstLookup(Order)
+    });
+    const conflict = await retryService.executeMarketOrder({
+      userId: user._id,
+      side: 'BUY',
+      symbol: 'BTCUSDT',
+      quantity: 0.2,
+      clientOrderId: key,
+      executionQuote: { symbol: 'BTCUSDT', price: 50000, ts: now - 20000 }
+    });
+
+    expect(conflict.status).toBe(409);
+    expect(conflict.body.code).toBe('IDEMPOTENCY_CONFLICT');
+    expect(await Order.countDocuments({ userId: user._id, clientOrderId: key })).toBe(1);
   });
 });

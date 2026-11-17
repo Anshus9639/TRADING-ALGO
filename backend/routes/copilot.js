@@ -16,6 +16,10 @@ const { SUPPORTED_SYMBOLS } = require('../lib/validate');
 const { roundTo } = require('../lib/numbers');
 
 const MAX_PROMPT_LENGTH = 500;
+// A consumed proposal whose order is not visible yet may still be committing.
+// Status lookups report it as pending for this long instead of claiming the
+// execution never happened.
+const EXECUTION_SETTLE_WINDOW_MS = 30000;
 
 const CODE_MESSAGES = Object.freeze({
   INVALID_PROPOSAL: 'Proposal is invalid.',
@@ -56,9 +60,9 @@ function inferTradeErrorCode(message = '') {
   return 'TRADE_REJECTED';
 }
 
-function sendTradeResult(res, result) {
+function mapTradeResult(result) {
   if (result.body.success) {
-    return res.status(result.status).json(result.body);
+    return { status: result.status, body: result.body };
   }
 
   // Preserve an explicit service code (e.g. MATCHER_NOT_READY) instead of
@@ -70,11 +74,26 @@ function sendTradeResult(res, result) {
         ? inferTradeErrorCode(result.body.message)
         : 'TRADE_REJECTED');
 
-  return res.status(result.status).json({
-    success: false,
-    code,
-    message: result.body.message
-  });
+  return {
+    status: result.status,
+    body: {
+      success: false,
+      code,
+      message: result.body.message
+    }
+  };
+}
+
+function pendingExecution() {
+  return {
+    status: 202,
+    body: {
+      success: false,
+      code: 'EXECUTION_PENDING',
+      execution: 'PENDING',
+      message: 'Execution is still settling. Retry shortly.'
+    }
+  };
 }
 
 function createCopilotRouter({
@@ -85,6 +104,7 @@ function createCopilotRouter({
   now = Date.now,
   User: UserModel = User,
   rateLimit = null,
+  tradeService: tradeServiceOverride = null,
   usdInrRate,
   maxPriceDriftPct,
   geminiModel,
@@ -105,7 +125,8 @@ function createCopilotRouter({
   const store = proposalStore || createProposalStore({ now, ttlMs: runtime.proposalTtlMs });
   // Share the router clock so settlement-time quote-age checks use the same
   // timeline as the proposal store and market feed.
-  const tradeService = createTradeService({ feed, User: UserModel, runtimeStatus, now });
+  const tradeService = tradeServiceOverride
+    || createTradeService({ feed, User: UserModel, runtimeStatus, now });
 
   const limits = rateLimit || runtime.rateLimit;
   const copilotLimiter = limits.max > 0 && limits.windowMs > 0
@@ -276,6 +297,164 @@ function createCopilotRouter({
 
   // Stage 2: consume the server-side proposal exactly once and execute its
   // stored intent through the same trade service used by manual orders.
+  const inFlight = new Map();
+  // Definitive, non-executing outcomes are replayed for retries so a consumed
+  // proposal is never reported as ambiguous just because no order exists.
+  const settled = new Map();
+  const settledTtlMs = Number.isFinite(store.ttlMs) ? store.ttlMs : 120000;
+
+  function pendingKey(userId, proposalId) {
+    return `${String(userId)}:${proposalId}`;
+  }
+
+  function pruneSettled() {
+    const timestamp = now();
+    for (const [key, entry] of settled) {
+      if (timestamp - entry.at > settledTtlMs) settled.delete(key);
+    }
+  }
+
+  function rememberSettled(key, result) {
+    if (!result || result.status === 202 || result.body?.success === true) return;
+    pruneSettled();
+    settled.set(key, { status: result.status, body: result.body, at: now() });
+  }
+
+  function recallSettled(key) {
+    const entry = settled.get(key);
+    if (!entry) return null;
+    if (now() - entry.at > settledTtlMs) {
+      settled.delete(key);
+      return null;
+    }
+    return { status: entry.status, body: entry.body };
+  }
+
+  function stillSettling(proposalId, userId) {
+    const info = store.inspect({ proposalId, userId });
+    if (!info.ok || info.state !== 'USED') return false;
+    const consumedAt = Number(info.proposal.consumedAt);
+    if (!Number.isFinite(consumedAt)) return false;
+    const age = now() - consumedAt;
+    return age >= 0 && age < EXECUTION_SETTLE_WINDOW_MS;
+  }
+
+  async function runExecution({ userId, proposalId }) {
+    // The proposal id is the execution idempotency key. If this proposal
+    // already produced an order, a network retry returns that same result
+    // instead of reporting the proposal as merely consumed.
+    const priorResult = await tradeService.getExecutionResult({
+      userId,
+      clientOrderId: proposalId
+    });
+    if (priorResult) return priorResult;
+
+    const remembered = recallSettled(pendingKey(userId, proposalId));
+    if (remembered) return remembered;
+
+    const consumed = store.consume({ proposalId, userId });
+    if (!consumed.ok) {
+      if (consumed.code === 'PROPOSAL_ALREADY_USED') {
+        const retried = await tradeService.getExecutionResult({
+          userId,
+          clientOrderId: proposalId
+        });
+        if (retried) return retried;
+        // Consumed but not visible yet: another attempt may still be
+        // committing. It is not a definitive failure until settlement ends.
+        if (stillSettling(proposalId, userId)) return pendingExecution();
+      }
+      return {
+        status: PROPOSAL_ERROR_STATUS[consumed.code] || 400,
+        body: {
+          success: false,
+          code: consumed.code,
+          message: CODE_MESSAGES[consumed.code] || 'Proposal rejected.'
+        }
+      };
+    }
+
+    const { intent, quote } = consumed.proposal;
+    const revalidated = revalidateStoredIntent(intent);
+    if (!revalidated.ok) {
+      return {
+        status: 400,
+        body: {
+          success: false,
+          code: 'INVALID_PROPOSAL',
+          message: revalidated.message
+        }
+      };
+    }
+    const storedIntent = revalidated.value;
+
+    if (storedIntent.orderType === 'MARKET') {
+      const freshQuote = feed.getQuote(storedIntent.symbol);
+      if (freshQuote.status !== 'ok') {
+        return {
+          status: 503,
+          body: {
+            success: false,
+            code: 'PRICE_UNAVAILABLE',
+            message: 'Market price unavailable. Please retry.'
+          }
+        };
+      }
+
+      if (!quote || !Number.isFinite(quote.price) || quote.price <= 0) {
+        return {
+          status: 400,
+          body: {
+            success: false,
+            code: 'INVALID_PROPOSAL',
+            message: CODE_MESSAGES.INVALID_PROPOSAL
+          }
+        };
+      }
+
+      const driftPct = (Math.abs(freshQuote.price - quote.price) / quote.price) * 100;
+      if (driftPct > driftThreshold) {
+        return {
+          status: 409,
+          body: {
+            success: false,
+            code: 'PRICE_CHANGED',
+            message: CODE_MESSAGES.PRICE_CHANGED,
+            previewPrice: quote.price,
+            currentPrice: freshQuote.price,
+            driftPct: roundTo(driftPct, 4)
+          }
+        };
+      }
+
+      const result = await tradeService.executeMarketOrder({
+        userId,
+        side: storedIntent.side,
+        symbol: storedIntent.symbol,
+        quantity: storedIntent.quantity,
+        clientOrderId: proposalId,
+        // The quote that passed the drift check is the quote used for
+        // settlement; no second, different quote is fetched.
+        executionQuote: {
+          symbol: storedIntent.symbol,
+          price: freshQuote.price,
+          ts: freshQuote.ts
+        }
+      });
+      return mapTradeResult(result);
+    }
+
+    const result = await tradeService.placeLimitOrder({
+      userId,
+      side: storedIntent.side,
+      symbol: storedIntent.symbol,
+      quantity: storedIntent.quantity,
+      limitPrice: storedIntent.limitPrice,
+      clientOrderId: proposalId
+    });
+    return mapTradeResult(result);
+  }
+
   router.post('/execute', copilotLimiter, auth, async (req, res) => {
     try {
       const proposalId = typeof req.body?.proposalId === 'string'
@@ -290,102 +469,96 @@ function createCopilotRouter({
         });
       }
 
-      // The proposal id is the execution idempotency key. If this proposal
-      // already produced an order, a network retry returns that same result
-      // instead of reporting the proposal as merely consumed.
-      const priorResult = await tradeService.getExecutionResult({
-        userId: req.user.id,
-        clientOrderId: proposalId
+      // A second identical request while the first is still settling must not
+      // run the execution twice; the retry is told to poll for the outcome.
+      const key = pendingKey(req.user.id, proposalId);
+      if (inFlight.has(key)) {
+        const pending = pendingExecution();
+        return res.status(pending.status).json(pending.body);
+      }
+
+      const execution = runExecution({ userId: req.user.id, proposalId });
+      inFlight.set(key, execution);
+      try {
+        const result = await execution;
+        rememberSettled(key, result);
+        return res.status(result.status).json(result.body);
+      } finally {
+        if (inFlight.get(key) === execution) inFlight.delete(key);
+      }
+    } catch (err) {
+      console.error('Copilot execute error:', err.message);
+      return res.status(500).json({
+        success: false,
+        code: 'COPILOT_ERROR',
+        message: 'Copilot request failed.'
       });
-      if (priorResult) {
-        return res.status(priorResult.status).json(priorResult.body);
-      }
+    }
+  });
 
-      const consumed = store.consume({ proposalId, userId: req.user.id });
-      if (!consumed.ok) {
-        if (consumed.code === 'PROPOSAL_ALREADY_USED') {
-          const retried = await tradeService.getExecutionResult({
-            userId: req.user.id,
-            clientOrderId: proposalId
-          });
-          if (retried) return res.status(retried.status).json(retried.body);
-        }
-        return res.status(PROPOSAL_ERROR_STATUS[consumed.code] || 400).json({
-          success: false,
-          code: consumed.code,
-          message: CODE_MESSAGES[consumed.code] || 'Proposal rejected.'
-        });
-      }
+  // Lookup-only execution status. It never consumes, executes or revokes the
+  // proposal, so the UI can resolve an unknown outcome without placing a trade.
+  router.get('/proposals/:proposalId/status', copilotLimiter, auth, async (req, res) => {
+    try {
+      const proposalId = typeof req.params.proposalId === 'string'
+        ? req.params.proposalId.trim()
+        : '';
+      const userId = req.user.id;
 
-      const { intent, quote } = consumed.proposal;
-      const revalidated = revalidateStoredIntent(intent);
-      if (!revalidated.ok) {
+      if (!proposalId) {
         return res.status(400).json({
           success: false,
           code: 'INVALID_PROPOSAL',
-          message: revalidated.message
+          message: CODE_MESSAGES.INVALID_PROPOSAL
         });
       }
-      const storedIntent = revalidated.value;
 
-      if (storedIntent.orderType === 'MARKET') {
-        const freshQuote = feed.getQuote(storedIntent.symbol);
-        if (freshQuote.status !== 'ok') {
-          return res.status(503).json({
-            success: false,
-            code: 'PRICE_UNAVAILABLE',
-            message: 'Market price unavailable. Please retry.'
-          });
-        }
-
-        if (!quote || !Number.isFinite(quote.price) || quote.price <= 0) {
-          return res.status(400).json({
-            success: false,
-            code: 'INVALID_PROPOSAL',
-            message: CODE_MESSAGES.INVALID_PROPOSAL
-          });
-        }
-
-        const driftPct = (Math.abs(freshQuote.price - quote.price) / quote.price) * 100;
-        if (driftPct > driftThreshold) {
-          return res.status(409).json({
-            success: false,
-            code: 'PRICE_CHANGED',
-            message: CODE_MESSAGES.PRICE_CHANGED,
-            previewPrice: quote.price,
-            currentPrice: freshQuote.price,
-            driftPct: roundTo(driftPct, 4)
-          });
-        }
-
-        const result = await tradeService.executeMarketOrder({
-          userId: req.user.id,
-          side: storedIntent.side,
-          symbol: storedIntent.symbol,
-          quantity: storedIntent.quantity,
-          clientOrderId: proposalId,
-          // The quote that passed the drift check is the quote used for
-          // settlement; no second, different quote is fetched.
-          executionQuote: {
-            symbol: storedIntent.symbol,
-            price: freshQuote.price,
-            ts: freshQuote.ts
-          }
-        });
-        return sendTradeResult(res, result);
-      }
-
-      const result = await tradeService.placeLimitOrder({
-        userId: req.user.id,
-        side: storedIntent.side,
-        symbol: storedIntent.symbol,
-        quantity: storedIntent.quantity,
-        limitPrice: storedIntent.limitPrice,
+      const execution = await tradeService.getExecutionResult({
+        userId,
         clientOrderId: proposalId
       });
-      return sendTradeResult(res, result);
+      if (execution) {
+        return res.status(execution.status).json({
+          ...execution.body,
+          execution: 'EXECUTED'
+        });
+      }
+
+      if (inFlight.has(pendingKey(userId, proposalId))) {
+        const pending = pendingExecution();
+        return res.status(pending.status).json(pending.body);
+      }
+
+      const settledResult = recallSettled(pendingKey(userId, proposalId));
+      if (settledResult) {
+        return res.json({
+          success: true,
+          execution: 'NOT_EXECUTED',
+          proposalState: 'USED'
+        });
+      }
+
+      const info = store.inspect({ proposalId, userId });
+      if (!info.ok) {
+        return res.status(PROPOSAL_ERROR_STATUS[info.code] || 400).json({
+          success: false,
+          code: info.code,
+          message: CODE_MESSAGES[info.code] || 'Proposal rejected.'
+        });
+      }
+
+      if (info.state === 'USED' && stillSettling(proposalId, userId)) {
+        const pending = pendingExecution();
+        return res.status(pending.status).json(pending.body);
+      }
+
+      return res.json({
+        success: true,
+        execution: 'NOT_EXECUTED',
+        proposalState: info.state
+      });
     } catch (err) {
-      console.error('Copilot execute error:', err.message);
+      console.error('Copilot status error:', err.message);
       return res.status(500).json({
         success: false,
         code: 'COPILOT_ERROR',
@@ -433,5 +606,6 @@ function createCopilotRouter({
 module.exports = {
   createCopilotRouter,
   inferTradeErrorCode,
-  MAX_PROMPT_LENGTH
+  MAX_PROMPT_LENGTH,
+  EXECUTION_SETTLE_WINDOW_MS
 };

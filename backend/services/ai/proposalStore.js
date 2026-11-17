@@ -102,6 +102,40 @@ function createProposalStore({
     return proposals.size;
   }
 
+  // Read-only lookup for execution-status consumers. It never consumes,
+  // revokes or deletes anything, so it is safe to call while settling.
+  function inspect({ proposalId, userId } = {}) {
+    if (typeof proposalId !== 'string' || !PROPOSAL_ID_PATTERN.test(proposalId)) {
+      return { ok: false, code: 'INVALID_PROPOSAL' };
+    }
+
+    const record = proposals.get(proposalId);
+    if (!record) return { ok: false, code: 'PROPOSAL_NOT_FOUND' };
+
+    if (String(record.userId) !== String(userId)) {
+      return { ok: false, code: 'INVALID_PROPOSAL' };
+    }
+
+    const state = record.consumedAt !== null
+      ? 'USED'
+      : record.revokedAt !== null
+        ? 'REVOKED'
+        : now() >= record.expiresAt
+          ? 'EXPIRED'
+          : 'READY';
+
+    return {
+      ok: true,
+      state,
+      proposal: {
+        id: record.id,
+        expiresAt: record.expiresAt,
+        consumedAt: record.consumedAt,
+        revokedAt: record.revokedAt
+      }
+    };
+  }
+
   // Server-side discard. Revocation is owner-only, idempotent, and never
   // executes or reserves anything.
   function revoke({ proposalId, userId } = {}) {
@@ -133,7 +167,7 @@ function createProposalStore({
     };
   }
 
-  return { create, consume, revoke, sweep, size, ttlMs };
+  return { create, consume, revoke, inspect, sweep, size, ttlMs };
 }
 
 module.exports = {

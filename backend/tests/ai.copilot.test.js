@@ -4,6 +4,7 @@ const request = require('supertest');
 const { createApp } = require('../app');
 const { createMarketFeed } = require('../services/marketFeed');
 const { createProposalStore, PROPOSAL_ID_PATTERN } = require('../services/ai/proposalStore');
+const { EXECUTION_SETTLE_WINDOW_MS } = require('../routes/copilot');
 const Order = require('../models/Order');
 const Trade = require('../models/Trade');
 const {
@@ -98,6 +99,18 @@ describe('copilot proposal and confirmation flow', () => {
       .post(`/api/copilot/proposals/${encodeURIComponent(proposalId)}/revoke`)
       .set('x-auth-token', token)
       .send({});
+  }
+
+  function executionStatus(app, token, proposalId) {
+    return request(app)
+      .get(`/api/copilot/proposals/${encodeURIComponent(proposalId)}/status`)
+      .set('x-auth-token', token);
+  }
+
+  function deferred() {
+    let resolve;
+    const promise = new Promise(res => { resolve = res; });
+    return { promise, resolve };
   }
 
   test('parsing returns a preview and performs zero account mutations', async () => {
@@ -454,8 +467,21 @@ describe('copilot proposal and confirmation flow', () => {
     expect(res.body.driftPct).toBe(20);
     expect(await snapshotUser(user._id)).toEqual(before);
 
+    // The definitive rejection is settled, so a retry replays it instead of
+    // reporting the consumed proposal as ambiguous, and the status lookup
+    // confirms that no trade was placed.
     const replay = await execute(app, token, parsed.body.proposalId);
-    expect(replay.body.code).toBe('PROPOSAL_ALREADY_USED');
+    expect(replay.status).toBe(409);
+    expect(replay.body.code).toBe('PRICE_CHANGED');
+
+    const status = await executionStatus(app, token, parsed.body.proposalId);
+    expect(status.status).toBe(200);
+    expect(status.body).toMatchObject({
+      success: true,
+      execution: 'NOT_EXECUTED',
+      proposalState: 'USED'
+    });
+    expect(await snapshotUser(user._id)).toEqual(before);
   });
 
   test('price movement within tolerance executes at the fresh server quote', async () => {
@@ -759,5 +785,256 @@ describe('copilot proposal and confirmation flow', () => {
     expect(await Order.countDocuments({ userId: user._id })).toBe(orderCount);
     expect(await Trade.countDocuments({ userId: user._id })).toBe(tradeCount);
     expect(restarted.proposalStore.size()).toBe(0);
+  });
+
+  test('a concurrent retry waits for the settling execution instead of executing twice', async () => {
+    const started = deferred();
+    const release = deferred();
+    let stored = null;
+    let executions = 0;
+    const fakeTradeService = {
+      async getExecutionResult() {
+        return stored;
+      },
+      async executeMarketOrder() {
+        executions += 1;
+        started.resolve();
+        stored = await release.promise;
+        return stored;
+      },
+      async placeLimitOrder() {
+        throw new Error('Unexpected limit order in a market execution test.');
+      }
+    };
+
+    const { app } = makeApp({
+      intents: { 'buy 0.1 btc': modelIntent() },
+      tradeService: fakeTradeService
+    });
+    const user = await createTestUser({ balance: 10000 });
+    const token = authToken(user);
+    const parsed = await parse(app, token, 'Buy 0.1 BTC');
+    expect(parsed.status).toBe(200);
+
+    // The first request is held inside the trade service so the retry truly
+    // overlaps with an in-flight execution.
+    const firstPromise = execute(app, token, parsed.body.proposalId).then(res => res);
+    await started.promise;
+
+    const concurrent = await execute(app, token, parsed.body.proposalId);
+    expect(concurrent.status).toBe(202);
+    expect(concurrent.body).toMatchObject({ code: 'EXECUTION_PENDING', execution: 'PENDING' });
+
+    const pendingStatus = await executionStatus(app, token, parsed.body.proposalId);
+    expect(pendingStatus.status).toBe(202);
+    expect(pendingStatus.body.code).toBe('EXECUTION_PENDING');
+    expect(executions).toBe(1);
+
+    release.resolve({ status: 200, body: { success: true, executedPrice: 50000, balance: 5000 } });
+    const first = await firstPromise;
+    expect(first.status).toBe(200);
+    expect(first.body.success).toBe(true);
+
+    const retry = await execute(app, token, parsed.body.proposalId);
+    expect(retry.status).toBe(200);
+    expect(retry.body.executedPrice).toBe(50000);
+    expect(executions).toBe(1);
+  });
+
+  test('a concurrent retry receives a settled failure without re-executing', async () => {
+    const started = deferred();
+    const release = deferred();
+    let executions = 0;
+    const fakeTradeService = {
+      async getExecutionResult() {
+        // A failed execution commits no order, so nothing is recoverable here.
+        return null;
+      },
+      async executeMarketOrder() {
+        executions += 1;
+        started.resolve();
+        return release.promise;
+      },
+      async placeLimitOrder() {
+        throw new Error('Unexpected limit order in a market execution test.');
+      }
+    };
+
+    const { app } = makeApp({
+      intents: { 'buy 0.1 btc': modelIntent() },
+      tradeService: fakeTradeService
+    });
+    const user = await createTestUser({ balance: 10000 });
+    const token = authToken(user);
+    const parsed = await parse(app, token, 'Buy 0.1 BTC');
+
+    const firstPromise = execute(app, token, parsed.body.proposalId).then(res => res);
+    await started.promise;
+
+    const concurrent = await execute(app, token, parsed.body.proposalId);
+    expect(concurrent.status).toBe(202);
+
+    release.resolve({ status: 400, body: { success: false, message: 'Insufficient USDT balance.' } });
+    const first = await firstPromise;
+    expect(first.status).toBe(400);
+    expect(first.body.code).toBe('INSUFFICIENT_BALANCE');
+
+    // The outcome is settled, so the retry replays it rather than turning
+    // "already consumed" into an ambiguity or executing again.
+    const retry = await execute(app, token, parsed.body.proposalId);
+    expect(retry.status).toBe(400);
+    expect(retry.body.code).toBe('INSUFFICIENT_BALANCE');
+    expect(executions).toBe(1);
+
+    const status = await executionStatus(app, token, parsed.body.proposalId);
+    expect(status.status).toBe(200);
+    expect(status.body).toMatchObject({
+      success: true,
+      execution: 'NOT_EXECUTED',
+      proposalState: 'USED'
+    });
+  });
+
+  test('a consumed proposal whose order is not visible yet reports pending, not failure', async () => {
+    const { app, proposalStore } = makeApp({
+      intents: { 'buy 0.1 btc': modelIntent() }
+    });
+    const user = await createTestUser({ balance: 10000 });
+    const token = authToken(user);
+    const parsed = await parse(app, token, 'Buy 0.1 BTC');
+
+    // Another process consumed the proposal and is still committing the order.
+    const consumed = proposalStore.consume({
+      proposalId: parsed.body.proposalId,
+      userId: String(user._id)
+    });
+    expect(consumed.ok).toBe(true);
+
+    const during = await executionStatus(app, token, parsed.body.proposalId);
+    expect(during.status).toBe(202);
+    expect(during.body.code).toBe('EXECUTION_PENDING');
+
+    const retryDuring = await execute(app, token, parsed.body.proposalId);
+    expect(retryDuring.status).toBe(202);
+    expect(retryDuring.body.code).toBe('EXECUTION_PENDING');
+
+    clock += EXECUTION_SETTLE_WINDOW_MS;
+
+    const after = await executionStatus(app, token, parsed.body.proposalId);
+    expect(after.status).toBe(200);
+    expect(after.body).toMatchObject({
+      success: true,
+      execution: 'NOT_EXECUTED',
+      proposalState: 'USED'
+    });
+
+    const retryAfter = await execute(app, token, parsed.body.proposalId);
+    expect(retryAfter.status).toBe(409);
+    expect(retryAfter.body.code).toBe('PROPOSAL_ALREADY_USED');
+    expect(await Order.countDocuments({ userId: user._id })).toBe(0);
+  });
+
+  test('execution status is lookup-only and reports proposal state without executing', async () => {
+    const { app } = makeApp({ intents: { 'buy 0.1 btc': modelIntent() } });
+    const owner = await createTestUser({ balance: 10000 });
+    const stranger = await createTestUser({ balance: 10000 });
+    const ownerToken = authToken(owner);
+    const strangerToken = authToken(stranger);
+    const before = await snapshotUser(owner._id);
+
+    const parsed = await parse(app, ownerToken, 'Buy 0.1 BTC');
+    expect(parsed.status).toBe(200);
+
+    const ready = await executionStatus(app, ownerToken, parsed.body.proposalId);
+    expect(ready.status).toBe(200);
+    expect(ready.body).toEqual({
+      success: true,
+      execution: 'NOT_EXECUTED',
+      proposalState: 'READY'
+    });
+
+    const foreign = await executionStatus(app, strangerToken, parsed.body.proposalId);
+    expect(foreign.status).toBe(400);
+    expect(foreign.body.code).toBe('INVALID_PROPOSAL');
+
+    const unknown = await executionStatus(app, ownerToken, 'a'.repeat(48));
+    expect(unknown.status).toBe(404);
+    expect(unknown.body.code).toBe('PROPOSAL_NOT_FOUND');
+
+    // Repeated lookups consume nothing and mutate nothing.
+    expect(await snapshotUser(owner._id)).toEqual(before);
+    expect(await Order.countDocuments({ userId: owner._id })).toBe(0);
+
+    const revoked = await revoke(app, ownerToken, parsed.body.proposalId);
+    expect(revoked.status).toBe(200);
+    const afterRevoke = await executionStatus(app, ownerToken, parsed.body.proposalId);
+    expect(afterRevoke.status).toBe(200);
+    expect(afterRevoke.body).toMatchObject({
+      execution: 'NOT_EXECUTED',
+      proposalState: 'REVOKED'
+    });
+  });
+
+  test('execution status reports the committed order for a retry', async () => {
+    const { app } = makeApp({ intents: { 'buy 0.1 btc': modelIntent() } });
+    const user = await createTestUser({ balance: 10000 });
+    const token = authToken(user);
+    const parsed = await parse(app, token, 'Buy 0.1 BTC');
+
+    const executed = await execute(app, token, parsed.body.proposalId);
+    expect(executed.status).toBe(200);
+
+    const status = await executionStatus(app, token, parsed.body.proposalId);
+    expect(status.status).toBe(200);
+    expect(status.body).toMatchObject({
+      success: true,
+      execution: 'EXECUTED',
+      executedPrice: executed.body.executedPrice
+    });
+    expect(status.body.newTrade._id).toEqual(executed.body.newTrade._id);
+  });
+
+  test('resolving and discarding a proposal never calls the trade service', async () => {
+    const calls = [];
+    const fakeTradeService = {
+      async getExecutionResult() {
+        calls.push('getExecutionResult');
+        return null;
+      },
+      async executeMarketOrder() {
+        calls.push('executeMarketOrder');
+        throw new Error('Discard must never execute.');
+      },
+      async placeLimitOrder() {
+        calls.push('placeLimitOrder');
+        throw new Error('Discard must never execute.');
+      }
+    };
+
+    const { app } = makeApp({
+      intents: { 'buy 0.1 btc': modelIntent() },
+      tradeService: fakeTradeService
+    });
+    const user = await createTestUser({ balance: 10000 });
+    const token = authToken(user);
+    const before = await snapshotUser(user._id);
+    const parsed = await parse(app, token, 'Buy 0.1 BTC');
+
+    // This is the Resolve & discard sequence: lookup status, then revoke.
+    const status = await executionStatus(app, token, parsed.body.proposalId);
+    expect(status.body.execution).toBe('NOT_EXECUTED');
+
+    const revoked = await revoke(app, token, parsed.body.proposalId);
+    expect(revoked.status).toBe(200);
+
+    expect(calls).not.toContain('executeMarketOrder');
+    expect(calls).not.toContain('placeLimitOrder');
+    expect(await snapshotUser(user._id)).toEqual(before);
+    expect(await Order.countDocuments({ userId: user._id })).toBe(0);
+
+    const late = await execute(app, token, parsed.body.proposalId);
+    expect(late.status).toBe(409);
+    expect(late.body.code).toBe('PROPOSAL_REVOKED');
+    expect(calls).not.toContain('executeMarketOrder');
   });
 });

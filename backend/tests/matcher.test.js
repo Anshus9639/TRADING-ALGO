@@ -460,4 +460,117 @@ describe('claim-lease limit matcher', () => {
     expect((await Order.findById(laterOrder._id).lean()).status).toBe('FILLED');
     expect((await Order.findById(deferredOrder._id).lean()).status).toBe('OPEN');
   });
+
+  test('orders filled between cycles cannot shift the page and skip later orders', async () => {
+    const user = await createTestUser({ balance: 30000 });
+    const keys = [];
+    for (let index = 0; index < 4; index += 1) {
+      const key = `batch-${index}-${new mongoose.Types.ObjectId()}`;
+      keys.push(key);
+      const placed = await placeBuyLimit(user, {
+        clientOrderId: key,
+        quantity: 0.1,
+        limitPrice: 60000
+      });
+      expect(placed.status).toBe(200);
+    }
+
+    const worker = createMatcher({
+      feed,
+      tradeService: service,
+      now: () => now,
+      workerId: 'batch-worker',
+      batchSize: 2
+    });
+
+    // The first cycle removes its two orders from the eligible set. An
+    // offset-based page would then skip the two remaining orders.
+    const firstCycle = await worker.runCycle();
+    expect(firstCycle.examined).toBe(2);
+    expect(firstCycle.filled).toBe(2);
+
+    const secondCycle = await worker.runCycle();
+    expect(secondCycle.examined).toBe(2);
+    expect(secondCycle.filled).toBe(2);
+
+    const orders = await Order.find({ clientOrderId: { $in: keys } }).lean();
+    expect(orders).toHaveLength(4);
+    expect(orders.every(order => order.status === 'FILLED')).toBe(true);
+  });
+
+  test('new arrivals after a full batch are examined without waiting for wrap-around', async () => {
+    const user = await createTestUser({ balance: 10000 });
+    await placeBuyLimit(user, {
+      symbol: 'ETHUSDT',
+      quantity: 0.1,
+      limitPrice: 1000,
+      clientOrderId: `arrival-deferred-${new mongoose.Types.ObjectId()}`
+    });
+
+    const worker = createMatcher({
+      feed,
+      tradeService: service,
+      now: () => now,
+      workerId: 'arrival-worker',
+      batchSize: 1
+    });
+
+    const firstCycle = await worker.runCycle();
+    expect(firstCycle.examined).toBe(1);
+    expect(firstCycle.filled).toBe(0);
+
+    const newKey = `arrival-new-${new mongoose.Types.ObjectId()}`;
+    await placeBuyLimit(user, { clientOrderId: newKey, limitPrice: 60000 });
+
+    const secondCycle = await worker.runCycle();
+    expect(secondCycle.examined).toBe(1);
+    expect(secondCycle.filled).toBe(1);
+
+    const created = await Order.findOne({ clientOrderId: newKey }).lean();
+    expect(created.status).toBe('FILLED');
+  });
+
+  test('the continuation wraps around so deferred orders are revisited', async () => {
+    const user = await createTestUser({ balance: 10000 });
+    const deferredKey = `wrap-deferred-${new mongoose.Types.ObjectId()}`;
+    await placeBuyLimit(user, {
+      symbol: 'ETHUSDT',
+      quantity: 0.1,
+      limitPrice: 4000,
+      clientOrderId: deferredKey
+    });
+    await placeBuyLimit(user, {
+      clientOrderId: `wrap-fill-${new mongoose.Types.ObjectId()}`,
+      limitPrice: 60000
+    });
+
+    const worker = createMatcher({
+      feed,
+      tradeService: service,
+      now: () => now,
+      workerId: 'wrap-worker',
+      batchSize: 2
+    });
+
+    const firstCycle = await worker.runCycle();
+    expect(firstCycle.examined).toBe(2);
+    expect(firstCycle.filled).toBe(1);
+    expect(firstCycle.deferred).toBe(1);
+
+    // The sweep reached the end of the ordered set and resets.
+    const secondCycle = await worker.runCycle();
+    expect(secondCycle.examined).toBe(0);
+
+    const thirdCycle = await worker.runCycle();
+    expect(thirdCycle.examined).toBe(1);
+    expect(thirdCycle.filled).toBe(0);
+
+    feed.setQuote('ETHUSDT', 3500);
+    const fourthCycle = await worker.runCycle();
+    expect(fourthCycle.examined).toBe(1);
+    expect(fourthCycle.filled).toBe(1);
+
+    const deferred = await Order.findOne({ clientOrderId: deferredKey }).lean();
+    expect(deferred.status).toBe('FILLED');
+  });
 });

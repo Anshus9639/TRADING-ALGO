@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { api, authHeaders } from '../lib/api';
 import { createClientOrderId } from '../lib/orderId.mjs';
-import { createPendingSubmissionMap } from '../lib/pendingOrders.mjs';
+import { createPendingSubmissionMap, shouldRetirePendingKey } from '../lib/pendingOrders.mjs';
 
 const QuickOrder = ({ activeSymbol, currentPrice, token, onTradeComplete }) => {
   const [orderType, setOrderType] = useState('MARKET'); // 🚀 New: Tracks Market vs Limit
@@ -89,12 +89,12 @@ const QuickOrder = ({ activeSymbol, currentPrice, token, onTradeComplete }) => {
       }
       
     } catch (err) {
-      // A definite 4xx/5xx answer below 500 (other than 408) proves the server
-      // rejected the request, so its key can be retired. Network failures,
-      // timeouts and 5xx responses are uncertain and keep the key so a retry
-      // replays the same order instead of placing a duplicate.
+      // A definitive 4xx answer proves the server rejected the request, so its
+      // key can be retired. Network failures, timeouts, rate limits and 5xx
+      // responses are uncertain and keep the key so a retry replays the same
+      // order instead of placing a duplicate.
       const status = err.response?.status;
-      if (requestKey && status && status < 500 && status !== 408) {
+      if (requestKey && shouldRetirePendingKey(status)) {
         pendingSubmissions.current.delete(requestKey);
       }
       setHasUnresolved(pendingSubmissions.current.size() > 0);

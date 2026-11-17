@@ -11,6 +11,8 @@ import {
   confirmProposal,
   reconcileProposal,
   discardProposal,
+  lookupExecutionStatus,
+  resolveDiscard,
   canConfirm,
   canReconcile,
   blocksNewCommand,
@@ -41,7 +43,13 @@ function payload(overrides = {}) {
   };
 }
 
-function recorder({ parseResponse = payload(), executeResponse, executeRejection } = {}) {
+function recorder({
+  parseResponse = payload(),
+  executeResponse,
+  executeRejection,
+  statusResponse = { success: true, execution: 'NOT_EXECUTED' },
+  statusRejection
+} = {}) {
   const calls = [];
   return {
     calls,
@@ -50,7 +58,16 @@ function recorder({ parseResponse = payload(), executeResponse, executeRejection
       if (url === '/api/copilot/parse') return { data: parseResponse };
       if (url.endsWith('/revoke')) return { data: { success: true, revoked: true } };
       if (executeRejection) throw executeRejection;
-      return { data: executeResponse || { success: true, balance: 5000, executedPrice: 50000 } };
+      return {
+        data: executeResponse === undefined
+          ? { success: true, balance: 5000, executedPrice: 50000 }
+          : executeResponse
+      };
+    },
+    async get(url, config) {
+      calls.push({ url, config });
+      if (statusRejection) throw statusRejection;
+      return { data: statusResponse };
     }
   };
 }
@@ -370,6 +387,23 @@ test('a new command is blocked while an execution remains uncertain', () => {
   assert.match(source, /No trade was created/);
 });
 
+test('AICopilot resolve and discard never replays the execution', () => {
+  const source = fs.readFileSync(
+    path.join(here, '..', 'src', 'components', 'AICopilot.jsx'),
+    'utf8'
+  );
+  const discardSection = source.slice(
+    source.indexOf('const handleDiscard'),
+    source.indexOf('const preview = proposal')
+  );
+
+  assert.match(discardSection, /resolveDiscard\(\{ http: api, state: current, token \}\)/);
+  assert.doesNotMatch(discardSection, /reconcileProposal/);
+  assert.doesNotMatch(discardSection, /confirmProposal/);
+  assert.doesNotMatch(discardSection, /copilot\/execute/);
+  assert.doesNotMatch(discardSection, /api\.post/);
+});
+
 test('AICopilot keeps an unconfirmed proposal and routes confirmation through the controller', () => {
   const source = fs.readFileSync(
     path.join(here, '..', 'src', 'components', 'AICopilot.jsx'),
@@ -387,4 +421,246 @@ test('AICopilot keeps an unconfirmed proposal and routes confirmation through th
   assert.match(source, /result\.uncertain/);
   assert.match(source, /setProposal\(result\.state\)/);
   assert.doesNotMatch(source, /api\.post\('\/api\/copilot\/execute'/);
+});
+
+test('a malformed execute response cannot prove failure', async () => {
+  const malformedBodies = [{}, null, { success: 'no' }, { success: false }];
+
+  for (const executeResponse of malformedBodies) {
+    const http = recorder({ executeResponse });
+    const state = createProposalState(payload(), NOW);
+
+    const result = await confirmProposal({ http, state, token: 'token-1', now: NOW });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.uncertain, true);
+    assert.equal(result.definitive, false);
+    assert.equal(result.reason, 'EXECUTION_UNCONFIRMED');
+    assert.equal(result.state.status, PROPOSAL_STATUS.READY);
+    assert.equal(result.state.proposalId, state.proposalId);
+    assert.equal(result.state.uncertain, true);
+    assert.equal(canConfirm(result.state, NOW), true);
+    assert.equal(canReconcile(result.state), true);
+    assert.equal(http.calls.length, 1);
+    assert.deepEqual(http.calls[0].body, { proposalId: state.proposalId });
+  }
+});
+
+test('an explicit failure without a backend outcome code stays unconfirmed', async () => {
+  const http = recorder({ executeResponse: { success: false, message: 'No result.' } });
+  const state = createProposalState(payload(), NOW);
+
+  const result = await confirmProposal({ http, state, token: 'token-1', now: NOW });
+
+  assert.equal(result.uncertain, true);
+  assert.equal(result.definitive, false);
+  assert.equal(result.state.status, PROPOSAL_STATUS.READY);
+  assert.equal(canConfirm(result.state, NOW), true);
+});
+
+test('an explicit failure with a backend outcome code is definitive', async () => {
+  const http = recorder({
+    executeResponse: { success: false, code: 'INSUFFICIENT_BALANCE', message: 'No funds.' }
+  });
+  const state = createProposalState(payload(), NOW);
+
+  const result = await confirmProposal({ http, state, token: 'token-1', now: NOW });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.definitive, true);
+  assert.equal(result.reason, 'INSUFFICIENT_BALANCE');
+  assert.equal(result.state.status, PROPOSAL_STATUS.ERROR);
+  assert.equal(canConfirm(result.state, NOW), false);
+  assert.equal(canReconcile(result.state), false);
+});
+
+test('auth and rate-limit rejections during recovery keep the execution unresolved', async () => {
+  for (const status of [401, 429]) {
+    const failure = Object.assign(new Error('Request failed'), {
+      response: {
+        status,
+        data: {
+          success: false,
+          code: status === 401 ? 'UNAUTHORIZED' : 'RATE_LIMITED',
+          message: 'Rejected.'
+        }
+      }
+    });
+    const http = recorder({ executeRejection: failure });
+    const state = { ...createProposalState(payload(), NOW), uncertain: true };
+
+    const result = await reconcileProposal({ http, state, token: 'token-1', now: NOW + 1000 });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.uncertain, true);
+    assert.equal(result.definitive, false);
+    assert.equal(result.reason, 'EXECUTION_UNCONFIRMED');
+    assert.equal(result.state.status, PROPOSAL_STATUS.READY);
+    assert.equal(result.state.proposalId, state.proposalId);
+    assert.equal(result.state.uncertain, true);
+    assert.equal(canReconcile(result.state), true);
+    assert.equal(http.calls.length, 1);
+    assert.deepEqual(http.calls[0].body, { proposalId: state.proposalId });
+  }
+});
+
+test('a first attempt rejected with auth or rate limiting remains definitive', async () => {
+  for (const status of [401, 429]) {
+    const failure = Object.assign(new Error('Request failed'), {
+      response: { status, data: { success: false, code: 'REJECTED', message: 'Rejected.' } }
+    });
+    const http = recorder({ executeRejection: failure });
+    const state = createProposalState(payload(), NOW);
+
+    const result = await confirmProposal({ http, state, token: 'token-1', now: NOW });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.uncertain, undefined);
+    assert.equal(result.definitive, true);
+    assert.equal(result.state.status, PROPOSAL_STATUS.ERROR);
+    assert.equal(isUncertainFailure(failure), false);
+  }
+});
+
+test('an execution-pending answer keeps the proposal confirmable', async () => {
+  const http = recorder({
+    executeResponse: {
+      success: false,
+      execution: 'PENDING',
+      code: 'EXECUTION_PENDING',
+      message: 'Execution is still settling.'
+    }
+  });
+  const state = createProposalState(payload(), NOW);
+
+  const result = await confirmProposal({ http, state, token: 'token-1', now: NOW });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.uncertain, true);
+  assert.equal(result.definitive, false);
+  assert.equal(result.state.status, PROPOSAL_STATUS.READY);
+  assert.equal(result.state.uncertain, true);
+  assert.equal(canConfirm(result.state, NOW), true);
+  assert.equal(canReconcile(result.state), true);
+});
+
+test('execution status lookup is read-only and reports the three outcomes', async () => {
+  const state = { ...createProposalState(payload(), NOW), uncertain: true };
+  const http = recorder();
+
+  const notExecuted = await lookupExecutionStatus({ http, state, token: 'token-1' });
+  assert.equal(notExecuted.ok, true);
+  assert.equal(notExecuted.execution, 'NOT_EXECUTED');
+  assert.equal(http.calls.length, 1);
+  assert.equal(http.calls[0].url, `/api/copilot/proposals/${'a'.repeat(48)}/status`);
+  assert.equal(http.calls[0].config.headers['x-auth-token'], 'token-1');
+  assert.equal(http.calls.some(call => call.url === '/api/copilot/execute'), false);
+
+  const executedHttp = recorder({
+    statusResponse: { success: true, execution: 'EXECUTED', executedPrice: 50000, balance: 5000 }
+  });
+  const executed = await lookupExecutionStatus({ http: executedHttp, state, token: 'token-1' });
+  assert.equal(executed.ok, true);
+  assert.equal(executed.execution, 'EXECUTED');
+  assert.equal(executed.result.executedPrice, 50000);
+
+  const pendingHttp = recorder({
+    statusResponse: { success: false, execution: 'PENDING', code: 'EXECUTION_PENDING' }
+  });
+  const pending = await lookupExecutionStatus({ http: pendingHttp, state, token: 'token-1' });
+  assert.equal(pending.ok, false);
+  assert.equal(pending.execution, 'PENDING');
+
+  const missingHttp = recorder({
+    statusRejection: Object.assign(new Error('Not found'), {
+      response: { status: 404, data: { success: false, code: 'PROPOSAL_NOT_FOUND' } }
+    })
+  });
+  const missing = await lookupExecutionStatus({ http: missingHttp, state, token: 'token-1' });
+  assert.equal(missing.ok, true);
+  assert.equal(missing.execution, 'NOT_EXECUTED');
+});
+
+test('resolve and discard looks up the outcome and revokes without ever executing', async () => {
+  const state = { ...createProposalState(payload(), NOW), uncertain: true };
+  const http = recorder();
+
+  const result = await resolveDiscard({ http, state, token: 'token-1' });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.resolved, true);
+  assert.equal(result.executed, undefined);
+  assert.equal(result.state, null);
+  assert.equal(http.calls.length, 2);
+  assert.equal(http.calls[0].url.endsWith('/status'), true);
+  assert.equal(http.calls[1].url.endsWith('/revoke'), true);
+  assert.deepEqual(http.calls[1].body, {});
+  assert.equal(http.calls.some(call => call.url === '/api/copilot/execute'), false);
+});
+
+test('resolve and discard reports an execution that committed before the lookup', async () => {
+  const state = { ...createProposalState(payload(), NOW), uncertain: true };
+  const http = recorder({
+    statusResponse: { success: true, execution: 'EXECUTED', executedPrice: 50000, balance: 5000 }
+  });
+
+  const result = await resolveDiscard({ http, state, token: 'token-1' });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.executed, true);
+  assert.equal(result.result.executedPrice, 50000);
+  assert.equal(http.calls.length, 1);
+  assert.equal(http.calls[0].url.endsWith('/status'), true);
+  assert.equal(http.calls.some(call => call.url.endsWith('/revoke')), false);
+  assert.equal(http.calls.some(call => call.url === '/api/copilot/execute'), false);
+});
+
+test('resolve and discard stays blocked while the outcome is unknown', async () => {
+  const state = { ...createProposalState(payload(), NOW), uncertain: true };
+  const pendingHttp = recorder({
+    statusResponse: { success: false, execution: 'PENDING', code: 'EXECUTION_PENDING' }
+  });
+
+  const pending = await resolveDiscard({ http: pendingHttp, state, token: 'token-1' });
+
+  assert.equal(pending.ok, false);
+  assert.equal(pending.blocked, true);
+  assert.equal(pending.uncertain, true);
+  assert.equal(pending.reason, 'OUTCOME_UNKNOWN');
+  assert.equal(pending.state.proposalId, state.proposalId);
+  assert.equal(pending.state.uncertain, true);
+  assert.equal(pendingHttp.calls.some(call => call.url.endsWith('/revoke')), false);
+  assert.equal(pendingHttp.calls.some(call => call.url === '/api/copilot/execute'), false);
+
+  const calls = [];
+  const offlineHttp = {
+    async get() {
+      calls.push('get');
+      throw Object.assign(new Error('Network Error'), { code: 'ERR_NETWORK' });
+    },
+    async post() {
+      calls.push('post');
+      throw new Error('Must not revoke while the outcome is unknown.');
+    }
+  };
+  const offline = await resolveDiscard({ http: offlineHttp, state, token: 'token-1' });
+
+  assert.equal(offline.ok, false);
+  assert.equal(offline.blocked, true);
+  assert.equal(offline.uncertain, true);
+  assert.deepEqual(calls, ['get']);
+});
+
+test('resolve and discard only revokes a proposal that never executed', async () => {
+  const state = createProposalState(payload(), NOW);
+  const http = recorder();
+
+  const result = await resolveDiscard({ http, state, token: 'token-1' });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.state, null);
+  assert.equal(http.calls.length, 1);
+  assert.equal(http.calls[0].url.endsWith('/revoke'), true);
+  assert.equal(http.calls.some(call => call.url === '/api/copilot/execute'), false);
+  assert.equal(http.calls.some(call => call.url.endsWith('/status')), false);
 });

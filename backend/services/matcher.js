@@ -40,9 +40,11 @@ function createMatcher({
   }
 
   let running = false;
-  // Rotating offset so cycles that repeatedly defer the oldest orders still
-  // reach later eligible orders. It resets at the end of the collection.
-  let cursor = 0;
+  // Continuation key of the last examined candidate. It advances through the
+  // stable (createdAt, _id) order so removals between cycles cannot shift the
+  // page and skip orders, and it resets at the end of the collection so
+  // deferred orders at the front are revisited.
+  let cursor = null;
 
   async function claim(orderId) {
     const timestamp = now();
@@ -151,17 +153,30 @@ function createMatcher({
       );
       stats.recovered = recovery.modifiedCount || 0;
 
-      const candidates = await OrderModel.find({ status: 'OPEN', orderType: 'LIMIT' })
+      const select = { status: 'OPEN', orderType: 'LIMIT' };
+      if (cursor) {
+        select.$or = [
+          { createdAt: { $gt: cursor.createdAt } },
+          { createdAt: cursor.createdAt, _id: { $gt: cursor.id } }
+        ];
+      }
+
+      const candidates = await OrderModel.find(select)
         .sort({ createdAt: 1, _id: 1 })
-        .skip(cursor)
         .limit(batchSize)
         .lean();
 
       // A short batch means the sweep reached the end of the eligible set, so
-      // the next cycle starts over. A full batch advances the offset, ensuring
-      // deferred orders at the front cannot starve later ones forever.
-      if (candidates.length < batchSize) cursor = 0;
-      else cursor += candidates.length;
+      // the next cycle starts over. A full batch advances the continuation
+      // key, ensuring deferred orders at the front cannot starve later ones.
+      if (candidates.length < batchSize) {
+        cursor = null;
+      } else {
+        const last = candidates[candidates.length - 1];
+        cursor = last && last.createdAt
+          ? { createdAt: last.createdAt, id: last._id }
+          : null;
+      }
 
       stats.examined = candidates.length;
 

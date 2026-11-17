@@ -109,6 +109,85 @@ export function createConfirmLock() {
   return { active: false };
 }
 
+// Lookup-only execution status. The endpoint never executes or revokes the
+// proposal, so it is safe to call while resolving an unknown outcome.
+export async function lookupExecutionStatus({ http, state, token }) {
+  if (!state || typeof state.proposalId !== 'string' || state.proposalId === '') {
+    return { ok: true, execution: 'NOT_EXECUTED' };
+  }
+
+  try {
+    const response = await http.get(
+      `/api/copilot/proposals/${encodeURIComponent(state.proposalId)}/status`,
+      buildAuthHeaders(token)
+    );
+    const data = response?.data || {};
+
+    if (data.execution === 'EXECUTED' && data.success === true) {
+      return { ok: true, execution: 'EXECUTED', result: data };
+    }
+    if (data.execution === 'NOT_EXECUTED') {
+      return { ok: true, execution: 'NOT_EXECUTED' };
+    }
+    return { ok: false, execution: 'PENDING', state };
+  } catch (error) {
+    const data = error?.response?.data || {};
+    if (data.code === 'PROPOSAL_NOT_FOUND' || data.code === 'INVALID_PROPOSAL') {
+      // The endpoint checks the canonical order before answering, so no
+      // execution with this proposal id exists.
+      return { ok: true, execution: 'NOT_EXECUTED' };
+    }
+    return {
+      ok: false,
+      execution: 'UNKNOWN',
+      error: data.message || error?.message || 'Could not verify the execution outcome.',
+      state
+    };
+  }
+}
+
+// Resolving an unconfirmed proposal may only look up its outcome and, when no
+// trade exists, revoke it. It never posts to the execution endpoint; replaying
+// the id is reserved for an explicit Confirm/Retry action.
+export async function resolveDiscard({ http, state, token }) {
+  if (!state) return { ok: true, state: null, resolved: true };
+
+  if (!canReconcile(state)) {
+    const discarded = await discardProposal({ http, state, token });
+    return { ...discarded, executionKnown: true, resolved: true };
+  }
+
+  const status = await lookupExecutionStatus({ http, state, token });
+
+  if (status.execution === 'EXECUTED') {
+    return {
+      ok: true,
+      executed: true,
+      result: status.result,
+      state: { ...state, status: PROPOSAL_STATUS.EXECUTED, uncertain: false, error: null }
+    };
+  }
+
+  if (status.execution !== 'NOT_EXECUTED') {
+    return {
+      ok: false,
+      blocked: true,
+      uncertain: true,
+      reason: 'OUTCOME_UNKNOWN',
+      state: {
+        ...state,
+        status: PROPOSAL_STATUS.READY,
+        uncertain: true,
+        error: status.error
+          || 'Execution outcome is unknown. Discard is blocked until it can be resolved.'
+      }
+    };
+  }
+
+  const discarded = await discardProposal({ http, state, token });
+  return { ...discarded, executionKnown: true, resolved: true };
+}
+
 // A response-less failure, a timeout, or a 5xx means the server may have
 // executed the proposal even though the client never saw the result. Those
 // outcomes must keep the proposal and its id so a retry replays the same
@@ -151,26 +230,48 @@ export async function confirmProposal({
       { proposalId: state.proposalId },
       buildAuthHeaders(token)
     );
-    const data = response.data || {};
-    if (!data.success) {
-      const error = new Error(data.message || 'Execution failed.');
-      error.code = data.code;
-      // The server answered, so this is a definitive rejection.
-      error.definite = true;
-      throw error;
+    const data = response && typeof response.data === 'object' ? response.data : null;
+
+    if (data && data.success === true) {
+      return {
+        ok: true,
+        state: { ...state, status: PROPOSAL_STATUS.EXECUTED, uncertain: false, error: null },
+        result: data
+      };
     }
 
-    return {
-      ok: true,
-      state: { ...state, status: PROPOSAL_STATUS.EXECUTED, uncertain: false, error: null },
-      result: data
-    };
+    // Another identical request is still settling server-side. The outcome is
+    // not known yet, so the proposal keeps its id and stays confirmable.
+    if (data && (data.execution === 'PENDING' || data.code === 'EXECUTION_PENDING')) {
+      const pendingError = new Error(data.message || 'Execution is still settling.');
+      pendingError.pending = true;
+      throw pendingError;
+    }
+
+    // A response without an explicit success flag (for example a proxy's
+    // `{}` body) proves nothing about the execution. An explicit failure is
+    // only definitive when the backend supplies the rejection code that
+    // establishes the outcome.
+    const error = new Error(data && data.message ? data.message : 'Execution response could not be verified.');
+    if (data && data.success === false && typeof data.code === 'string' && data.code !== '') {
+      error.code = data.code;
+      error.definite = true;
+    }
+    throw error;
   } catch (error) {
-    const data = error?.response?.data || {};
+    const data = error?.response?.data && typeof error.response.data === 'object'
+      ? error.response.data
+      : {};
     const code = data.code || error?.code || 'TRADE_FAILED';
     const message = data.message || error?.message || 'Execution failed.';
 
-    if (isUncertainFailure(error)) {
+    // While an execution is already unconfirmed, an authentication or rate
+    // limit rejection says nothing about the trade; the proposal must stay
+    // resolvable instead of being discarded as a definitive failure.
+    const status = error?.response?.status;
+    const recoveryRejected = state.uncertain === true && (status === 401 || status === 429);
+
+    if (error.pending || recoveryRejected || isUncertainFailure(error)) {
       return {
         ok: false,
         uncertain: true,
@@ -187,7 +288,7 @@ export async function confirmProposal({
       };
     }
 
-    const status = code === 'PRICE_CHANGED'
+    const finalStatus = code === 'PRICE_CHANGED'
       ? PROPOSAL_STATUS.PRICE_CHANGED
       : code === 'PROPOSAL_EXPIRED'
         ? PROPOSAL_STATUS.EXPIRED
@@ -197,7 +298,7 @@ export async function confirmProposal({
       ok: false,
       reason: code,
       definitive: true,
-      state: { ...state, status, uncertain: false, error: message }
+      state: { ...state, status: finalStatus, uncertain: false, error: message }
     };
   } finally {
     if (lock) lock.active = false;

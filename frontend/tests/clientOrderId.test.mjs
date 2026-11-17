@@ -37,7 +37,8 @@ test('QuickOrder sends a clientOrderId and reuses it after network failures', ()
   assert.match(source, /pendingSubmissions\.current\.get\(requestKey\)/);
   assert.match(source, /pendingSubmissions\.current\.set\(requestKey, payload\.clientOrderId\)/);
   // Keys are only retired once the server definitively refused the order.
-  assert.match(source, /status < 500 && status !== 408/);
+  assert.match(source, /shouldRetirePendingKey\(status\)/);
+  assert.doesNotMatch(source, /status < 500/);
   assert.doesNotMatch(source, /if \(err\.response\) pendingSubmission\.current = null/);
   // A new submission cannot overwrite another unresolved submission's id.
   assert.doesNotMatch(source, /pendingSubmissions\.current = new Map\(\)/);
@@ -53,7 +54,7 @@ test('AICopilot discard goes through the server-side revocation controller', () 
     'utf8'
   );
 
-  assert.match(component, /discardProposal\(\{ http: api, state: current, token \}\)/);
+  assert.match(component, /resolveDiscard\(\{ http: api, state: current, token \}\)/);
   assert.match(controller, /\/api\/copilot\/proposals\/\$\{encodeURIComponent\(state\.proposalId\)\}\/revoke/);
   const discardSection = controller.slice(
     controller.indexOf('export async function discardProposal'),

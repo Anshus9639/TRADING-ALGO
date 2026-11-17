@@ -6,7 +6,7 @@ import {
   requestProposal,
   confirmProposal,
   reconcileProposal,
-  discardProposal,
+  resolveDiscard,
   canConfirm,
   canReconcile,
   blocksNewCommand,
@@ -171,47 +171,27 @@ const AICopilot = ({ token, watchlist, onTradeComplete }) => {
 
     setLoading(true);
 
-    if (canReconcile(current)) {
-      // Resolve the unknown outcome first. A committed execution must be
-      // reported instead of being discarded locally as if nothing happened.
-      const resolved = await reconcileProposal({
-        http: api,
-        state: current,
-        token,
-        now: Date.now(),
-        lock: confirmLock.current
-      });
+    // Resolve & discard only looks up the outcome and revokes the proposal. It
+    // never replays the execution: retrying the same id stays on the explicit
+    // Retry/Reconcile path handled by handleConfirm.
+    const result = await resolveDiscard({ http: api, state: current, token });
 
-      if (resolved.ok) {
-        reportExecutionSuccess(current, resolved);
-      } else if (resolved.uncertain) {
-        setProposal(resolved.state);
-        setLog({
-          text: 'Execution still unconfirmed. Discard is blocked until it can be reconciled.',
-          status: 'error'
-        });
-      } else if (resolved.definitive) {
-        setProposal(null);
-        setLog({
-          text: resolved.reason === 'EXPIRED' || resolved.reason === 'PROPOSAL_EXPIRED'
-            ? 'No execution was found for the expired proposal; no trade was created.'
-            : `Proposal closed without an execution (${resolved.reason}).`,
-          status: 'success'
-        });
-      } else {
-        setLog({ text: 'Could not resolve the proposal yet. Please retry.', status: 'error' });
-      }
-
-      setLoading(false);
-      return;
-    }
-
-    // Revoke server-side first so the proposal can never be executed later.
-    const result = await discardProposal({ http: api, state: current, token });
-
-    if (result.ok) {
+    if (result.executed) {
+      reportExecutionSuccess(current, { result: result.result });
+    } else if (result.ok) {
       setProposal(null);
-      setLog({ text: 'Proposal discarded. No trade was sent.', status: 'success' });
+      setLog({
+        text: result.executionKnown
+          ? 'No trade was created; the proposal was discarded.'
+          : 'Proposal discarded. No trade was sent.',
+        status: 'success'
+      });
+    } else if (result.uncertain) {
+      setProposal(result.state);
+      setLog({
+        text: 'Execution outcome is unknown. Discard is blocked until the outcome can be resolved; retry the same proposal.',
+        status: 'error'
+      });
     } else {
       setLog({ text: `Discard failed: ${result.state?.error || 'Please retry.'}`, status: 'error' });
     }

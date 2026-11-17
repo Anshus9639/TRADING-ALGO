@@ -1,7 +1,14 @@
 import { isClientOrderId } from './orderId.mjs';
 
 const STORAGE_PREFIX = 'nexustrade:pending-orders:';
-const STORAGE_VERSION = 1;
+// Each pending submission is its own storage key. A whole-map snapshot would
+// let a second tab overwrite entries it never saw and let a stale instance
+// write a deleted entry back, so updates are per key and deletes leave a
+// tombstone that suppresses old-format snapshots.
+const STORAGE_VERSION = 2;
+const LEGACY_STORAGE_VERSION = 1;
+const ENTRY_MARKER = ':entry:';
+const TOMBSTONE_MARKER = ':deleted:';
 const MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const MAX_REQUEST_KEY_LENGTH = 500;
 const CLOCK_SKEW_MS = 60 * 1000;
@@ -12,6 +19,18 @@ function defaultStorage() {
   } catch {
     return null;
   }
+}
+
+// Only a definitive rejection proves the server did not create the order.
+// Network failures, timeouts (408), rate limits (429) and 5xx answers all
+// leave the outcome unknown, so the idempotency key must survive for a retry.
+export function shouldRetirePendingKey(status) {
+  return typeof status === 'number'
+    && Number.isFinite(status)
+    && status >= 400
+    && status < 500
+    && status !== 408
+    && status !== 429;
 }
 
 function decodeBase64Url(segment) {
@@ -46,6 +65,68 @@ export function readTokenScope(token) {
   }
 }
 
+function isAcceptableRequestKey(value) {
+  return typeof value === 'string'
+    && value.length > 0
+    && value.length <= MAX_REQUEST_KEY_LENGTH;
+}
+
+function isFresh(savedAt, timestamp, maxAgeMs) {
+  return savedAt <= timestamp + CLOCK_SKEW_MS && timestamp - savedAt <= maxAgeMs;
+}
+
+function readStoredRecord(raw) {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || parsed.version !== STORAGE_VERSION) return null;
+    if (!isClientOrderId(parsed.clientOrderId)) return null;
+    const savedAt = Number(parsed.savedAt);
+    if (!Number.isFinite(savedAt)) return null;
+    return { clientOrderId: parsed.clientOrderId, savedAt };
+  } catch {
+    return null;
+  }
+}
+
+function readStoredTombstone(raw) {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || parsed.version !== STORAGE_VERSION) return null;
+    const deletedAt = Number(parsed.deletedAt);
+    return Number.isFinite(deletedAt) ? deletedAt : null;
+  } catch {
+    return null;
+  }
+}
+
+// Full-map snapshots are only read for compatibility with entries written by
+// older frontend bundles; this module never writes one again.
+function readLegacyEntries(raw) {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || parsed.version !== LEGACY_STORAGE_VERSION) return null;
+    if (!parsed.entries || typeof parsed.entries !== 'object') return null;
+    return parsed.entries;
+  } catch {
+    return null;
+  }
+}
+
+function listStorageKeys(storage, base) {
+  if (!storage || typeof storage.length !== 'number' || typeof storage.key !== 'function') {
+    return null;
+  }
+  const keys = [];
+  for (let index = 0; index < storage.length; index += 1) {
+    const key = storage.key(index);
+    if (typeof key === 'string' && key.startsWith(base)) keys.push(key);
+  }
+  return keys;
+}
+
 // Unresolved idempotency keys survive a page refresh. Entries are scoped to the
 // authenticated user, expire after a day, and hold only the request key and the
 // generated client order id - never a token or account credential.
@@ -57,50 +138,92 @@ export function createPendingSubmissionMap({
 } = {}) {
   const scope = readTokenScope(token);
   const storageKey = scope ? `${STORAGE_PREFIX}${scope}` : null;
+  const entryPrefix = storageKey ? `${storageKey}${ENTRY_MARKER}` : null;
+  const tombstonePrefix = storageKey ? `${storageKey}${TOMBSTONE_MARKER}` : null;
   const entries = new Map();
+  const tombstones = new Map();
 
-  if (storageKey && storage) {
+  function entryKey(requestKey) {
+    return `${entryPrefix}${requestKey}`;
+  }
+
+  function tombstoneKey(requestKey) {
+    return `${tombstonePrefix}${requestKey}`;
+  }
+
+  function persistEntry(requestKey, record) {
+    if (!storageKey || !storage) return;
     try {
-      const raw = storage.getItem(storageKey);
-      const parsed = raw ? JSON.parse(raw) : null;
-      const records = parsed
-        && parsed.version === STORAGE_VERSION
-        && parsed.entries
-        && typeof parsed.entries === 'object'
-        ? parsed.entries
-        : {};
-      const timestamp = now();
-
-      for (const [requestKey, record] of Object.entries(records)) {
-        if (typeof requestKey !== 'string'
-          || requestKey.length === 0
-          || requestKey.length > MAX_REQUEST_KEY_LENGTH) continue;
-        if (!record || !isClientOrderId(record.clientOrderId)) continue;
-        const savedAt = Number(record.savedAt);
-        if (!Number.isFinite(savedAt)) continue;
-        // Future timestamps beyond normal clock skew and stale entries are
-        // discarded rather than trusted indefinitely.
-        if (savedAt > timestamp + CLOCK_SKEW_MS || timestamp - savedAt > maxAgeMs) continue;
-        entries.set(requestKey, { clientOrderId: record.clientOrderId, savedAt });
-      }
+      storage.setItem(entryKey(requestKey), JSON.stringify({
+        version: STORAGE_VERSION,
+        clientOrderId: record.clientOrderId,
+        savedAt: record.savedAt
+      }));
     } catch {
-      // Corrupt or unavailable storage must not block trading.
+      // Quota or privacy-mode failures leave the in-memory map authoritative.
     }
   }
 
-  function flush() {
-    if (!storageKey || !storage) return;
-    const records = {};
-    for (const [requestKey, record] of entries) {
-      records[requestKey] = {
-        clientOrderId: record.clientOrderId,
-        savedAt: record.savedAt
-      };
-    }
+  if (storageKey && storage) {
     try {
-      storage.setItem(storageKey, JSON.stringify({ version: STORAGE_VERSION, entries: records }));
+      const timestamp = now();
+      const keys = listStorageKeys(storage, storageKey);
+
+      if (keys) {
+        for (const key of keys) {
+          if (!key.startsWith(tombstonePrefix)) continue;
+          const requestKey = key.slice(tombstonePrefix.length);
+          if (!isAcceptableRequestKey(requestKey)) continue;
+          const deletedAt = readStoredTombstone(storage.getItem(key));
+          if (deletedAt === null || deletedAt > timestamp + CLOCK_SKEW_MS) continue;
+          tombstones.set(requestKey, deletedAt);
+        }
+
+        for (const key of keys) {
+          if (!key.startsWith(entryPrefix)) continue;
+          const requestKey = key.slice(entryPrefix.length);
+          if (!isAcceptableRequestKey(requestKey)) continue;
+          const record = readStoredRecord(storage.getItem(key));
+          // Future timestamps beyond normal clock skew and stale entries are
+          // discarded rather than trusted indefinitely.
+          if (!record || !isFresh(record.savedAt, timestamp, maxAgeMs)) {
+            try { storage.removeItem(key); } catch { /* ignore */ }
+            continue;
+          }
+          entries.set(requestKey, record);
+        }
+      }
+
+      const legacy = readLegacyEntries(storage.getItem(storageKey));
+      if (legacy) {
+        for (const [requestKey, record] of Object.entries(legacy)) {
+          if (!isAcceptableRequestKey(requestKey) || !record) continue;
+          if (!isClientOrderId(record.clientOrderId)) continue;
+          const savedAt = Number(record.savedAt);
+          if (!Number.isFinite(savedAt) || !isFresh(savedAt, timestamp, maxAgeMs)) continue;
+          if (entries.has(requestKey)) continue;
+          const imported = { clientOrderId: record.clientOrderId, savedAt };
+          entries.set(requestKey, imported);
+          persistEntry(requestKey, imported);
+        }
+      }
+
+      for (const [requestKey, record] of entries) {
+        const deletedAt = tombstones.get(requestKey);
+        if (deletedAt !== undefined && deletedAt >= record.savedAt) {
+          entries.delete(requestKey);
+          try { storage.removeItem(entryKey(requestKey)); } catch { /* ignore */ }
+        }
+      }
+
+      for (const [requestKey, deletedAt] of tombstones) {
+        if (timestamp - deletedAt > maxAgeMs) {
+          tombstones.delete(requestKey);
+          try { storage.removeItem(tombstoneKey(requestKey)); } catch { /* ignore */ }
+        }
+      }
     } catch {
-      // Quota or privacy-mode failures leave the in-memory map authoritative.
+      // Corrupt or unavailable storage must not block trading.
     }
   }
 
@@ -113,22 +236,39 @@ export function createPendingSubmissionMap({
       return entries.get(requestKey)?.clientOrderId;
     },
     set(requestKey, clientOrderId) {
-      if (typeof requestKey !== 'string' || requestKey.length === 0 || requestKey.length > MAX_REQUEST_KEY_LENGTH) {
+      if (!isAcceptableRequestKey(requestKey)) {
         throw new Error('Invalid pending submission key.');
       }
       if (!isClientOrderId(clientOrderId)) {
         throw new Error('Invalid client order id.');
       }
       const existing = entries.get(requestKey);
-      entries.set(requestKey, {
+      const record = {
         clientOrderId,
         savedAt: existing && existing.clientOrderId === clientOrderId ? existing.savedAt : now()
-      });
-      flush();
+      };
+      entries.set(requestKey, record);
+      persistEntry(requestKey, record);
+
+      // A new submission supersedes an earlier deletion of the same request.
+      if (tombstones.delete(requestKey)) {
+        try { storage?.removeItem(tombstoneKey(requestKey)); } catch { /* ignore */ }
+      }
     },
     delete(requestKey) {
       const removed = entries.delete(requestKey);
-      if (removed) flush();
+      if (!removed) return removed;
+      if (storageKey && storage) {
+        try { storage.removeItem(entryKey(requestKey)); } catch { /* ignore */ }
+        try {
+          storage.setItem(tombstoneKey(requestKey), JSON.stringify({
+            version: STORAGE_VERSION,
+            deletedAt: now()
+          }));
+        } catch {
+          // Without a tombstone the entry key removal still prevents reuse.
+        }
+      }
       return removed;
     }
   };

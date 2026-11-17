@@ -121,4 +121,52 @@ describe('AI proposal store', () => {
 
     expect(store.size()).toBe(1);
   });
+
+  test('inspect reports state without consuming, revoking or deleting', () => {
+    const clock = { now: 1_700_000_000_000 };
+    const store = makeStore(clock);
+    const proposal = store.create({ userId: 'user-a', intent: INTENT, preview: PREVIEW });
+
+    const ready = store.inspect({ proposalId: proposal.id, userId: 'user-a' });
+    expect(ready).toMatchObject({
+      ok: true,
+      state: 'READY',
+      proposal: { id: proposal.id, consumedAt: null, revokedAt: null }
+    });
+    expect(store.size()).toBe(1);
+
+    // Looking up a ready proposal must not make it unusable afterwards.
+    expect(store.consume({ proposalId: proposal.id, userId: 'user-a' }).ok).toBe(true);
+    expect(store.inspect({ proposalId: proposal.id, userId: 'user-a' }).state).toBe('USED');
+  });
+
+  test('inspect reports revoked and expired proposals without mutating them', () => {
+    const clock = { now: 1_700_000_000_000 };
+    const store = makeStore(clock);
+    const revokedProposal = store.create({ userId: 'user-a', intent: INTENT, preview: PREVIEW });
+    const expiringProposal = store.create({ userId: 'user-a', intent: INTENT, preview: PREVIEW });
+
+    expect(store.revoke({ proposalId: revokedProposal.id, userId: 'user-a' }).ok).toBe(true);
+    expect(store.inspect({ proposalId: revokedProposal.id, userId: 'user-a' }).state).toBe('REVOKED');
+
+    clock.now += 120000;
+    const expired = store.inspect({ proposalId: expiringProposal.id, userId: 'user-a' });
+    expect(expired.ok).toBe(true);
+    expect(expired.state).toBe('EXPIRED');
+    // Read-only: the expired record is still present until a later sweep.
+    expect(store.size()).toBe(2);
+  });
+
+  test('inspect is owner-only and rejects malformed or unknown ids', () => {
+    const clock = { now: 1_700_000_000_000 };
+    const store = makeStore(clock);
+    const proposal = store.create({ userId: 'user-a', intent: INTENT, preview: PREVIEW });
+
+    expect(store.inspect({ proposalId: proposal.id, userId: 'user-b' }).code)
+      .toBe('INVALID_PROPOSAL');
+    expect(store.inspect({ proposalId: 'not-a-real-id', userId: 'user-a' }).code)
+      .toBe('INVALID_PROPOSAL');
+    expect(store.inspect({ proposalId: 'a'.repeat(48), userId: 'user-a' }).code)
+      .toBe('PROPOSAL_NOT_FOUND');
+  });
 });
