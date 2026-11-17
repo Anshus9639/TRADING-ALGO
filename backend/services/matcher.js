@@ -40,6 +40,9 @@ function createMatcher({
   }
 
   let running = false;
+  // Rotating offset so cycles that repeatedly defer the oldest orders still
+  // reach later eligible orders. It resets at the end of the collection.
+  let cursor = 0;
 
   async function claim(orderId) {
     const timestamp = now();
@@ -150,8 +153,15 @@ function createMatcher({
 
       const candidates = await OrderModel.find({ status: 'OPEN', orderType: 'LIMIT' })
         .sort({ createdAt: 1, _id: 1 })
+        .skip(cursor)
         .limit(batchSize)
         .lean();
+
+      // A short batch means the sweep reached the end of the eligible set, so
+      // the next cycle starts over. A full batch advances the offset, ensuring
+      // deferred orders at the front cannot starve later ones forever.
+      if (candidates.length < batchSize) cursor = 0;
+      else cursor += candidates.length;
 
       stats.examined = candidates.length;
 

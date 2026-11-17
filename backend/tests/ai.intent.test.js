@@ -188,6 +188,26 @@ describe('AI intent resolution against server data', () => {
     expect(resolved.value.preview.warnings.join(' ')).toMatch(/1:1 with USDT/);
   });
 
+  test('a notional-sized quantity is rounded down so it never exceeds the requested amount', () => {
+    const modelIntent = validateModelIntent(
+      market({ quantity: null, notional: { amount: 100, currency: 'USD' } })
+    ).value;
+    const resolved = resolveIntent({
+      modelIntent,
+      context: {
+        ...context(),
+        // 100 / 600 does not terminate; nearest rounding would produce
+        // 0.16666667 and a notional of 100.000002.
+        quoteFor: () => quote(600)
+      }
+    });
+
+    expect(resolved.ok).toBe(true);
+    expect(resolved.value.intent.quantity).toBe(0.16666666);
+    expect(resolved.value.intent.quantity * 600).toBeLessThanOrEqual(100);
+    expect(resolved.value.preview.estimatedValue).toBeLessThanOrEqual(100);
+  });
+
   test('INR requires an explicit rate and is never silently treated as USDT', () => {
     const modelIntent = validateModelIntent(
       market({ quantity: null, notional: { amount: 8300, currency: 'INR' } })

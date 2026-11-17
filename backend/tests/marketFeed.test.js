@@ -143,6 +143,20 @@ describe('marketFeed quote storage', () => {
     expect(refreshed.price).toBe(61000);
     expect(refreshed.ageMs).toBe(0);
   });
+
+  test('a quote dated after the current clock is treated as stale', () => {
+    let current = 1_700_000_000_000;
+    const feed = createMarketFeed({ now: () => current });
+    feed.setQuote('BTCUSDT', 60000);
+
+    // Clock skew must never turn a future timestamp into a negative age that
+    // passes the freshness window.
+    current -= 1000;
+
+    const quote = feed.getQuote('BTCUSDT');
+    expect(quote.status).toBe('stale');
+    expect(quote.price).toBeUndefined();
+  });
 });
 
 describe('limit matcher freshness gating', () => {

@@ -248,4 +248,216 @@ describe('claim-lease limit matcher', () => {
     expect(resultA.skipped).toBe(false);
     expect(resultB).toEqual({ skipped: true, reason: 'CYCLE_IN_PROGRESS' });
   });
+
+  test('a failed order releases only its own reservation while the pool covers every sibling', async () => {
+    const user = await createTestUser({ balance: 10000 });
+    const firstKey = `sibling-a-${new mongoose.Types.ObjectId()}`;
+    const secondKey = `sibling-b-${new mongoose.Types.ObjectId()}`;
+    const first = await placeBuyLimit(user, { clientOrderId: firstKey });
+    const second = await placeBuyLimit(user, { clientOrderId: secondKey });
+    const firstOrder = await Order.findOne({ userId: user._id, clientOrderId: firstKey }).lean();
+    const secondOrder = await Order.findOne({ userId: user._id, clientOrderId: secondKey }).lean();
+
+    const failed = await service.failOrder({ orderId: firstOrder._id, error: 'cancelled by test' });
+
+    expect(failed.status).toBe(200);
+    const afterFirst = await snapshotUser(user._id);
+    expect(afterFirst.balance).toBe(6000);
+    expect(afterFirst.lockedBalance).toBe(4000);
+    expect(first.body.success).toBe(true);
+    expect(second.body.success).toBe(true);
+
+    const sibling = await Order.findById(secondOrder._id).lean();
+    expect(sibling.status).toBe('OPEN');
+    expect(sibling.remainingQuantity).toBe(0.1);
+
+    const failedTwice = await service.failOrder({ orderId: secondOrder._id });
+    expect(failedTwice.status).toBe(200);
+    const afterSecond = await snapshotUser(user._id);
+    expect(afterSecond.balance).toBe(10000);
+    expect(afterSecond.lockedBalance).toBe(0);
+  });
+
+  test('a failed order never releases funds that its sibling still needs', async () => {
+    const user = await createTestUser({ balance: 10000 });
+    const firstKey = `shortfall-a-${new mongoose.Types.ObjectId()}`;
+    await placeBuyLimit(user, { clientOrderId: firstKey });
+    await placeBuyLimit(user, { clientOrderId: `shortfall-b-${new mongoose.Types.ObjectId()}` });
+    const firstOrder = await Order.findOne({ userId: user._id, clientOrderId: firstKey }).lean();
+
+    // Simulate an accounting shortfall: lockedBalance no longer covers both
+    // reservations, so ownership of the missing amount is ambiguous.
+    await User.collection.updateOne({ _id: user._id }, { $set: { lockedBalance: 4000 } });
+
+    const failed = await service.failOrder({ orderId: firstOrder._id, error: 'cycle failed' });
+
+    expect(failed.status).toBe(200);
+    const after = await snapshotUser(user._id);
+    expect(after.balance).toBe(2000);
+    expect(after.lockedBalance).toBe(4000);
+
+    const quarantined = await Order.findById(firstOrder._id).lean();
+    expect(quarantined.status).toBe('FAILED');
+    expect(quarantined.lastError).toMatch(/cycle failed/);
+    expect(quarantined.lastError).toMatch(/escrow could not be verified/);
+  });
+
+  test('a failed SELL order unlocks only the quantity it reserved', async () => {
+    const user = await createTestUser({
+      balance: 0,
+      portfolio: [{ symbol: 'BTCUSDT', quantity: 1, avgPrice: 40000 }]
+    });
+    const firstKey = `sell-a-${new mongoose.Types.ObjectId()}`;
+    const first = await service.placeLimitOrder({
+      userId: user._id,
+      side: 'SELL',
+      symbol: 'BTCUSDT',
+      quantity: 0.4,
+      limitPrice: 60000,
+      clientOrderId: firstKey
+    });
+    const second = await service.placeLimitOrder({
+      userId: user._id,
+      side: 'SELL',
+      symbol: 'BTCUSDT',
+      quantity: 0.4,
+      limitPrice: 60000,
+      clientOrderId: `sell-b-${new mongoose.Types.ObjectId()}`
+    });
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    const firstOrder = await Order.findOne({ userId: user._id, clientOrderId: firstKey }).lean();
+
+    const failed = await service.failOrder({ orderId: firstOrder._id });
+
+    expect(failed.status).toBe(200);
+    const stored = await User.findById(user._id).lean();
+    const position = stored.portfolio.find(item => item.symbol === 'BTCUSDT');
+    expect(position.quantity).toBe(1);
+    expect(position.lockedQuantity).toBeCloseTo(0.4, 12);
+  });
+
+  test('a SELL failure with a shortfall does not unlock its sibling holdings', async () => {
+    const user = await createTestUser({
+      balance: 0,
+      portfolio: [{ symbol: 'BTCUSDT', quantity: 1, avgPrice: 40000 }]
+    });
+    const firstKey = `sell-short-a-${new mongoose.Types.ObjectId()}`;
+    const first = await service.placeLimitOrder({
+      userId: user._id,
+      side: 'SELL',
+      symbol: 'BTCUSDT',
+      quantity: 0.4,
+      limitPrice: 60000,
+      clientOrderId: firstKey
+    });
+    expect(first.status).toBe(200);
+    await service.placeLimitOrder({
+      userId: user._id,
+      side: 'SELL',
+      symbol: 'BTCUSDT',
+      quantity: 0.4,
+      limitPrice: 60000,
+      clientOrderId: `sell-short-b-${new mongoose.Types.ObjectId()}`
+    });
+    const firstOrder = await Order.findOne({ userId: user._id, clientOrderId: firstKey }).lean();
+
+    await User.collection.updateOne(
+      { _id: user._id },
+      { $set: { 'portfolio.0.lockedQuantity': 0.4 } }
+    );
+
+    const failed = await service.failOrder({ orderId: firstOrder._id });
+
+    expect(failed.status).toBe(200);
+    const stored = await User.findById(user._id).lean();
+    const position = stored.portfolio.find(item => item.symbol === 'BTCUSDT');
+    expect(position.lockedQuantity).toBeCloseTo(0.4, 12);
+    const quarantined = await Order.findById(firstOrder._id).lean();
+    expect(quarantined.lastError).toMatch(/SELL escrow could not be verified/);
+  });
+
+  test('a limit fill refuses to settle with a stale execution quote', async () => {
+    const user = await createTestUser({ balance: 6000 });
+    const key = `stale-quote-${new mongoose.Types.ObjectId()}`;
+    const placed = await placeBuyLimit(user, { clientOrderId: key });
+    expect(placed.status).toBe(200);
+    const order = await Order.findOne({ userId: user._id, clientOrderId: key }).lean();
+
+    await Order.updateOne(
+      { _id: order._id },
+      {
+        $set: {
+          status: 'FILLING',
+          claimedBy: 'stale-quote-worker',
+          claimedAt: new Date(now),
+          leaseExpiresAt: new Date(now + 30000)
+        }
+      }
+    );
+
+    const result = await service.fillLimitOrder({
+      orderId: order._id,
+      workerId: 'stale-quote-worker',
+      executionQuote: { symbol: 'BTCUSDT', price: 39000, ts: now - 15001 }
+    });
+
+    expect(result.status).toBe(503);
+    expect(result.code).toBe('QUOTE_UNAVAILABLE');
+    expect(await Trade.countDocuments({ userId: user._id })).toBe(0);
+
+    const after = await snapshotUser(user._id);
+    expect(after.balance).toBe(2000);
+    expect(after.lockedBalance).toBe(4000);
+  });
+
+  test('successive batches eventually examine later eligible orders', async () => {
+    const user = await createTestUser({ balance: 20000 });
+    // The oldest order can never be priced in this test because ETHUSDT has no
+    // quote, so it is deferred on every cycle and stays at the front.
+    const deferredKey = `cursor-deferred-${new mongoose.Types.ObjectId()}`;
+    const deferred = await service.placeLimitOrder({
+      userId: user._id,
+      side: 'BUY',
+      symbol: 'ETHUSDT',
+      quantity: 0.1,
+      limitPrice: 1000,
+      clientOrderId: deferredKey
+    });
+    expect(deferred.status).toBe(200);
+
+    const laterKey = `cursor-later-${new mongoose.Types.ObjectId()}`;
+    const later = await service.placeLimitOrder({
+      userId: user._id,
+      side: 'BUY',
+      symbol: 'BTCUSDT',
+      quantity: 0.1,
+      limitPrice: 60000,
+      clientOrderId: laterKey
+    });
+    expect(later.status).toBe(200);
+    const deferredOrder = await Order.findOne({ userId: user._id, clientOrderId: deferredKey }).lean();
+    const laterOrder = await Order.findOne({ userId: user._id, clientOrderId: laterKey }).lean();
+
+    const worker = createMatcher({
+      feed,
+      tradeService: service,
+      now: () => now,
+      workerId: 'cursor-worker',
+      batchSize: 1
+    });
+
+    const firstCycle = await worker.runCycle();
+    expect(firstCycle.examined).toBe(1);
+    expect(firstCycle.filled).toBe(0);
+
+    // Without the rotating offset the deferred ETH order would be the only
+    // candidate forever and the later BTC order could never fill.
+    const secondCycle = await worker.runCycle();
+    expect(secondCycle.examined).toBe(1);
+    expect(secondCycle.filled).toBe(1);
+
+    expect((await Order.findById(laterOrder._id).lean()).status).toBe('FILLED');
+    expect((await Order.findById(deferredOrder._id).lean()).status).toBe('OPEN');
+  });
 });

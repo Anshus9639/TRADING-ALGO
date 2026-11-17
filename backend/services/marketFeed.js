@@ -38,8 +38,9 @@ function createMarketFeed({
     const limit = Number.isFinite(maxAgeMs) && maxAgeMs >= 0 ? maxAgeMs : defaultMaxAgeMs;
     const ageMs = now() - quote.ts;
 
-    // Non-finite ages cannot be proven fresh, so they are treated as stale.
-    if (!Number.isFinite(ageMs) || ageMs > limit) {
+    // Non-finite or negative ages cannot be proven fresh — negative ages mean
+    // the clock moved backwards — so both are treated as stale.
+    if (!Number.isFinite(ageMs) || ageMs < 0 || ageMs > limit) {
       return { status: 'stale', symbol: normalized, ageMs };
     }
 

@@ -5,7 +5,7 @@ const {
   validateLimitPrice,
   validateNotional
 } = require('../../lib/validate');
-const { roundTo, MIN_QUANTITY } = require('../../lib/numbers');
+const { roundTo, floorTo, MIN_QUANTITY, DECIMALS } = require('../../lib/numbers');
 
 // The LLM is an untrusted extractor. This is the complete set of properties it
 // may return; anything else (urls, endpoints, prices, user ids) is rejected.
@@ -213,7 +213,13 @@ function resolveIntent({ modelIntent, context } = {}) {
       warnings.push('USD is treated as 1:1 with USDT for this paper-trading account.');
     }
 
-    quantity = roundTo(amountInQuote / priceForSizing);
+    // A spend amount must never be exceeded. Rounding to the nearest supported
+    // precision can overshoot (100 USDT / 600 USDT -> 0.16666667 costs
+    // 100.000002), so floor instead and correct any float drift downward once.
+    quantity = floorTo(amountInQuote / priceForSizing);
+    if (quantity > 0 && quantity * priceForSizing > amountInQuote) {
+      quantity = floorTo(quantity - 10 ** -DECIMALS);
+    }
   }
 
   const quantityCheck = validateQuantity(quantity);

@@ -1,4 +1,6 @@
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const request = require('supertest');
 const { createApp } = require('../app');
 const { createMarketFeed } = require('../services/marketFeed');
@@ -181,5 +183,20 @@ describe('limit orders gated on matcher readiness', () => {
     expect(replay.body.balance).toBe(6000);
     expect(replay.body.lockedBalance).toBe(4000);
     expect(await Order.countDocuments()).toBe(1);
+  });
+
+  test('the server only restores ACTIVE readiness after a completed matcher cycle', () => {
+    const source = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+    const start = source.indexOf('setInterval(async () => {');
+    const end = source.indexOf('}, 3000);');
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const interval = source.slice(start, end);
+
+    // A cycle skipped because one is already running, or because the matcher
+    // is FAILED, must never be treated as a successful recovery.
+    expect(interval).toMatch(/if \(!stats\.skipped\) \{\s*runtimeStatus\.markMatcherActive\(\);/);
+    expect(interval).not.toMatch(/runtimeStatus\.markMatcherActive\(\);\s*\}\s*catch/);
+    expect(interval.match(/runtimeStatus\.markMatcherActive\(\)/g)).toHaveLength(1);
   });
 });
