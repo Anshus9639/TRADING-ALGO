@@ -407,6 +407,32 @@ describe('copilot proposal and confirmation flow', () => {
     expect(after.balance).toBe(5000);
   });
 
+  test('an executed proposal is still recoverable by id after its TTL expires', async () => {
+    const { app } = makeApp({
+      intents: { 'buy 0.1 btc': modelIntent() }
+    });
+    const user = await createTestUser({ balance: 10000 });
+    const token = authToken(user);
+
+    const parsed = await parse(app, token, 'Buy 0.1 BTC');
+    const first = await execute(app, token, parsed.body.proposalId);
+    expect(first.status).toBe(200);
+    const afterFirst = await snapshotUser(user._id);
+
+    // A client that lost the response retries later, after its local and the
+    // server-side proposal TTL have passed. The prior execution result is
+    // checked before the proposal is consumed, so the committed trade is
+    // recovered instead of reported as expired or executed again.
+    clock += 120001;
+    const reconciled = await execute(app, token, parsed.body.proposalId);
+
+    expect(reconciled.status).toBe(200);
+    expect(reconciled.body.success).toBe(true);
+    expect(reconciled.body.idempotent).toBe(true);
+    expect(reconciled.body.executedPrice).toBe(first.body.executedPrice);
+    expect(await snapshotUser(user._id)).toEqual(afterFirst);
+  });
+
   test('material price drift returns PRICE_CHANGED without executing', async () => {
     const { app } = makeApp({
       intents: { 'buy 0.1 btc': modelIntent() }

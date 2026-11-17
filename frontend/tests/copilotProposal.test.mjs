@@ -9,8 +9,11 @@ import {
   createConfirmLock,
   requestProposal,
   confirmProposal,
+  reconcileProposal,
   discardProposal,
   canConfirm,
+  canReconcile,
+  blocksNewCommand,
   isExpired,
   isUncertainFailure,
   formatRemaining
@@ -258,6 +261,113 @@ test('a definitive 4xx rejection discards the proposal and never retries', async
   // An explicit success:false body is definitive even without a status code.
   const inline = Object.assign(new Error('Rejected'), { code: 'TRADE_REJECTED', definite: true });
   assert.equal(isUncertainFailure(inline), false);
+});
+
+test('an unconfirmed execution can be reconciled with the same id after local expiry', async () => {
+  const state = { ...createProposalState(payload(), NOW), uncertain: true };
+  const later = NOW + 120001;
+
+  assert.equal(isExpired(state, later), true);
+  assert.equal(canConfirm(state, later), false);
+  assert.equal(canReconcile(state), true);
+
+  const http = recorder({
+    executeResponse: { success: true, balance: 5000, executedPrice: 50000, idempotent: true }
+  });
+  const result = await reconcileProposal({ http, state, token: 'token-1', now: later });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.state.status, PROPOSAL_STATUS.EXECUTED);
+  assert.equal(http.calls.length, 1);
+  assert.equal(http.calls[0].url, '/api/copilot/execute');
+  assert.deepEqual(http.calls[0].body, { proposalId: 'a'.repeat(48) });
+});
+
+test('reconciling an expired proposal with no execution reports the definitive outcome', async () => {
+  const state = { ...createProposalState(payload(), NOW), uncertain: true };
+  const failure = Object.assign(new Error('Request failed'), {
+    response: {
+      status: 410,
+      data: { success: false, code: 'PROPOSAL_EXPIRED', message: 'Proposal expired.' }
+    }
+  });
+  const http = recorder({ executeRejection: failure });
+
+  const result = await reconcileProposal({ http, state, token: 'token-1', now: NOW + 120001 });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'PROPOSAL_EXPIRED');
+  assert.equal(result.definitive, true);
+  assert.equal(result.uncertain, undefined);
+  assert.equal(result.state.status, PROPOSAL_STATUS.EXPIRED);
+  assert.equal(http.calls.length, 1);
+  assert.deepEqual(http.calls[0].body, { proposalId: 'a'.repeat(48) });
+});
+
+test('reconciliation keeps the proposal when the outcome is still uncertain', async () => {
+  const state = { ...createProposalState(payload(), NOW), uncertain: true };
+  const http = recorder({
+    executeRejection: Object.assign(new Error('Network Error'), { code: 'ERR_NETWORK' })
+  });
+
+  const result = await reconcileProposal({ http, state, token: 'token-1', now: NOW + 1000 });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.uncertain, true);
+  assert.equal(result.definitive, false);
+  assert.equal(result.state.proposalId, state.proposalId);
+  assert.equal(canReconcile(result.state), true);
+});
+
+test('retrying after an uncertain failure reuses the original proposal id', async () => {
+  const firstHttp = recorder({
+    executeRejection: Object.assign(new Error('Network Error'), { code: 'ERR_NETWORK' })
+  });
+  const state = createProposalState(payload(), NOW);
+
+  const first = await confirmProposal({ http: firstHttp, state, token: 'token-1', now: NOW });
+  assert.equal(first.uncertain, true);
+  assert.equal(first.definitive, false);
+
+  const retryHttp = recorder();
+  const retry = await confirmProposal({
+    http: retryHttp,
+    state: first.state,
+    token: 'token-1',
+    now: NOW + 1000
+  });
+
+  assert.equal(retry.ok, true);
+  assert.equal(retryHttp.calls.length, 1);
+  assert.deepEqual(retryHttp.calls[0].body, { proposalId: state.proposalId });
+});
+
+test('a new command is blocked while an execution remains uncertain', () => {
+  assert.equal(blocksNewCommand({ uncertain: true }), true);
+  assert.equal(blocksNewCommand({ uncertain: false }), false);
+  assert.equal(blocksNewCommand(null), false);
+  assert.equal(canReconcile(null), false);
+  assert.equal(canReconcile({ status: PROPOSAL_STATUS.READY }), false);
+
+  const source = fs.readFileSync(
+    path.join(here, '..', 'src', 'components', 'AICopilot.jsx'),
+    'utf8'
+  );
+  const commandSection = source.slice(
+    source.indexOf('const handleCommand'),
+    source.indexOf('const reportExecutionSuccess')
+  );
+  assert.match(commandSection, /blocksNewCommand\(proposal\)/);
+  // The guard must run before the proposal is cleared.
+  assert.ok(
+    commandSection.indexOf('blocksNewCommand(proposal)') < commandSection.indexOf('setProposal(null)')
+  );
+  assert.match(source, /canReconcile\(current\)/);
+  assert.match(source, /reconcileProposal/);
+  assert.match(source, /UNCONFIRMED/);
+  assert.match(source, /Execution outcome is unknown/);
+  assert.match(source, /Resolve & discard/);
+  assert.match(source, /No trade was created/);
 });
 
 test('AICopilot keeps an unconfirmed proposal and routes confirmation through the controller', () => {

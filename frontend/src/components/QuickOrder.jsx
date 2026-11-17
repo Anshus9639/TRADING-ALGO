@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { api, authHeaders } from '../lib/api';
 import { createClientOrderId } from '../lib/orderId.mjs';
+import { createPendingSubmissionMap } from '../lib/pendingOrders.mjs';
 
 const QuickOrder = ({ activeSymbol, currentPrice, token, onTradeComplete }) => {
   const [orderType, setOrderType] = useState('MARKET'); // 🚀 New: Tracks Market vs Limit
@@ -10,7 +11,19 @@ const QuickOrder = ({ activeSymbol, currentPrice, token, onTradeComplete }) => {
   const [message, setMessage] = useState(null); 
   // Keyed per submission so a retry of an unresolved order reuses its original
   // idempotency key, and a different order cannot overwrite that identity.
-  const pendingSubmissions = useRef(new Map());
+  // The map is user-scoped and survives a page refresh without persisting tokens.
+  const pendingSubmissions = useRef(null);
+  if (!pendingSubmissions.current) {
+    pendingSubmissions.current = createPendingSubmissionMap({ token });
+  }
+  const [hasUnresolved, setHasUnresolved] = useState(
+    () => pendingSubmissions.current.size() > 0
+  );
+
+  useEffect(() => {
+    pendingSubmissions.current = createPendingSubmissionMap({ token });
+    setHasUnresolved(pendingSubmissions.current.size() > 0);
+  }, [token]);
 
   // 🚀 Auto-fill limit price with the current live price when switching to LIMIT tab
   useEffect(() => {
@@ -51,7 +64,8 @@ const QuickOrder = ({ activeSymbol, currentPrice, token, onTradeComplete }) => {
         numericQuantity,
         orderType === 'LIMIT' ? numericLimitPrice : 'MARKET'
       ].join('|');
-      const pending = pendingSubmissions.current.get(requestKey);      if (pending) {
+      const pending = pendingSubmissions.current.get(requestKey);
+      if (pending) {
         payload.clientOrderId = pending;
       } else {
         payload.clientOrderId = createClientOrderId();
@@ -60,6 +74,7 @@ const QuickOrder = ({ activeSymbol, currentPrice, token, onTradeComplete }) => {
 
       const res = await api.post(endpoint, payload, authHeaders(token));
       pendingSubmissions.current.delete(requestKey);
+      setHasUnresolved(pendingSubmissions.current.size() > 0);
 
       // Success! Show inline message
       const successText = orderType === 'LIMIT' 
@@ -82,6 +97,7 @@ const QuickOrder = ({ activeSymbol, currentPrice, token, onTradeComplete }) => {
       if (requestKey && status && status < 500 && status !== 408) {
         pendingSubmissions.current.delete(requestKey);
       }
+      setHasUnresolved(pendingSubmissions.current.size() > 0);
       // Error! Show inline message
       const errorMsg = err.response?.data?.message || "Trade failed due to server error.";
       setMessage({ text: `Rejected: ${errorMsg}`, type: "error" });
@@ -117,6 +133,13 @@ const QuickOrder = ({ activeSymbol, currentPrice, token, onTradeComplete }) => {
       {message && (
         <div className={`p-2 rounded text-xs font-bold text-center ${message.type === 'success' ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>
           {message.text}
+        </div>
+      )}
+
+      {hasUnresolved && (
+        <div className="p-2 rounded text-[10px] font-mono text-amber-400 bg-amber-500/10 border border-amber-500/20">
+          An earlier submission is unresolved. Repeating the same order reuses its original
+          idempotency key instead of placing a duplicate.
         </div>
       )}
 
