@@ -7,6 +7,7 @@ import {
   resolveApiOrigin,
   buildAuthHeaders
 } from '../src/lib/apiConfig.mjs';
+import { resolveBuildApiUrl } from '../src/lib/buildConfig.mjs';
 
 test('development defaults to localhost', () => {
   assert.equal(DEFAULT_DEV_API_URL, 'http://localhost:5000');
@@ -59,6 +60,37 @@ test('production requires an explicit API URL regardless of the selected mode', 
   );
   // A dev server keeps the localhost default even when MODE is custom.
   assert.equal(resolveApiUrl({ MODE: 'staging', PROD: false }), DEFAULT_DEV_API_URL);
+});
+
+test('the Vite command decides production status independently of the mode', () => {
+  assert.throws(
+    () => resolveBuildApiUrl({ command: 'build', mode: 'production', env: {} }),
+    /VITE_API_URL must be set/
+  );
+  // `vite build --mode staging` is still a production bundle.
+  assert.throws(
+    () => resolveBuildApiUrl({ command: 'build', mode: 'staging', env: {} }),
+    /VITE_API_URL must be set/
+  );
+  assert.throws(
+    () => resolveBuildApiUrl({ command: 'build', mode: 'staging', env: { VITE_API_URL: '  ' } }),
+    /VITE_API_URL must be set/
+  );
+  // The dev server keeps the localhost default for any mode.
+  assert.equal(
+    resolveBuildApiUrl({ command: 'serve', mode: 'development', env: {} }),
+    DEFAULT_DEV_API_URL
+  );
+  assert.equal(
+    resolveBuildApiUrl({ command: 'build', mode: 'staging', env: { VITE_API_URL: 'https://api.example.com/' } }),
+    'https://api.example.com'
+  );
+});
+
+test('vite.config passes the actual command into the API URL guard', () => {
+  const source = readFileSync(new URL('../vite.config.js', import.meta.url), 'utf8');
+  assert.match(source, /resolveBuildApiUrl\(\{ command, mode, env \}\)/);
+  assert.match(source, /\{\s*command,\s*mode\s*\}/);
 });
 
 test('production accepts a valid API URL', () => {
