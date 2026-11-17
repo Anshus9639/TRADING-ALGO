@@ -11,7 +11,7 @@ const { createMarketFeed } = require('../services/marketFeed');
 const { createTradeService } = require('../services/tradeService');
 const { createMatcher } = require('../services/matcher');
 const { findUnmigratedLegacyOrders, findLegacyOrderBlockers } = require('../services/legacyOrders');
-const { resolveLegacyOrderId } = require('../lib/legacyIdentity');
+const { resolveLegacyOrderId, legacyOrderId, legacyTradeId } = require('../lib/legacyIdentity');
 const { checkIdempotencyIndex } = require('../scripts/check-idempotency-index');
 const {
   planAccount,
@@ -19,7 +19,9 @@ const {
   auditLegacyData,
   verifyMigration,
   createBackup,
-  verifyBackup
+  readBackup,
+  verifyBackup,
+  backupHash
 } = require('../scripts/legacyMigration');
 const { startTestDb, stopTestDb, createTestUser } = require('./helpers');
 
@@ -55,6 +57,41 @@ function legacyOrder(symbol, type, quantity, limitPrice, timestamp) {
     limitPrice,
     ...(timestamp ? { timestamp } : {})
   };
+}
+
+// Wraps the canonical models so tests can observe how many users are read at a
+// time and which user ids each associated-collection query requests.
+function trackedModels() {
+  const calls = { orderBatches: [], tradeBatches: [] };
+  const wrap = (Model, sink) => ({
+    collection: {
+      find(filter, ...rest) {
+        const ids = filter && filter.userId && filter.userId.$in;
+        if (Array.isArray(ids)) sink.push(ids.map(String));
+        return Model.collection.find(filter, ...rest);
+      },
+      countDocuments: (...args) => Model.collection.countDocuments(...args)
+    }
+  });
+
+  return {
+    calls,
+    models: {
+      User,
+      Order: wrap(Order, calls.orderBatches),
+      Trade: wrap(Trade, calls.tradeBatches)
+    }
+  };
+}
+
+async function createBatchUser(index) {
+  return createTestUser({
+    username: `batch-user-${index}`,
+    balance: 6000,
+    portfolio: [{ symbol: 'BTCUSDT', quantity: 0.1, avgPrice: 40000 }],
+    pendingOrders: [legacyOrder('BTCUSDT', 'BUY', 0.1, 40000, new Date('2025-06-01T00:00:00Z'))],
+    trades: [legacyTrade('BTCUSDT', 'BUY', 0.1, 40000, new Date('2025-05-01T00:00:00Z'))]
+  });
 }
 
 describe('legacy embedded data migration', () => {
@@ -618,6 +655,25 @@ describe('legacy embedded data migration', () => {
     ]);
   });
 
+  test('legacy identity hashes only stable financial fields', () => {
+    const userId = new mongoose.Types.ObjectId();
+    const timestamp = new Date('2025-06-01T00:00:00Z');
+    const order = { symbol: 'BTCUSDT', type: 'BUY', quantity: 0.1, limitPrice: 40000, timestamp };
+    const trade = { symbol: 'BTCUSDT', type: 'BUY', quantity: 0.1, price: 40000, timestamp };
+
+    // Properties outside the documented seed (for example a password or email
+    // copied into a record by mistake) cannot influence the derived id.
+    expect(String(legacyOrderId(userId, { ...order, password: 'secret', email: 'a@b.test' })))
+      .toBe(String(legacyOrderId(userId, order)));
+    expect(String(legacyTradeId(userId, { ...trade, password: 'secret' })))
+      .toBe(String(legacyTradeId(userId, trade)));
+
+    // The owning user id is part of the seed, so ids never collide across users.
+    const otherUser = new mongoose.Types.ObjectId();
+    expect(String(legacyOrderId(otherUser, order))).not.toBe(String(legacyOrderId(userId, order)));
+    expect(String(legacyTradeId(otherUser, trade))).not.toBe(String(legacyTradeId(userId, trade)));
+  });
+
   test('records without an _id share one deterministic id in readers, the gate and migration', async () => {
     const raw = {
       symbol: 'BTCUSDT',
@@ -703,8 +759,158 @@ describe('legacy embedded data migration', () => {
     expect(view.pendingOrders[0].legacy).toBe(true);
   });
 
-  test('a canonical order conflict makes verification fail', async () => {
-    const order = legacyOrder('BTCUSDT', 'BUY', 0.1, 40000, new Date('2025-05-01T00:00:00Z'));
+  test('dry run streams every user in bounded batches', async () => {
+    for (let index = 0; index < 5; index += 1) {
+      await createBatchUser(index);
+    }
+
+    const { calls, models: tracked } = trackedModels();
+    const report = await runMigration({ ...tracked, mongoose, mode: 'dry-run', batchSize: 2 });
+
+    expect(report.totals.usersScanned).toBe(5);
+    expect(report.totals.ordersToInsert).toBe(5);
+    expect(report.totals.tradesToInsert).toBe(5);
+    expect(report.writes).toEqual({ users: 0, orders: 0, trades: 0 });
+    // Three batches of 2, 2 and 1 users are planned and read independently.
+    expect(calls.orderBatches.map(batch => batch.length)).toEqual([2, 2, 1]);
+    expect(calls.tradeBatches.map(batch => batch.length)).toEqual([2, 2, 1]);
+    expect(await Order.countDocuments({})).toBe(0);
+    expect(await Trade.countDocuments({})).toBe(0);
+  });
+
+  test('the limit is applied before reading associated records', async () => {
+    for (let index = 0; index < 3; index += 1) {
+      await createBatchUser(index);
+    }
+    const sorted = await User.find({}).sort({ _id: 1 }).lean();
+
+    const { calls, models: tracked } = trackedModels();
+    const report = await runMigration({ ...tracked, mongoose, mode: 'dry-run', limit: 1, batchSize: 2 });
+
+    expect(report.totals.usersScanned).toBe(1);
+    expect(report.totals.ordersToInsert).toBe(1);
+    // A limit of 1 reads exactly one user and only that user's records.
+    expect(calls.orderBatches).toEqual([[String(sorted[0]._id)]]);
+    expect(calls.tradeBatches).toEqual([[String(sorted[0]._id)]]);
+  });
+
+  test('audit accumulates totals across batches', async () => {
+    for (let index = 0; index < 5; index += 1) {
+      await createBatchUser(index);
+    }
+
+    const report = await auditLegacyData(models(), { batchSize: 2 });
+
+    expect(report.readOnly).toBe(true);
+    expect(report.collections).toEqual({ users: 5, orders: 0, trades: 0 });
+    expect(report.legacy).toMatchObject({
+      users: 5,
+      pendingOrders: 5,
+      openBuy: 5,
+      openSell: 0,
+      trades: 5
+    });
+    expect(report.migration.ordersToInsert).toBe(5);
+    expect(report.migration.tradesToInsert).toBe(5);
+    expect(await Order.countDocuments({})).toBe(0);
+  });
+
+  test('a streamed backup is readable, checksummed and verifiable after apply', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'nexustrade-migration-'));
+    const backupFile = path.join(directory, 'users-backup.json');
+    try {
+      for (let index = 0; index < 3; index += 1) {
+        await createBatchUser(index);
+      }
+
+      const backup = await createBackup(models(), backupFile, { batchSize: 1 });
+      expect(backup.userCount).toBe(3);
+      expect(backup.sha256).toMatch(/^[a-f0-9]{64}$/);
+      // The streamed temporary file is renamed into place, never left behind.
+      expect(fs.readdirSync(directory)).toEqual(['users-backup.json']);
+
+      const read = readBackup(backupFile);
+      expect(read.ok).toBe(true);
+      expect(read.payload.version).toBe(1);
+      expect(read.payload.userCount).toBe(3);
+      expect(read.payload.users).toHaveLength(3);
+      expect(read.payload.sha256).toBe(backupHash(read.payload.users));
+      expect(read.payload.sha256).toBe(backup.sha256);
+
+      const applied = await runMigration({ ...models(), mongoose, mode: 'apply', batchSize: 2 });
+      expect(applied.usersFailed).toBe(0);
+      expect(applied.writes).toEqual({ users: 3, orders: 3, trades: 3 });
+
+      const backupCheck = await verifyBackup(models(), backupFile, { batchSize: 2 });
+      expect(backupCheck.ok).toBe(true);
+      expect(backupCheck.currentUserCount).toBe(3);
+      expect(backupCheck.missingUsers).toEqual([]);
+      expect(backupCheck.changedEmbedded).toEqual([]);
+
+      const verification = await verifyMigration(models(), { backupFile, batchSize: 2 });
+      expect(verification.ok).toBe(true);
+      expect(verification.mismatches).toEqual([]);
+      expect(verification.users).toBe(3);
+      expect(verification.migrated).toEqual({ orders: 3, trades: 3, pending: 0 });
+      expect(verification.backup.ok).toBe(true);
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test('a failed streamed backup keeps the previous file and removes the temporary file', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'nexustrade-migration-'));
+    const backupFile = path.join(directory, 'users-backup.json');
+    const previous = '{"previous":true}\n';
+    try {
+      await createBatchUser(0);
+      await createBatchUser(1);
+      fs.writeFileSync(backupFile, previous);
+
+      const failingUser = {
+        collection: {
+          countDocuments: () => User.collection.countDocuments({}),
+          find() {
+            return {
+              sort() { return this; },
+              batchSize() { return this; },
+              async *[Symbol.asyncIterator]() {
+                const [first] = await User.collection.find({}).limit(1).toArray();
+                yield first;
+                throw new Error('simulated read failure');
+              }
+            };
+          }
+        }
+      };
+
+      await expect(createBackup({ User: failingUser }, backupFile)).rejects.toThrow('simulated read failure');
+
+      expect(fs.readFileSync(backupFile, 'utf8')).toBe(previous);
+      expect(fs.readdirSync(directory)).toEqual(['users-backup.json']);
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test('verification streams users and canonical records in bounded batches', async () => {
+    for (let index = 0; index < 5; index += 1) {
+      await createBatchUser(index);
+    }
+    await runMigration({ ...models(), mongoose, mode: 'apply', batchSize: 2 });
+
+    const { calls, models: tracked } = trackedModels();
+    const verification = await verifyMigration(tracked, { batchSize: 2 });
+
+    expect(verification.ok).toBe(true);
+    expect(verification.mismatches).toEqual([]);
+    expect(verification.users).toBe(5);
+    expect(verification.migrated).toEqual({ orders: 5, trades: 5, pending: 0 });
+    expect(calls.orderBatches.map(batch => batch.length)).toEqual([2, 2, 1]);
+    expect(calls.tradeBatches.map(batch => batch.length)).toEqual([2, 2, 1]);
+  });
+
+  test('a canonical order conflict makes verification fail', async () => {    const order = legacyOrder('BTCUSDT', 'BUY', 0.1, 40000, new Date('2025-05-01T00:00:00Z'));
     const user = await createTestUser({
       balance: 6000,
       lockedBalance: 8000,

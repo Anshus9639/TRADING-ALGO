@@ -35,6 +35,7 @@ const {
  */
 
 const BACKUP_VERSION = 1;
+const DEFAULT_BATCH_SIZE = 100;
 const SEVERITY = Object.freeze({ ERROR: 'error', WARNING: 'warning' });
 const EPSILON = 1e-9;
 
@@ -573,11 +574,13 @@ function summarizePlan(plan) {
   };
 }
 
-function summarizePlans(plans, { mode, startedAt, finishedAt } = {}) {
+// Reports are built as batches are processed. Nothing here retains a global
+// collection of users, orders, trades or plans.
+function createSummaryAccumulator({ mode = null, startedAt = null } = {}) {
   const issueCounts = {};
   const issues = [];
   const totals = {
-    usersScanned: plans.length,
+    usersScanned: 0,
     usersBlocked: 0,
     usersWithChanges: 0,
     legacyPendingOrders: 0,
@@ -589,10 +592,11 @@ function summarizePlans(plans, { mode, startedAt, finishedAt } = {}) {
     conflicts: 0
   };
 
-  for (const plan of plans) {
+  function add(plan) {
     const summary = summarizePlan(plan);
     if (summary.blocked) totals.usersBlocked += 1;
     if (planHasChanges(plan)) totals.usersWithChanges += 1;
+    totals.usersScanned += 1;
     totals.legacyPendingOrders += plan.orders.length;
     totals.legacyTrades += plan.trades.length;
     totals.ordersToInsert += summary.ordersToInsert;
@@ -607,22 +611,30 @@ function summarizePlans(plans, { mode, startedAt, finishedAt } = {}) {
     }
   }
 
-  const errors = issues.filter(entry => entry.severity === SEVERITY.ERROR).length;
-  const warnings = issues.length - errors;
+  function finish(finishedAt = null) {
+    const errors = issues.filter(entry => entry.severity === SEVERITY.ERROR).length;
+    return {
+      mode,
+      startedAt,
+      finishedAt,
+      totals,
+      ambiguity: {
+        total: issues.length,
+        errors,
+        warnings: issues.length - errors,
+        issueCounts,
+        issues
+      }
+    };
+  }
 
-  return {
-    mode,
-    startedAt: startedAt || null,
-    finishedAt: finishedAt || null,
-    totals,
-    ambiguity: {
-      total: issues.length,
-      errors,
-      warnings,
-      issueCounts,
-      issues
-    }
-  };
+  return { add, finish };
+}
+
+function summarizePlans(plans, meta = {}) {
+  const accumulator = createSummaryAccumulator(meta);
+  for (const plan of plans) accumulator.add(plan);
+  return accumulator.finish(meta.finishedAt || null);
 }
 
 function groupByUser(documents) {
@@ -635,32 +647,65 @@ function groupByUser(documents) {
   return map;
 }
 
-// Raw collection reads avoid Mongoose applying schema defaults while reading,
-// so genuinely missing legacy timestamps remain detectable.
-async function loadDataset({ User, Order, Trade }) {
-  const [users, orders, trades] = await Promise.all([
-    User.collection.find({}).sort({ _id: 1 }).toArray(),
-    Order.collection.find({}).toArray(),
-    Trade.collection.find({}).toArray()
-  ]);
-  return {
-    users,
-    ordersByUser: groupByUser(orders),
-    tradesByUser: groupByUser(trades),
-    counts: { users: users.length, orders: orders.length, trades: trades.length }
-  };
+function normalizeBatchSize(batchSize) {
+  return Number.isInteger(batchSize) && batchSize > 0 ? batchSize : DEFAULT_BATCH_SIZE;
 }
 
-function planDataset(dataset, { now = Date.now() } = {}) {
-  return dataset.users.map(user => {
-    const userId = String(user._id);
-    return planAccount(
-      user,
-      dataset.ordersByUser.get(userId) || [],
-      dataset.tradesByUser.get(userId) || [],
-      { now }
-    );
-  });
+async function loadBatchRecords(models, users) {
+  const userIds = users.map(user => user._id);
+  const [orders, trades] = await Promise.all([
+    models.Order.collection.find({ userId: { $in: userIds } }).toArray(),
+    models.Trade.collection.find({ userId: { $in: userIds } }).toArray()
+  ]);
+  const ordersByUser = groupByUser(orders);
+  const tradesByUser = groupByUser(trades);
+
+  return users.map(user => ({
+    user,
+    orders: ordersByUser.get(String(user._id)) || [],
+    trades: tradesByUser.get(String(user._id)) || []
+  }));
+}
+
+// The user cursor is read in fixed-size batches. `limit` is applied to the
+// cursor before iteration, so a limited run never reads other users' records.
+async function* iterateUserBatches(models, { batchSize = DEFAULT_BATCH_SIZE, limit = null } = {}) {
+  const size = normalizeBatchSize(batchSize);
+  const cursor = models.User.collection.find({}).sort({ _id: 1 }).batchSize(size);
+  if (limit) cursor.limit(limit);
+
+  let batch = [];
+  for await (const user of cursor) {
+    batch.push(user);
+    if (batch.length >= size) {
+      yield await loadBatchRecords(models, batch);
+      batch = [];
+    }
+  }
+  if (batch.length > 0) {
+    yield await loadBatchRecords(models, batch);
+  }
+}
+
+async function countCollections(models) {
+  const [users, orders, trades] = await Promise.all([
+    models.User.collection.countDocuments({}),
+    models.Order.collection.countDocuments({}),
+    models.Trade.collection.countDocuments({})
+  ]);
+  return { users, orders, trades };
+}
+
+function duplicateGroupsFor(records) {
+  const counts = new Map();
+  for (const record of records) {
+    if (!record || !record._id) continue;
+    const id = String(record._id);
+    counts.set(id, (counts.get(id) || 0) + 1);
+  }
+  return [...counts.entries()]
+    .filter(([, count]) => count > 1)
+    .map(([id, count]) => ({ id, count }));
 }
 
 async function transactionsSupported(mongooseInstance) {
@@ -770,7 +815,16 @@ async function applyUserPlan({ User, Order, Trade, mongoose: mongooseInstance, u
   return result;
 }
 
-async function runMigration({ User, Order, Trade, mongoose: mongooseInstance, mode = 'dry-run', limit = null, now = Date.now() } = {}) {
+async function runMigration({
+  User,
+  Order,
+  Trade,
+  mongoose: mongooseInstance,
+  mode = 'dry-run',
+  limit = null,
+  now = Date.now(),
+  batchSize = DEFAULT_BATCH_SIZE
+} = {}) {
   if (mode !== 'dry-run' && mode !== 'apply') {
     throw new TypeError('mode must be "dry-run" or "apply".');
   }
@@ -786,130 +840,152 @@ async function runMigration({ User, Order, Trade, mongoose: mongooseInstance, mo
   }
 
   if (mode === 'dry-run') {
-    const dataset = await loadDataset(models);
-    const users = limit ? dataset.users.slice(0, limit) : dataset.users;
-    const plans = users.map(user => {
-      const userId = String(user._id);
-      return planAccount(
-        user,
-        dataset.ordersByUser.get(userId) || [],
-        dataset.tradesByUser.get(userId) || [],
-        { now }
-      );
-    });
+    const accumulator = createSummaryAccumulator({ mode, startedAt });
+    for await (const batch of iterateUserBatches(models, { batchSize, limit })) {
+      for (const { user, orders, trades } of batch) {
+        accumulator.add(planAccount(user, orders, trades, { now }));
+      }
+    }
     return {
-      ...summarizePlans(plans, { mode, startedAt, finishedAt: new Date().toISOString() }),
+      ...accumulator.finish(new Date().toISOString()),
       writes: { users: 0, orders: 0, trades: 0 }
     };
   }
 
-  let query = models.User.find({}).sort({ _id: 1 }).select('_id').lean();
-  if (limit) query = query.limit(limit);
-  const userIds = await query;
+  const size = normalizeBatchSize(batchSize);
+  let userCursor = models.User.collection.find({}).sort({ _id: 1 }).batchSize(size).project({ _id: 1 });
+  if (limit) userCursor = userCursor.limit(limit);
 
-  const results = [];
-  for (const { _id } of userIds) {
-    results.push(await applyUserPlan({
+  const issueCounts = {};
+  const issues = [];
+  const failures = [];
+  const counters = {
+    scanned: 0,
+    updated: 0,
+    unchanged: 0,
+    blocked: 0,
+    missing: 0,
+    failed: 0,
+    orders: 0,
+    trades: 0
+  };
+
+  for await (const { _id } of userCursor) {
+    const result = await applyUserPlan({
       User: models.User,
       Order: models.Order,
       Trade: models.Trade,
       mongoose: db,
       userId: _id,
       now
-    }));
-  }
+    });
 
-  const issueCounts = {};
-  const issues = [];
-  for (const result of results) {
+    counters.scanned += 1;
+    if (result.action === 'updated') {
+      counters.updated += 1;
+      counters.orders += result.ordersInserted || 0;
+      counters.trades += result.tradesInserted || 0;
+    } else if (result.action === 'unchanged') {
+      counters.unchanged += 1;
+    } else if (result.action === 'blocked') {
+      counters.blocked += 1;
+    } else if (result.action === 'missing') {
+      counters.missing += 1;
+    } else {
+      counters.failed += 1;
+      failures.push(result);
+    }
+
     for (const entry of result.issues || []) {
       issueCounts[entry.code] = (issueCounts[entry.code] || 0) + 1;
       issues.push(entry);
     }
   }
 
-  const failed = results.filter(result => result.action === 'failed');
+  const errors = issues.filter(entry => entry.severity === SEVERITY.ERROR).length;
   return {
     mode,
     startedAt,
     finishedAt: new Date().toISOString(),
-    usersScanned: results.length,
-    usersUpdated: results.filter(result => result.action === 'updated').length,
-    usersUnchanged: results.filter(result => result.action === 'unchanged').length,
-    usersBlocked: results.filter(result => result.action === 'blocked').length,
-    usersMissing: results.filter(result => result.action === 'missing').length,
-    usersFailed: failed.length,
-    failures: failed,
+    usersScanned: counters.scanned,
+    usersUpdated: counters.updated,
+    usersUnchanged: counters.unchanged,
+    usersBlocked: counters.blocked,
+    usersMissing: counters.missing,
+    usersFailed: counters.failed,
+    failures,
     writes: {
-      users: results.filter(result => result.action === 'updated').length,
-      orders: results.reduce((sum, result) => sum + (result.ordersInserted || 0), 0),
-      trades: results.reduce((sum, result) => sum + (result.tradesInserted || 0), 0)
+      users: counters.updated,
+      orders: counters.orders,
+      trades: counters.trades
     },
     ambiguity: {
       total: issues.length,
-      errors: issues.filter(entry => entry.severity === SEVERITY.ERROR).length,
-      warnings: issues.filter(entry => entry.severity === SEVERITY.WARNING).length,
+      errors,
+      warnings: issues.length - errors,
       issueCounts,
       issues
     }
   };
 }
 
-async function auditLegacyData(modelsInput = {}, { now = Date.now() } = {}) {
+async function auditLegacyData(modelsInput = {}, { now = Date.now(), batchSize = DEFAULT_BATCH_SIZE } = {}) {
   const models = defaultModels(modelsInput);
-  const dataset = await loadDataset(models);
-  const plans = planDataset(dataset, { now });
-  const summary = summarizePlans(plans, {
-    mode: 'audit',
-    startedAt: new Date().toISOString(),
-    finishedAt: new Date().toISOString()
-  });
-
-  const openBuy = dataset.users.reduce((sum, user) => {
-    const legacy = Array.isArray(user.pendingOrders) ? user.pendingOrders : [];
-    return sum + legacy.filter(order => String(order.type).toUpperCase() === 'BUY').length;
-  }, 0);
-  const openSell = dataset.users.reduce((sum, user) => {
-    const legacy = Array.isArray(user.pendingOrders) ? user.pendingOrders : [];
-    return sum + legacy.filter(order => String(order.type).toUpperCase() === 'SELL').length;
-  }, 0);
-
-  function duplicateGroupsFor(records) {
-    const counts = new Map();
-    for (const record of records) {
-      if (!record || !record._id) continue;
-      const id = String(record._id);
-      counts.set(id, (counts.get(id) || 0) + 1);
-    }
-    return [...counts.entries()]
-      .filter(([, count]) => count > 1)
-      .map(([id, count]) => ({ id, count }));
-  }
-
+  const startedAt = new Date().toISOString();
+  const accumulator = createSummaryAccumulator({ mode: 'audit', startedAt });
+  let openBuy = 0;
+  let openSell = 0;
   const duplicateOrderGroups = [];
   const duplicateTradeGroups = [];
-  for (const user of dataset.users) {
-    for (const group of duplicateGroupsFor(Array.isArray(user.pendingOrders) ? user.pendingOrders : [])) {
-      duplicateOrderGroups.push({ userId: String(user._id), legacyOrderId: group.id, count: group.count });
-    }
-    for (const group of duplicateGroupsFor(Array.isArray(user.trades) ? user.trades : [])) {
-      duplicateTradeGroups.push({ userId: String(user._id), legacyTradeId: group.id, count: group.count });
-    }
-  }
-
   const unknownCostBasis = [];
-  for (const plan of plans) {
-    for (const position of plan.portfolio.positions) {
-      if (position.costBasisStatus === 'UNKNOWN' && position.quantity > 0) {
-        unknownCostBasis.push({ userId: plan.userId, symbol: position.symbol, quantity: position.quantity });
+
+  for await (const batch of iterateUserBatches(models, { batchSize })) {
+    for (const { user, orders, trades } of batch) {
+      const plan = planAccount(user, orders, trades, { now });
+      accumulator.add(plan);
+
+      const legacyOrders = Array.isArray(user.pendingOrders) ? user.pendingOrders : [];
+      for (const order of legacyOrders) {
+        const side = String(order.type).toUpperCase();
+        if (side === 'BUY') openBuy += 1;
+        else if (side === 'SELL') openSell += 1;
+      }
+
+      for (const group of duplicateGroupsFor(legacyOrders)) {
+        duplicateOrderGroups.push({
+          userId: String(user._id),
+          legacyOrderId: group.id,
+          count: group.count
+        });
+      }
+      for (const group of duplicateGroupsFor(Array.isArray(user.trades) ? user.trades : [])) {
+        duplicateTradeGroups.push({
+          userId: String(user._id),
+          legacyTradeId: group.id,
+          count: group.count
+        });
+      }
+
+      for (const position of plan.portfolio.positions) {
+        if (position.costBasisStatus === 'UNKNOWN' && position.quantity > 0) {
+          unknownCostBasis.push({
+            userId: plan.userId,
+            symbol: position.symbol,
+            quantity: position.quantity
+          });
+        }
       }
     }
   }
 
+  const finishedAt = new Date().toISOString();
+  const summary = accumulator.finish(finishedAt);
+  const collections = await countCollections(models);
+
   return {
     readOnly: true,
-    checkedAt: new Date().toISOString(),
-    collections: dataset.counts,
+    checkedAt: finishedAt,
+    collections,
     legacy: {
       users: summary.totals.usersScanned,
       pendingOrders: summary.totals.legacyPendingOrders,
@@ -940,132 +1016,141 @@ async function auditLegacyData(modelsInput = {}, { now = Date.now() } = {}) {
   };
 }
 
-async function verifyMigration(modelsInput = {}, { backupFile = null, now = Date.now() } = {}) {
+async function verifyMigration(modelsInput = {}, {
+  backupFile = null,
+  now = Date.now(),
+  batchSize = DEFAULT_BATCH_SIZE
+} = {}) {
   const models = defaultModels(modelsInput);
-  const dataset = await loadDataset(models);
-  const plans = planDataset(dataset, { now });
   const mismatches = [];
   const issues = [];
   const unknownCostBasis = [];
+  let usersChecked = 0;
+  let migratedOrders = 0;
+  let migratedTrades = 0;
+  let pendingRecords = 0;
 
-  for (const plan of plans) {
-    issues.push(...plan.issues);
-    if (plan.blocked) {
-      mismatches.push({ code: 'BLOCKED_USER', userId: plan.userId, detail: 'User was not migrated because legacy data is ambiguous.' });
-      continue;
-    }
-    const pendingOrders = plan.orders.filter(item => item.action === 'insert');
-    const pendingTrades = plan.trades.filter(item => item.action === 'insert');
-    if (pendingOrders.length > 0) {
-      mismatches.push({ code: 'UNMIGRATED_ORDERS', userId: plan.userId, detail: `${pendingOrders.length} valid legacy order(s) are not in the canonical collection.` });
-    }
-    if (pendingTrades.length > 0) {
-      mismatches.push({ code: 'UNMIGRATED_TRADES', userId: plan.userId, detail: `${pendingTrades.length} valid legacy trade(s) are not in the canonical collection.` });
-    }
-    // A canonical twin with different financial fields is a reconciliation
-    // failure in its own right, independent of how locks happen to line up.
-    const conflictingOrders = plan.orders.filter(item => item.action === 'conflict');
-    const conflictingTrades = plan.trades.filter(item => item.action === 'conflict');
-    if (conflictingOrders.length > 0) {
-      mismatches.push({ code: 'CONFLICTING_ORDERS', userId: plan.userId, detail: `${conflictingOrders.length} canonical order(s) disagree with the embedded legacy record.` });
-    }
-    if (conflictingTrades.length > 0) {
-      mismatches.push({ code: 'CONFLICTING_TRADES', userId: plan.userId, detail: `${conflictingTrades.length} canonical trade(s) disagree with the embedded legacy record.` });
-    }
+  for await (const batch of iterateUserBatches(models, { batchSize })) {
+    for (const { user, orders, trades } of batch) {
+      const plan = planAccount(user, orders, trades, { now });
+      usersChecked += 1;
+      issues.push(...plan.issues);
+      migratedOrders += plan.orders.filter(item => item.action === 'already-migrated').length;
+      migratedTrades += plan.trades.filter(item => item.action === 'already-migrated').length;
+      pendingRecords += plan.orders.filter(item => item.action === 'insert').length
+        + plan.trades.filter(item => item.action === 'insert').length;
 
-    const user = dataset.users.find(item => String(item._id) === plan.userId);
-    if (!user) {
-      mismatches.push({ code: 'MISSING_USER', userId: plan.userId, detail: 'User disappeared between reads.' });
-      continue;
-    }
-    if (user.balance < 0) {
-      mismatches.push({ code: 'NEGATIVE_BALANCE', userId: plan.userId, detail: `balance ${user.balance}.` });
-    }
-    const expectedLockedBalance = roundTo(plan.lockedBalance);
-    const actualLockedBalance = roundTo(asFinite(user.lockedBalance, 0));
-    if (expectedLockedBalance !== actualLockedBalance) {
-      mismatches.push({
-        code: 'LOCKED_BALANCE_MISMATCH',
-        userId: plan.userId,
-        detail: `lockedBalance ${actualLockedBalance} != open BUY reservations ${expectedLockedBalance}.`
-      });
-    }
-
-    for (const position of plan.portfolio.positions) {
-      if (position.costBasisStatus === 'UNKNOWN' && position.quantity > 0) {
-        unknownCostBasis.push({
-          userId: plan.userId,
-          symbol: position.symbol,
-          quantity: position.quantity,
-          status: 'UNKNOWN'
-        });
-      }
-      const current = (user.portfolio || []).find(item => item.symbol === position.symbol);
-      if (!current) {
-        mismatches.push({ code: 'MISSING_POSITION', userId: plan.userId, detail: `${position.symbol} is missing from the user portfolio.` });
+      if (plan.blocked) {
+        mismatches.push({ code: 'BLOCKED_USER', userId: plan.userId, detail: 'User was not migrated because legacy data is ambiguous.' });
         continue;
       }
-      const currentQuantity = roundTo(asFinite(current.quantity, 0));
-      const expectedStatus = position.costBasisStatus;
-      const currentStatus = current.costBasisStatus
-        || (normalizeAvgPrice(current.avgPrice) !== null ? 'KNOWN' : (currentQuantity > 0 ? 'UNKNOWN' : 'KNOWN'));
-      if (currentStatus !== expectedStatus) {
+      const pendingOrders = plan.orders.filter(item => item.action === 'insert');
+      const pendingTrades = plan.trades.filter(item => item.action === 'insert');
+      if (pendingOrders.length > 0) {
+        mismatches.push({ code: 'UNMIGRATED_ORDERS', userId: plan.userId, detail: `${pendingOrders.length} valid legacy order(s) are not in the canonical collection.` });
+      }
+      if (pendingTrades.length > 0) {
+        mismatches.push({ code: 'UNMIGRATED_TRADES', userId: plan.userId, detail: `${pendingTrades.length} valid legacy trade(s) are not in the canonical collection.` });
+      }
+      // A canonical twin with different financial fields is a reconciliation
+      // failure in its own right, independent of how locks happen to line up.
+      const conflictingOrders = plan.orders.filter(item => item.action === 'conflict');
+      const conflictingTrades = plan.trades.filter(item => item.action === 'conflict');
+      if (conflictingOrders.length > 0) {
+        mismatches.push({ code: 'CONFLICTING_ORDERS', userId: plan.userId, detail: `${conflictingOrders.length} canonical order(s) disagree with the embedded legacy record.` });
+      }
+      if (conflictingTrades.length > 0) {
+        mismatches.push({ code: 'CONFLICTING_TRADES', userId: plan.userId, detail: `${conflictingTrades.length} canonical trade(s) disagree with the embedded legacy record.` });
+      }
+
+      if (user.balance < 0) {
+        mismatches.push({ code: 'NEGATIVE_BALANCE', userId: plan.userId, detail: `balance ${user.balance}.` });
+      }
+      const expectedLockedBalance = roundTo(plan.lockedBalance);
+      const actualLockedBalance = roundTo(asFinite(user.lockedBalance, 0));
+      if (expectedLockedBalance !== actualLockedBalance) {
         mismatches.push({
-          code: 'COST_BASIS_STATUS_MISMATCH',
+          code: 'LOCKED_BALANCE_MISMATCH',
           userId: plan.userId,
-          detail: `${position.symbol} costBasisStatus ${currentStatus} != expected ${expectedStatus}.`
+          detail: `lockedBalance ${actualLockedBalance} != open BUY reservations ${expectedLockedBalance}.`
         });
       }
-      if (normalizeAvgPrice(current.avgPrice) !== normalizeAvgPrice(position.avgPrice)) {
-        mismatches.push({
-          code: 'COST_BASIS_MISMATCH',
-          userId: plan.userId,
-          detail: `${position.symbol} avgPrice ${current.avgPrice} != expected ${position.avgPrice}.`
-        });
-      }
-      if (roundTo(asFinite(current.lockedQuantity, 0)) !== roundTo(position.lockedQuantity)) {
-        mismatches.push({
-          code: 'LOCKED_QUANTITY_MISMATCH',
-          userId: plan.userId,
-          detail: `${position.symbol} lockedQuantity ${asFinite(current.lockedQuantity, 0)} != open SELL reservations ${position.lockedQuantity}.`
-        });
-      }
-      if (roundTo(asFinite(current.quantity, 0)) !== roundTo(position.quantity)) {
-        mismatches.push({
-          code: 'POSITION_QUANTITY_MISMATCH',
-          userId: plan.userId,
-          detail: `${position.symbol} quantity ${asFinite(current.quantity, 0)} != reconstructed total ${position.quantity}.`
-        });
-      }
-      const available = roundTo(position.quantity - position.lockedQuantity);
-      if (available < -EPSILON) {
-        mismatches.push({ code: 'NEGATIVE_AVAILABLE', userId: plan.userId, detail: `${position.symbol} available ${available}.` });
+
+      for (const position of plan.portfolio.positions) {
+        if (position.costBasisStatus === 'UNKNOWN' && position.quantity > 0) {
+          unknownCostBasis.push({
+            userId: plan.userId,
+            symbol: position.symbol,
+            quantity: position.quantity,
+            status: 'UNKNOWN'
+          });
+        }
+        const current = (user.portfolio || []).find(item => item.symbol === position.symbol);
+        if (!current) {
+          mismatches.push({ code: 'MISSING_POSITION', userId: plan.userId, detail: `${position.symbol} is missing from the user portfolio.` });
+          continue;
+        }
+        const currentQuantity = roundTo(asFinite(current.quantity, 0));
+        const expectedStatus = position.costBasisStatus;
+        const currentStatus = current.costBasisStatus
+          || (normalizeAvgPrice(current.avgPrice) !== null ? 'KNOWN' : (currentQuantity > 0 ? 'UNKNOWN' : 'KNOWN'));
+        if (currentStatus !== expectedStatus) {
+          mismatches.push({
+            code: 'COST_BASIS_STATUS_MISMATCH',
+            userId: plan.userId,
+            detail: `${position.symbol} costBasisStatus ${currentStatus} != expected ${expectedStatus}.`
+          });
+        }
+        if (normalizeAvgPrice(current.avgPrice) !== normalizeAvgPrice(position.avgPrice)) {
+          mismatches.push({
+            code: 'COST_BASIS_MISMATCH',
+            userId: plan.userId,
+            detail: `${position.symbol} avgPrice ${current.avgPrice} != expected ${position.avgPrice}.`
+          });
+        }
+        if (roundTo(asFinite(current.lockedQuantity, 0)) !== roundTo(position.lockedQuantity)) {
+          mismatches.push({
+            code: 'LOCKED_QUANTITY_MISMATCH',
+            userId: plan.userId,
+            detail: `${position.symbol} lockedQuantity ${asFinite(current.lockedQuantity, 0)} != open SELL reservations ${position.lockedQuantity}.`
+          });
+        }
+        if (roundTo(asFinite(current.quantity, 0)) !== roundTo(position.quantity)) {
+          mismatches.push({
+            code: 'POSITION_QUANTITY_MISMATCH',
+            userId: plan.userId,
+            detail: `${position.symbol} quantity ${asFinite(current.quantity, 0)} != reconstructed total ${position.quantity}.`
+          });
+        }
+        const available = roundTo(position.quantity - position.lockedQuantity);
+        if (available < -EPSILON) {
+          mismatches.push({ code: 'NEGATIVE_AVAILABLE', userId: plan.userId, detail: `${position.symbol} available ${available}.` });
+        }
       }
     }
   }
 
   let backup = null;
   if (backupFile) {
-    backup = await verifyBackup({ User: models.User }, backupFile);
+    backup = await verifyBackup({ User: models.User }, backupFile, { batchSize });
     if (!backup.ok) {
       mismatches.push({ code: 'BACKUP_VERIFICATION_FAILED', userId: null, detail: backup.error || 'Backup integrity check failed.' });
     }
   }
 
+  const collections = await countCollections(models);
   return {
     ok: mismatches.length === 0,
     checkedAt: new Date().toISOString(),
-    collections: dataset.counts,
-    users: plans.length,
+    collections,
+    users: usersChecked,
     migrated: {
-      orders: plans.reduce((sum, plan) => sum + plan.orders.filter(item => item.action === 'already-migrated').length, 0),
-      trades: plans.reduce((sum, plan) => sum + plan.trades.filter(item => item.action === 'already-migrated').length, 0),
-      pending: plans.reduce((sum, plan) => sum
-        + plan.orders.filter(item => item.action === 'insert').length
-        + plan.trades.filter(item => item.action === 'insert').length, 0)
+      orders: migratedOrders,
+      trades: migratedTrades,
+      pending: pendingRecords
     },
     lockReconciliation: {
-      usersChecked: plans.length,
+      usersChecked,
       mismatches: mismatches.filter(item => item.code.startsWith('LOCKED_')).length
     },
     costBasis: {
@@ -1089,23 +1174,71 @@ function backupHash(users) {
   return crypto.createHash('sha256').update(JSON.stringify(users)).digest('hex');
 }
 
-async function createBackup({ User }, file, { now = new Date() } = {}) {
-  const users = await User.collection.find({}).sort({ _id: 1 }).toArray();
-  const payload = {
-    version: BACKUP_VERSION,
-    createdAt: now.toISOString(),
-    userCount: users.length,
-    users,
-    sha256: backupHash(users)
-  };
-  await fs.promises.writeFile(file, JSON.stringify(payload, null, 2), 'utf8');
-  return {
-    file,
-    version: BACKUP_VERSION,
-    createdAt: payload.createdAt,
-    userCount: payload.userCount,
-    sha256: payload.sha256
-  };
+// The backup is streamed to a temporary file and renamed into place only after
+// the complete payload and checksum have been written. The checksum is computed
+// over the same compact users array that readBackup hashes, so backups remain
+// byte-version compatible with the existing reader.
+async function createBackup({ User }, file, { now = new Date(), batchSize = DEFAULT_BATCH_SIZE } = {}) {
+  const createdAt = now.toISOString();
+  const expectedCount = await User.collection.countDocuments({});
+  const tempFile = `${file}.tmp-${process.pid}-${Date.now()}`;
+  const hash = crypto.createHash('sha256');
+  let handle = null;
+  let streamed = 0;
+
+  try {
+    handle = await fs.promises.open(tempFile, 'w');
+    await handle.write(
+      `{\n  "version": ${BACKUP_VERSION},\n  "createdAt": ${JSON.stringify(createdAt)},\n  "userCount": ${expectedCount},\n  "users": [`
+    );
+    hash.update('[');
+
+    const cursor = User.collection.find({}).sort({ _id: 1 }).batchSize(normalizeBatchSize(batchSize));
+    for await (const user of cursor) {
+      const compact = JSON.stringify(user);
+      hash.update(streamed === 0 ? compact : `,${compact}`);
+      const pretty = JSON.stringify(user, null, 2).replace(/\n/g, '\n    ');
+      await handle.write(`${streamed === 0 ? '\n' : ',\n'}    ${pretty}`);
+      streamed += 1;
+    }
+    hash.update(']');
+
+    if (streamed !== expectedCount) {
+      throw new Error('User collection changed while the backup was being written; retry.');
+    }
+
+    const sha256 = hash.digest('hex');
+    await handle.write(`${streamed === 0 ? '' : '\n  '}],\n  "sha256": "${sha256}"\n}\n`);
+    await handle.sync();
+    await handle.close();
+    handle = null;
+
+    // Atomic replacement: the destination is untouched until the temporary
+    // file is complete.
+    await fs.promises.rename(tempFile, file);
+
+    return {
+      file,
+      version: BACKUP_VERSION,
+      createdAt,
+      userCount: streamed,
+      sha256
+    };
+  } catch (err) {
+    if (handle) {
+      try {
+        await handle.close();
+      } catch {
+        // The original error is more useful than a close failure.
+      }
+    }
+    try {
+      await fs.promises.unlink(tempFile);
+    } catch {
+      // The temporary file may not exist if opening it failed.
+    }
+    throw err;
+  }
 }
 
 function readBackup(file) {
@@ -1125,28 +1258,35 @@ function readBackup(file) {
   return { ok: true, payload };
 }
 
-async function verifyBackup({ User }, file) {
+async function verifyBackup({ User }, file, { batchSize = DEFAULT_BATCH_SIZE } = {}) {
   const read = readBackup(file);
   if (!read.ok) return read;
   const { payload } = read;
 
-  const currentUsers = await User.collection.find({}).sort({ _id: 1 }).toArray();
-  const currentById = new Map(currentUsers.map(user => [String(user._id), user]));
+  const backupById = new Map(payload.users.map(user => [String(user._id), user]));
+  const seen = new Set();
   const missingUsers = [];
   const changedEmbedded = [];
+  let currentUserCount = 0;
 
-  for (const backupUser of payload.users) {
-    const current = currentById.get(String(backupUser._id));
-    if (!current) {
-      missingUsers.push(String(backupUser._id));
-      continue;
-    }
+  const cursor = User.collection.find({}).sort({ _id: 1 }).batchSize(normalizeBatchSize(batchSize));
+  for await (const current of cursor) {
+    currentUserCount += 1;
+    const key = String(current._id);
+    const backupUser = backupById.get(key);
+    if (!backupUser) continue;
+    seen.add(key);
+
     // The embedded arrays are intentionally retained, so a correct migration
     // must leave them byte-for-byte equivalent to the backup.
     if (JSON.stringify(backupUser.pendingOrders || []) !== JSON.stringify(current.pendingOrders || [])
       || JSON.stringify(backupUser.trades || []) !== JSON.stringify(current.trades || [])) {
-      changedEmbedded.push(String(backupUser._id));
+      changedEmbedded.push(key);
     }
+  }
+
+  for (const key of backupById.keys()) {
+    if (!seen.has(key)) missingUsers.push(key);
   }
 
   return {
@@ -1155,7 +1295,7 @@ async function verifyBackup({ User }, file) {
     version: payload.version,
     createdAt: payload.createdAt,
     userCount: payload.userCount,
-    currentUserCount: currentUsers.length,
+    currentUserCount,
     missingUsers,
     changedEmbedded,
     error: missingUsers.length > 0 ? 'Backup users are missing from the database.' : null
@@ -1164,6 +1304,7 @@ async function verifyBackup({ User }, file) {
 
 module.exports = {
   BACKUP_VERSION,
+  DEFAULT_BATCH_SIZE,
   SEVERITY,
   DEFAULT_TX_OPTIONS,
   issue,
@@ -1174,8 +1315,7 @@ module.exports = {
   planHasChanges,
   summarizePlan,
   summarizePlans,
-  loadDataset,
-  planDataset,
+  iterateUserBatches,
   transactionsSupported,
   applyUserPlan,
   runMigration,
