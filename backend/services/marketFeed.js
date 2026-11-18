@@ -1,11 +1,7 @@
-const DEFAULT_SYMBOLS = Object.freeze(['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT']);
-const DEFAULT_MAX_AGE_MS = 15000;
+const { PINNED_SYMBOLS, normalizeSymbol } = require('../lib/symbols');
 
-function normalizeSymbol(symbol) {
-  if (typeof symbol !== 'string') return null;
-  const normalized = symbol.trim().toUpperCase();
-  return normalized || null;
-}
+const DEFAULT_SYMBOLS = PINNED_SYMBOLS;
+const DEFAULT_MAX_AGE_MS = 15000;
 
 function isUsablePrice(price) {
   return typeof price === 'number' && Number.isFinite(price) && price > 0;
@@ -18,6 +14,30 @@ function createMarketFeed({
 } = {}) {
   const supported = new Set(symbols.map(s => normalizeSymbol(s)).filter(Boolean));
   const quotes = new Map();
+
+  function setSymbols(symbols) {
+    if (!Array.isArray(symbols)) return Array.from(supported);
+    const next = new Set();
+    for (const item of symbols) {
+      const normalized = normalizeSymbol(item);
+      if (normalized) next.add(normalized);
+    }
+    if (next.size === 0) return Array.from(supported);
+
+    supported.clear();
+    for (const symbol of next) supported.add(symbol);
+    // A quote for a pair that is no longer in the universe must not be reused
+    // if the pair returns later; force a fresh observation instead.
+    for (const symbol of Array.from(quotes.keys())) {
+      if (!supported.has(symbol)) quotes.delete(symbol);
+    }
+    return Array.from(supported);
+  }
+
+  function hasSymbol(symbol) {
+    const normalized = normalizeSymbol(symbol);
+    return Boolean(normalized && supported.has(normalized));
+  }
 
   function setQuote(symbol, price) {
     const normalized = normalizeSymbol(symbol);
@@ -60,6 +80,8 @@ function createMarketFeed({
   return {
     setQuote,
     getQuote,
+    setSymbols,
+    hasSymbol,
     reset,
     supportedSymbols: () => Array.from(supported)
   };
@@ -73,6 +95,8 @@ module.exports = {
   marketFeed: defaultFeed,
   setQuote: defaultFeed.setQuote,
   getQuote: defaultFeed.getQuote,
+  setSymbols: defaultFeed.setSymbols,
+  hasSymbol: defaultFeed.hasSymbol,
   reset: defaultFeed.reset,
   supportedSymbols: defaultFeed.supportedSymbols,
   DEFAULT_SYMBOLS,

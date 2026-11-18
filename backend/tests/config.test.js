@@ -13,7 +13,8 @@ const {
   DEFAULT_CORS_ORIGINS,
   DEFAULT_AUTH_RATE_LIMIT_MAX,
   DEFAULT_AUTH_READ_RATE_LIMIT_MAX,
-  DEFAULT_TRADE_RATE_LIMIT_MAX
+  DEFAULT_TRADE_RATE_LIMIT_MAX,
+  DEFAULT_MARKET_READ_RATE_LIMIT_MAX
 } = require('../config/env');
 
 const LOCAL_URI = 'mongodb://127.0.0.1:27017/nexustrade_test';
@@ -121,22 +122,30 @@ describe('backend environment configuration', () => {
       max: DEFAULT_TRADE_RATE_LIMIT_MAX,
       windowMs: 60 * 1000
     });
+    expect(defaults.marketRead).toEqual({
+      max: DEFAULT_MARKET_READ_RATE_LIMIT_MAX,
+      windowMs: 60 * 1000
+    });
 
     const custom = getRateLimitConfig({
       AUTH_RATE_LIMIT_MAX: '5',
       AUTH_RATE_LIMIT_WINDOW_SECONDS: '30',
       AUTH_READ_RATE_LIMIT_MAX: '60',
       TRADE_RATE_LIMIT_MAX: '20',
-      TRADE_RATE_LIMIT_WINDOW_SECONDS: '10'
+      TRADE_RATE_LIMIT_WINDOW_SECONDS: '10',
+      MARKET_READ_RATE_LIMIT_MAX: '90',
+      MARKET_READ_RATE_LIMIT_WINDOW_SECONDS: '45'
     });
     expect(custom.auth).toEqual({ max: 5, windowMs: 30000 });
     expect(custom.authRead).toEqual({ max: 60, windowMs: 60 * 1000 });
     expect(custom.trade).toEqual({ max: 20, windowMs: 10000 });
+    expect(custom.marketRead).toEqual({ max: 90, windowMs: 45000 });
   });
 
   test('rejects invalid rate limit settings', () => {
     expect(() => getRateLimitConfig({ AUTH_RATE_LIMIT_MAX: 'abc' })).toThrow(/AUTH_RATE_LIMIT_MAX/);
     expect(() => getRateLimitConfig({ TRADE_RATE_LIMIT_WINDOW_SECONDS: '-1' })).toThrow(/TRADE_RATE_LIMIT_WINDOW_SECONDS/);
+    expect(() => getRateLimitConfig({ MARKET_READ_RATE_LIMIT_MAX: 'abc' })).toThrow(/MARKET_READ_RATE_LIMIT_MAX/);
   });
 
   test('trust proxy requires an explicit hop count', () => {

@@ -25,6 +25,15 @@ const DEFAULT_AUTH_READ_RATE_LIMIT_MAX = 120;
 const DEFAULT_AUTH_READ_RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const DEFAULT_TRADE_RATE_LIMIT_MAX = 60;
 const DEFAULT_TRADE_RATE_LIMIT_WINDOW_MS = 60 * 1000;
+// Public read endpoints (catalogue and candles). Generous enough for ordinary
+// chart navigation while still bounding upstream and CPU work per IP.
+const DEFAULT_MARKET_READ_RATE_LIMIT_MAX = 120;
+const DEFAULT_MARKET_READ_RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const DEFAULT_MARKET_UNIVERSE_SIZE = 40;
+const DEFAULT_MARKET_CACHE_TTL_SECONDS = 300;
+const DEFAULT_MARKET_FETCH_TIMEOUT_MS = 8000;
+const MIN_MARKET_UNIVERSE_SIZE = 4;
+const MAX_MARKET_UNIVERSE_SIZE = 50;
 
 class ConfigError extends Error {
   constructor(message) {
@@ -180,7 +189,44 @@ function getRateLimitConfig(env = process.env) {
         max: 86400,
         allowZero: true
       }) * 1000)
+    },
+    marketRead: {
+      max: Math.round(parseBoundedNumber(env.MARKET_READ_RATE_LIMIT_MAX, 'MARKET_READ_RATE_LIMIT_MAX', {
+        fallback: DEFAULT_MARKET_READ_RATE_LIMIT_MAX,
+        min: 0,
+        max: 100000,
+        allowZero: true
+      })),
+      windowMs: Math.round(parseBoundedNumber(env.MARKET_READ_RATE_LIMIT_WINDOW_SECONDS, 'MARKET_READ_RATE_LIMIT_WINDOW_SECONDS', {
+        fallback: DEFAULT_MARKET_READ_RATE_LIMIT_WINDOW_MS / 1000,
+        min: 0,
+        max: 86400,
+        allowZero: true
+      }) * 1000)
     }
+  };
+}
+
+function getMarketConfig(env = process.env) {
+  return {
+    universeSize: Math.round(parseBoundedNumber(env.MARKET_UNIVERSE_SIZE, 'MARKET_UNIVERSE_SIZE', {
+      fallback: DEFAULT_MARKET_UNIVERSE_SIZE,
+      min: MIN_MARKET_UNIVERSE_SIZE,
+      max: MAX_MARKET_UNIVERSE_SIZE,
+      allowZero: true
+    })),
+    cacheTtlMs: Math.round(parseBoundedNumber(env.MARKET_CACHE_TTL_SECONDS, 'MARKET_CACHE_TTL_SECONDS', {
+      fallback: DEFAULT_MARKET_CACHE_TTL_SECONDS,
+      min: 30,
+      max: 3600,
+      allowZero: true
+    }) * 1000),
+    fetchTimeoutMs: Math.round(parseBoundedNumber(env.MARKET_FETCH_TIMEOUT_MS, 'MARKET_FETCH_TIMEOUT_MS', {
+      fallback: DEFAULT_MARKET_FETCH_TIMEOUT_MS,
+      min: 500,
+      max: 30000,
+      allowZero: true
+    }))
   };
 }
 
@@ -257,6 +303,7 @@ function loadConfig(env = process.env) {
 
   const geminiApiKey = readString(env, 'GEMINI_API_KEY');
   const copilot = getCopilotConfig(env);
+  const market = getMarketConfig(env);
 
   return {
     nodeEnv,
@@ -272,6 +319,7 @@ function loadConfig(env = process.env) {
     geminiModel: copilot.geminiModel,
     geminiTimeoutMs: copilot.geminiTimeoutMs,
     copilot,
+    market,
     trustProxy: parseTrustProxy(env.TRUST_PROXY, nodeEnv),
     rateLimit: getRateLimitConfig(env),
     corsOrigins: parseCorsOrigins(env.CORS_ORIGINS)
@@ -313,6 +361,14 @@ module.exports = {
   DEFAULT_AUTH_READ_RATE_LIMIT_WINDOW_MS,
   DEFAULT_TRADE_RATE_LIMIT_MAX,
   DEFAULT_TRADE_RATE_LIMIT_WINDOW_MS,
+  DEFAULT_MARKET_READ_RATE_LIMIT_MAX,
+  DEFAULT_MARKET_READ_RATE_LIMIT_WINDOW_MS,
+  DEFAULT_MARKET_UNIVERSE_SIZE,
+  DEFAULT_MARKET_CACHE_TTL_SECONDS,
+  DEFAULT_MARKET_FETCH_TIMEOUT_MS,
+  MIN_MARKET_UNIVERSE_SIZE,
+  MAX_MARKET_UNIVERSE_SIZE,
+  getMarketConfig,
   loadAppConfig,
   loadConfig,
   getJwtSecret,

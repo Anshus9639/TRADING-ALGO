@@ -196,11 +196,12 @@ async function loadAccountView(user) {
     portfolio,
     trades,
     pendingOrders,
+    watchlist: (user.watchlist || []).filter(symbol => typeof symbol === 'string'),
     legacyAmbiguity: { pendingOrderIds, tradeIds }
   };
 }
 
-const SNAPSHOT_FIELDS = 'username email balance lockedBalance portfolio pendingOrders trades updatedAt';
+const SNAPSHOT_FIELDS = 'username email balance lockedBalance portfolio pendingOrders trades watchlist updatedAt';
 
 // The account view combines one document read with separate collection reads.
 // A trade that commits in between would produce a balance that does not match

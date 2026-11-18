@@ -1,5 +1,5 @@
 const mongoose = require('mongoose');
-const { SUPPORTED_SYMBOLS } = require('../lib/validate');
+const { SYMBOL_PATTERN } = require('../lib/symbols');
 const { ORDER_STATUSES } = require('../lib/orderState');
 
 // Canonical order records for every submission (market orders are recorded as
@@ -7,7 +7,14 @@ const { ORDER_STATUSES } = require('../lib/orderState');
 // prevents duplicate execution of the same client submission.
 const OrderSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
-  symbol: { type: String, required: true, uppercase: true, enum: SUPPORTED_SYMBOLS },
+  // Format-validated rather than enumerated: the catalogue decides which pairs
+  // are tradeable, and historical orders must remain readable after delisting.
+  symbol: {
+    type: String,
+    required: true,
+    uppercase: true,
+    match: [SYMBOL_PATTERN, 'Symbol must be an uppercase alphanumeric pair.']
+  },
   side: { type: String, required: true, enum: ['BUY', 'SELL'] },
   orderType: { type: String, required: true, enum: ['MARKET', 'LIMIT'] },
   quantity: { type: Number, required: true, min: 0.00001 },

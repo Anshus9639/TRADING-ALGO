@@ -100,12 +100,18 @@ describe('canonical order and trade models', () => {
     expect(new Order(validOrder({ orderType: 'MARKET', limitPrice: null })).validateSync()).toBeUndefined();
   });
 
-  test('rejects unknown statuses, sides, symbols, and non-positive quantities', () => {
+  test('rejects unknown statuses, sides, malformed symbols, and non-positive quantities', () => {
     expect(new Order(validOrder({ status: 'PARTIAL' })).validateSync().errors.status).toBeTruthy();
     expect(new Order(validOrder({ side: 'HOLD' })).validateSync().errors.side).toBeTruthy();
-    expect(new Order(validOrder({ symbol: 'DOGEUSDT' })).validateSync().errors.symbol).toBeTruthy();
+    expect(new Order(validOrder({ symbol: 'DOGE/USDT' })).validateSync().errors.symbol).toBeTruthy();
     expect(new Order(validOrder({ quantity: 0 })).validateSync().errors.quantity).toBeTruthy();
     expect(new Order(validOrder({ remainingQuantity: -1 })).validateSync().errors.remainingQuantity).toBeTruthy();
+  });
+
+  test('well-formed historical symbols stay persistable after leaving the catalogue', () => {
+    // Delisted pairs must remain readable and replayable, so the model only
+    // enforces symbol shape; tradeability is decided by the live universe.
+    expect(new Order(validOrder({ symbol: 'dogeusdt' })).validateSync()).toBeUndefined();
   });
 
   test('enforces one order per user and clientOrderId', async () => {

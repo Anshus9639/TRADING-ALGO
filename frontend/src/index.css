@@ -2,22 +2,165 @@
 @tailwind components;
 @tailwind utilities;
 
-body {
-  margin: 0;
-  padding: 0;
-  overflow-x: hidden;
+@layer base {
+  :root {
+    --void: 5 6 10;
+    --graphite: 10 12 18;
+    --navy: 12 16 32;
+    --panel-1: 17 20 29;
+    --panel-2: 22 26 38;
+    --panel-3: 29 34 48;
+    --line-subtle: 36 42 58;
+    --line-strong: 54 62 84;
+    --ink-primary: 238 241 248;
+    --ink-secondary: 154 163 184;
+    --ink-muted: 107 115 135;
+    --violet: 124 92 255;
+    --ultraviolet: 167 139 250;
+    --cyan: 34 211 238;
+    --aqua: 103 232 249;
+    --positive: 52 229 161;
+    --negative: 255 92 122;
+    --magenta: 244 114 182;
+    --amber: 251 191 36;
+    --blue: 96 165 250;
+    color-scheme: dark;
+  }
+
+  * {
+    border-color: rgb(var(--line-subtle));
+  }
+
+  html,
+  body,
+  #root {
+    min-height: 100%;
+  }
+
+  html {
+    background-color: rgb(var(--void));
+  }
+
+  body {
+    @apply bg-void font-sans text-ink-primary antialiased;
+    margin: 0;
+    padding: 0;
+    overflow-x: hidden;
+    background-image: theme('backgroundImage.aurora');
+    background-attachment: fixed;
+    background-repeat: no-repeat;
+  }
+
+  button,
+  input,
+  select,
+  textarea {
+    font: inherit;
+  }
+
+  input[type='number']::-webkit-outer-spin-button,
+  input[type='number']::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+
+  input[type='number'] {
+    -moz-appearance: textfield;
+  }
+
+  :focus-visible {
+    outline: 2px solid rgb(var(--cyan));
+    outline-offset: 2px;
+  }
+
+  ::selection {
+    background: rgb(var(--violet) / 0.4);
+    color: rgb(var(--ink-primary));
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
 }
 
-/* Custom scrollbar for that pro trading app look */
-::-webkit-scrollbar {
-  width: 6px;
+@layer components {
+  .panel {
+    @apply rounded-panel border border-line-subtle bg-panel-1/85 shadow-panel;
+  }
+
+  .panel-raised {
+    @apply rounded-panel border border-line-strong/70 bg-panel-2/90 shadow-lift;
+  }
+
+  .panel-header {
+    @apply flex items-center justify-between gap-3 border-b border-line-subtle px-4 py-3;
+  }
+
+  .eyebrow {
+    @apply font-mono text-[10px] font-medium uppercase tracking-[0.18em] text-ink-muted;
+  }
+
+  .metric {
+    @apply font-mono tabular-nums tracking-tight;
+  }
+
+  .control {
+    @apply rounded-md border border-line-subtle bg-panel-2/80 px-3 py-2 text-sm text-ink-primary transition-colors duration-150 hover:border-line-strong focus:border-cyan/60 focus:outline-none;
+  }
 }
 
-::-webkit-scrollbar-track {
-  background: #161a1e;
-}
+@layer utilities {
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
 
-::-webkit-scrollbar-thumb {
-  background: #2b3139;
-  border-radius: 10px;
+  .scrollbar-thin {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(var(--line-strong)) transparent;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background: rgb(var(--line-strong));
+    border-radius: 999px;
+  }
+
+  .no-scrollbar {
+    scrollbar-width: none;
+  }
+
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+
+  .safe-bottom {
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+
+  .safe-top {
+    padding-top: env(safe-area-inset-top);
+  }
+
+  .text-glow-violet {
+    text-shadow: 0 0 22px rgb(var(--violet) / 0.45);
+  }
+
+  .text-glow-cyan {
+    text-shadow: 0 0 20px rgb(var(--cyan) / 0.35);
+  }
 }

@@ -6,6 +6,7 @@ const {
   validateNotional
 } = require('../../lib/validate');
 const { roundTo, floorTo, MIN_QUANTITY, DECIMALS } = require('../../lib/numbers');
+const { floorToStep, hasUsableMarketRules, checkMarketRules } = require('../../lib/exchangeFilters');
 
 // The LLM is an untrusted extractor. This is the complete set of properties it
 // may return; anything else (urls, endpoints, prices, user ids) is rejected.
@@ -187,6 +188,19 @@ function resolveIntent({ modelIntent, context } = {}) {
 
   const warnings = [];
   let quantity = modelIntent.quantity;
+  const rules = typeof context.marketRulesFor === 'function'
+    ? context.marketRulesFor(symbol)
+    : null;
+
+  // A proposal is only built for a pair whose exchange rules are known: the
+  // preview quantity and minimum value must be executable as shown, and
+  // falling back to global limits would promise terms the market may reject.
+  if (typeof context.marketRulesFor === 'function' && !hasUsableMarketRules(rules)) {
+    return invalid(
+      'MARKET_RULES_UNAVAILABLE',
+      `Trading is temporarily unavailable for ${symbol} because exchange rules could not be verified.`
+    );
+  }
 
   if (modelIntent.allAvailable) {
     const available = Number(context.holdings?.[symbol]) || 0;
@@ -222,6 +236,22 @@ function resolveIntent({ modelIntent, context } = {}) {
     }
   }
 
+  // A size the server derived (notional or "all available") is floored onto the
+  // market step grid so the preview is executable as shown. An explicitly
+  // requested quantity is never adjusted here; it is validated as given.
+  if (modelIntent.quantity === null) {
+    const stepSize = rules && rules.stepSize;
+    const floored = floorToStep(quantity, stepSize);
+    if (floored !== quantity) {
+      quantity = floored;
+      warnings.push(`Quantity was floored to ${floored} to match the ${stepSize} market step size.`);
+    }
+    if (!(quantity > 0)) {
+      const minimum = rules && rules.minQty ? rules.minQty : MIN_QUANTITY;
+      return invalid('INVALID_INTENT', `The requested amount is below the market minimum of ${minimum}.`);
+    }
+  }
+
   const quantityCheck = validateQuantity(quantity);
   if (!quantityCheck.ok) {
     return invalid(
@@ -236,6 +266,16 @@ function resolveIntent({ modelIntent, context } = {}) {
   const notionalCheck = validateNotional(quantity, priceForSizing);
   if (!notionalCheck.ok) return invalid('INVALID_INTENT', notionalCheck.error);
   const estimatedValue = notionalCheck.value;
+
+  // Market orders settle at the feed's observation, so only their derived value
+  // and lot size are checked here; a LIMIT price must also sit on the tick grid.
+  const rulesCheck = checkMarketRules({
+    quantity,
+    price: priceForSizing,
+    rules,
+    enforceTick: orderType === 'LIMIT'
+  });
+  if (!rulesCheck.ok) return invalid('INVALID_INTENT', rulesCheck.error);
 
   const balance = Number(context.balance) || 0;
   const availableQuantity = Number(context.holdings?.[symbol]) || 0;

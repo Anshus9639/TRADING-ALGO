@@ -7,9 +7,12 @@ const auth = require('../middleware/auth');
 const { rateLimitOptions } = require('../middleware/rateLimit');
 const { getJwtSecret, getRateLimitConfig } = require('../config/env');
 const { loadConsistentAccountView } = require('../services/accountView');
+const { validateSymbolFormat } = require('../lib/validate');
+const { symbolUniverse } = require('../services/symbolUniverse');
 
 const MAX_EMAIL_LENGTH = 254;
 const MAX_USERNAME_LENGTH = 50;
+const MAX_WATCHLIST_SYMBOLS = 25;
 // bcrypt only considers the first 72 UTF-8 bytes. Enforcing the limit on signup
 // prevents silently truncated credentials.
 const MAX_PASSWORD_LENGTH = 72;
@@ -17,7 +20,7 @@ const MAX_PASSWORD_LENGTH = 72;
 // loaded for session restoration; an exclusion projection would still fetch a
 // document the hash analysis treats as password-bearing. `updatedAt` lets the
 // view detect an account write that raced its collection reads.
-const ACCOUNT_VIEW_FIELDS = 'username email balance lockedBalance portfolio pendingOrders trades updatedAt';
+const ACCOUNT_VIEW_FIELDS = 'username email balance lockedBalance portfolio pendingOrders trades watchlist updatedAt';
 // New accounts must use a dotted domain. Accounts created before this rule may
 // hold a local-only domain (for example "trader@localhost"); login accepts any
 // single @ with a non-empty local part so those owners can still authenticate.
@@ -68,8 +71,35 @@ async function buildUserPayload(user) {
     lockedBalance: view.lockedBalance,
     portfolio: view.portfolio,
     trades: view.trades,
-    pendingOrders: view.pendingOrders
+    pendingOrders: view.pendingOrders,
+    watchlist: view.watchlist
   };
+}
+
+// The watchlist accepts only symbols the catalogue currently trades. Format is
+// checked first so a malformed entry reports its own error instead of being
+// silently dropped.
+function parseWatchlist(input) {
+  if (!Array.isArray(input)) {
+    return { ok: false, error: 'Watchlist must be an array of symbols.' };
+  }
+  if (input.length > MAX_WATCHLIST_SYMBOLS) {
+    return { ok: false, error: `Watchlist supports at most ${MAX_WATCHLIST_SYMBOLS} symbols.` };
+  }
+
+  const symbols = [];
+  const seen = new Set();
+  for (const entry of input) {
+    const formatCheck = validateSymbolFormat(entry);
+    if (!formatCheck.ok) return { ok: false, error: formatCheck.error };
+    if (!symbolUniverse.isActive(formatCheck.value)) {
+      return { ok: false, error: `Unsupported symbol: ${formatCheck.value}.` };
+    }
+    if (seen.has(formatCheck.value)) continue;
+    seen.add(formatCheck.value);
+    symbols.push(formatCheck.value);
+  }
+  return { ok: true, value: symbols };
 }
 
 function createAuthRouter({ rateLimits = getRateLimitConfig() } = {}) {
@@ -100,6 +130,48 @@ function createAuthRouter({ rateLimits = getRateLimitConfig() } = {}) {
     } catch (err) {
       console.error("Auth Me Error:", err.message);
       res.status(500).send("Server Error");
+    }
+  });
+
+  // @route    GET api/auth/watchlist
+  // @desc     Read the caller's pinned market symbols
+  // @access   Private
+  router.get('/watchlist', readLimiter, auth, async (req, res) => {
+    try {
+      const user = await User.findById(req.user.id, 'watchlist').lean();
+      if (!user) return res.status(404).json({ msg: 'User not found' });
+      res.json({ symbols: (user.watchlist || []).filter(symbol => typeof symbol === 'string') });
+    } catch (err) {
+      console.error('Watchlist read error:', err.message);
+      res.status(500).send('Server Error');
+    }
+  });
+
+  // @route    PUT api/auth/watchlist
+  // @desc     Replace the caller's pinned market symbols
+  // @access   Private
+  router.put('/watchlist', readLimiter, auth, async (req, res) => {
+    try {
+      const body = readBodyObject(req.body);
+      const parsed = parseWatchlist(body.symbols);
+      if (!parsed.ok) {
+        return res.status(400).json({
+          success: false,
+          code: 'INVALID_WATCHLIST',
+          message: parsed.error
+        });
+      }
+
+      const result = await User.updateOne(
+        { _id: req.user.id },
+        { $set: { watchlist: parsed.value } }
+      );
+      if (result.matchedCount === 0) return res.status(404).json({ msg: 'User not found' });
+
+      res.json({ symbols: parsed.value });
+    } catch (err) {
+      console.error('Watchlist update error:', err.message);
+      res.status(500).send('Server Error');
     }
   });
 

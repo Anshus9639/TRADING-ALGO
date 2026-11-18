@@ -1,19 +1,21 @@
 const express = require('express');
 const cors = require('cors');
-const axios = require('axios');
+const { rateLimit } = require('express-rate-limit');
 const { marketFeed } = require('./services/marketFeed');
 const { createTradeRouter } = require('./routes/trade');
 const { createCopilotRouter } = require('./routes/copilot');
 const { createAuthRouter } = require('./routes/auth');
-const { loadAppConfig } = require('./config/env');
+const { createMarketRouter } = require('./routes/market');
+const { createHistoryFetcher } = require('./services/marketHistory');
+const { normalizeChartInterval } = require('./lib/chartIntervals');
+const { validateSymbolFormat } = require('./lib/validate');
+const { symbolUniverse } = require('./services/symbolUniverse');
+const { loadAppConfig, getRateLimitConfig } = require('./config/env');
+const { rateLimitOptions } = require('./middleware/rateLimit');
 
 // App-only configuration: does not require database or JWT secrets, so isolated
 // tests can import this factory without a full environment.
 const { corsOrigins, trustProxy } = loadAppConfig();
-
-// An external history request must never hold a Node request handler open
-// indefinitely; Binance can accept a connection and then stall.
-const HISTORY_FETCH_TIMEOUT_MS = 10000;
 
 const corsOptions = {
   origin: corsOrigins,
@@ -26,10 +28,22 @@ function createApp({
   copilot = {},
   runtimeStatus = null,
   auth: authOptions = {},
-  trade: tradeOptions = {}
+  trade: tradeOptions = {},
+  market = null,
+  marketReadRateLimit = null,
+  history = null
 } = {}) {
   const app = express();
   app.set('trust proxy', trustProxy);
+  const historyFetcher = history || createHistoryFetcher();
+  const readLimitConfig = marketReadRateLimit || getRateLimitConfig().marketRead;
+  const historyLimiter = readLimitConfig.max > 0 && readLimitConfig.windowMs > 0
+    ? rateLimit(rateLimitOptions({
+      ...readLimitConfig,
+      message: 'Too many chart requests. Please wait and retry.'
+    }))
+    : (_req, _res, next) => next();
+
 
   // Apply to Express
   app.use(cors(corsOptions));
@@ -37,8 +51,12 @@ function createApp({
 
   // --- ROUTES ---
   app.use('/api/auth', createAuthRouter(authOptions));
-  app.use('/api/trade', createTradeRouter({ feed, runtimeStatus, ...tradeOptions }));
-  app.use('/api/copilot', createCopilotRouter({ feed, ...copilot, runtimeStatus }));
+  app.use('/api/trade', createTradeRouter({ feed, runtimeStatus, market, ...tradeOptions }));
+  app.use('/api/copilot', createCopilotRouter({ feed, ...copilot, runtimeStatus, market }));
+  app.use('/api/market', createMarketRouter({
+    market,
+    rateLimit: readLimitConfig
+  }));
 
   // Liveness never depends on downstream components: it only proves the HTTP
   // process is alive. Readiness reports safe component codes and is served
@@ -74,24 +92,40 @@ function createApp({
     });
   });
 
-  // 3. FIXED HISTORY (The "Pattern" Fix)
-  app.get('/api/history/:symbol', async (req, res) => {
+  // Candles are only served for symbols the catalogue currently trades and for
+  // a fixed interval allowlist, so the endpoint cannot proxy arbitrary Binance
+  // paths. The limiter bounds per-IP request volume; the response advertises
+  // exactly the lifetime of the fetcher's own short-lived cache.
+  app.get('/api/history/:symbol', historyLimiter, async (req, res) => {
+    const symbolCheck = validateSymbolFormat(req.params.symbol);
+    if (!symbolCheck.ok || !symbolUniverse.isActive(symbolCheck.value)) {
+      return res.status(400).json({ error: 'Unsupported symbol.' });
+    }
+
+    const requested = req.query.interval;
+    const interval = requested === undefined ? '1m' : normalizeChartInterval(requested);
+    if (!interval) {
+      return res.status(400).json({ error: 'Unsupported interval.' });
+    }
+
     try {
-      const { symbol } = req.params;
-      // 🚀 Look for the interval in the URL query, default to 1m
-      const interval = req.query.interval || '1m';
-
-      const response = await axios.get(
-        `https://api.binance.us/api/v3/klines?symbol=${symbol.toUpperCase()}&interval=${interval}&limit=500`,
-        { timeout: HISTORY_FETCH_TIMEOUT_MS }
-      );
-
-      const formattedData = response.data.map(d => ({
+      const raw = await historyFetcher.fetchKlines({ symbol: symbolCheck.value, interval });
+      const ttlSeconds = Math.max(0, Math.floor(
+        (Number.isFinite(historyFetcher.ttlMs) ? historyFetcher.ttlMs : 0) / 1000
+      ));
+      if (ttlSeconds > 0) {
+        res.set(
+          'Cache-Control',
+          `public, max-age=${ttlSeconds}, stale-while-revalidate=${ttlSeconds * 2}`
+        );
+      }
+      const formattedData = raw.map(d => ({
         time: Math.floor(d[0] / 1000),
         open: parseFloat(d[1]),
         high: parseFloat(d[2]),
         low: parseFloat(d[3]),
         close: parseFloat(d[4]),
+        volume: Number.isFinite(parseFloat(d[5])) ? parseFloat(d[5]) : null,
       }));
 
       res.json(formattedData);

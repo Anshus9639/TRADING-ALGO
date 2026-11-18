@@ -1,5 +1,7 @@
 const { createMarketFeed } = require('../services/marketFeed');
 const { createTradeService } = require('../services/tradeService');
+const { symbolUniverse } = require('../services/symbolUniverse');
+const { PINNED_SYMBOLS } = require('../lib/symbols');
 const Order = require('../models/Order');
 const Trade = require('../models/Trade');
 const {
@@ -389,5 +391,89 @@ describe('trade service market execution', () => {
     expect(conflict.status).toBe(409);
     expect(conflict.body.code).toBe('IDEMPOTENCY_CONFLICT');
     expect(await Order.countDocuments({ userId: user._id, clientOrderId: key })).toBe(1);
+  });
+});
+
+describe('dynamic universe replay', () => {
+  beforeAll(async () => {
+    await startTestDb();
+  }, 120000);
+
+  afterAll(async () => {
+    await stopTestDb();
+  });
+
+  afterEach(() => {
+    symbolUniverse.reset();
+  });
+
+  function dynamicFeed(symbols) {
+    const created = createMarketFeed({ symbols });
+    created.setQuote('DOGEUSDT', 0.5);
+    return created;
+  }
+
+  test('a market retry for a delisted pair replays the committed order instead of failing', async () => {
+    const user = await createTestUser({ balance: 10000 });
+    const symbols = [...PINNED_SYMBOLS, 'DOGEUSDT'];
+    symbolUniverse.setActive(symbols);
+
+    const service = createTradeService({ feed: dynamicFeed(symbols) });
+    const params = {
+      userId: user._id,
+      side: 'BUY',
+      symbol: 'DOGEUSDT',
+      quantity: 100,
+      clientOrderId: 'retry-delisted-market'
+    };
+
+    const original = await service.executeMarketOrder(params);
+    expect(original.status).toBe(200);
+
+    symbolUniverse.setActive(PINNED_SYMBOLS);
+    const afterShrink = createTradeService({ feed: dynamicFeed(PINNED_SYMBOLS) });
+
+    const retry = await afterShrink.executeMarketOrder(params);
+    expect(retry.status).toBe(200);
+    expect(retry.body.idempotent).toBe(true);
+    expect(await Order.countDocuments({ userId: user._id })).toBe(1);
+    expect(await Trade.countDocuments({ userId: user._id })).toBe(1);
+
+    const newOrder = await afterShrink.executeMarketOrder({
+      ...params,
+      clientOrderId: 'new-order-after-delist'
+    });
+    expect(newOrder.status).toBe(400);
+    expect(newOrder.body.message).toContain('Unsupported symbol');
+  });
+
+  test('a limit retry for a delisted pair replays without reserving escrow twice', async () => {
+    const user = await createTestUser({ balance: 1000 });
+    const symbols = [...PINNED_SYMBOLS, 'DOGEUSDT'];
+    symbolUniverse.setActive(symbols);
+
+    const service = createTradeService({ feed: dynamicFeed(symbols) });
+    const params = {
+      userId: user._id,
+      side: 'BUY',
+      symbol: 'DOGEUSDT',
+      quantity: 100,
+      limitPrice: 0.4,
+      clientOrderId: 'retry-delisted-limit'
+    };
+
+    const original = await service.placeLimitOrder(params);
+    expect(original.status).toBe(200);
+    const beforeRetry = await snapshotUser(user._id);
+    expect(beforeRetry.lockedBalance).toBe(40);
+
+    symbolUniverse.setActive(PINNED_SYMBOLS);
+    const afterShrink = createTradeService({ feed: dynamicFeed(PINNED_SYMBOLS) });
+
+    const retry = await afterShrink.placeLimitOrder(params);
+    expect(retry.status).toBe(200);
+    expect(retry.body.idempotent).toBe(true);
+    expect(await snapshotUser(user._id)).toEqual(beforeRetry);
+    expect(await Order.countDocuments({ userId: user._id })).toBe(1);
   });
 });

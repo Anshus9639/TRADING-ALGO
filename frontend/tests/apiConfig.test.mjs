@@ -152,7 +152,10 @@ test('frontend sources use the centralized API helpers only', () => {
     '../src/components/Auth.jsx',
     '../src/components/QuickOrder.jsx',
     '../src/components/AICopilot.jsx',
-    '../src/components/ActivityDashboard.jsx'
+    '../src/components/ActivityDashboard.jsx',
+    '../src/hooks/useMarketCatalogue.js',
+    '../src/hooks/useWatchlist.js',
+    '../src/hooks/useMarketStream.js'
   ];
 
   for (const file of files) {
@@ -165,6 +168,11 @@ test('frontend sources use the centralized API helpers only', () => {
     assert.ok(!source.includes("from 'axios'"), `${file} bypasses the shared axios client`);
   }
 
+  // The socket moved out of App into the market-stream hook, which must still
+  // build it from the configured origin instead of a hardcoded URL.
+  const streamSource = readFileSync(new URL('../src/hooks/useMarketStream.js', import.meta.url), 'utf8');
+  assert.match(streamSource, /io\(API_ORIGIN\)/);
+  assert.match(streamSource, /from '\.\.\/lib\/api'/);
   const appSource = readFileSync(new URL('../src/App.jsx', import.meta.url), 'utf8');
-  assert.match(appSource, /io\(API_ORIGIN\)/);
+  assert.ok(!appSource.includes('socket.io-client'), 'App must not create its own socket');
 });

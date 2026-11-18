@@ -5,5 +5,8 @@ coverage/
 .env.local
 .env.*
 !.env.example
+# The Playwright preview points at 127.0.0.1 only; safe to track so the e2e
+# harness is reproducible.
+!.env.e2e
 *.local
 *.log

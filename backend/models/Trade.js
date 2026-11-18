@@ -1,5 +1,5 @@
 const mongoose = require('mongoose');
-const { SUPPORTED_SYMBOLS } = require('../lib/validate');
+const { SYMBOL_PATTERN } = require('../lib/symbols');
 
 // Append-only execution ledger. Trades are never updated or deleted by the
 // application; the embedded user.trades array is retained only for legacy
@@ -7,7 +7,12 @@ const { SUPPORTED_SYMBOLS } = require('../lib/validate');
 const TradeSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
   orderId: { type: mongoose.Schema.Types.ObjectId, ref: 'Order', default: null },
-  symbol: { type: String, required: true, uppercase: true, enum: SUPPORTED_SYMBOLS },
+  symbol: {
+    type: String,
+    required: true,
+    uppercase: true,
+    match: [SYMBOL_PATTERN, 'Symbol must be an uppercase alphanumeric pair.']
+  },
   side: { type: String, required: true, enum: ['BUY', 'SELL'] },
   quantity: { type: Number, required: true, min: 0.00001 },
   executionPrice: { type: Number, required: true, min: 0 },

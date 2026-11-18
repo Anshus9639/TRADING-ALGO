@@ -12,7 +12,7 @@ const {
   resolveIntent,
   revalidateStoredIntent
 } = require('../services/ai/intent');
-const { SUPPORTED_SYMBOLS } = require('../lib/validate');
+const { symbolUniverse } = require('../services/symbolUniverse');
 const { roundTo } = require('../lib/numbers');
 
 const MAX_PROMPT_LENGTH = 500;
@@ -99,6 +99,7 @@ function pendingExecution() {
 function createCopilotRouter({
   feed,
   runtimeStatus = null,
+  market = null,
   ai = null,
   proposalStore = null,
   now = Date.now,
@@ -123,10 +124,19 @@ function createCopilotRouter({
     ? runtime.usdInrRate
     : (Number.isFinite(usdInrRate) && usdInrRate > 0 ? usdInrRate : null);
   const store = proposalStore || createProposalStore({ now, ttlMs: runtime.proposalTtlMs });
+  // Resolved per call: the catalogue is attached after the app is built and its
+  // active set changes on every refresh. A market context also makes complete
+  // exchange filters mandatory, so a proposal is never built (and an execution
+  // never settles) for a pair whose rules cannot be verified.
+  const marketRulesFor = market
+    ? symbol => (market.catalogue && typeof market.catalogue.getSymbol === 'function'
+      ? market.catalogue.getSymbol(symbol)
+      : null)
+    : null;
   // Share the router clock so settlement-time quote-age checks use the same
   // timeline as the proposal store and market feed.
   const tradeService = tradeServiceOverride
-    || createTradeService({ feed, User: UserModel, runtimeStatus, now });
+    || createTradeService({ feed, User: UserModel, runtimeStatus, getMarketRules: marketRulesFor, now });
 
   const limits = rateLimit || runtime.rateLimit;
   const copilotLimiter = limits.max > 0 && limits.windowMs > 0
@@ -191,7 +201,7 @@ function createCopilotRouter({
         ])
       );
       const quotes = {};
-      for (const symbol of SUPPORTED_SYMBOLS) {
+      for (const symbol of symbolUniverse.listActive()) {
         const quote = feed.getQuote(symbol);
         if (quote.status === 'ok') quotes[symbol] = { price: quote.price, ts: quote.ts };
       }
@@ -232,6 +242,7 @@ function createCopilotRouter({
           balance: user.balance,
           holdings,
           quoteFor: symbol => feed.getQuote(symbol),
+          marketRulesFor,
           usdInrRate: configuredInrRate,
           maxPriceDriftPct: driftThreshold
         }
@@ -249,6 +260,13 @@ function createCopilotRouter({
           return res.status(503).json({
             success: false,
             code: 'PRICE_UNAVAILABLE',
+            message: resolved.message
+          });
+        }
+        if (resolved.code === 'MARKET_RULES_UNAVAILABLE') {
+          return res.status(503).json({
+            success: false,
+            code: 'MARKET_RULES_UNAVAILABLE',
             message: resolved.message
           });
         }

@@ -310,4 +310,86 @@ describe('trade routes', () => {
       expect(after.pendingOrders).toEqual([]);
     });
   });
+
+  describe('exchange rule availability', () => {
+    const RULES = {
+      tickSize: 0.5,
+      stepSize: 0.001,
+      minQty: 0.001,
+      minNotional: 10
+    };
+
+    function appWithRules(entry) {
+      return createApp({
+        feed,
+        market: { catalogue: { getSymbol: () => entry } }
+      });
+    }
+
+    test('rejects a new market order when the catalogue has no entry', async () => {
+      const rulesApp = appWithRules(null);
+      const user = await createTestUser({ balance: 10000 });
+      const token = authToken(user);
+      const before = await snapshotUser(user._id);
+
+      const res = await postTrade(rulesApp, token, '/api/trade/buy', {
+        symbol: 'BTCUSDT',
+        quantity: 0.1
+      });
+
+      expect(res.status).toBe(503);
+      expect(res.body).toEqual({
+        success: false,
+        code: 'MARKET_RULES_UNAVAILABLE',
+        message: expect.stringContaining('Trading is temporarily unavailable')
+      });
+      expect(await snapshotUser(user._id)).toEqual(before);
+    });
+
+    test('rejects a new limit order when the catalogue only has fallback data', async () => {
+      const rulesApp = appWithRules({
+        symbol: 'BTCUSDT',
+        status: 'UNKNOWN',
+        tickSize: null,
+        stepSize: null,
+        minQty: null,
+        minNotional: null
+      });
+      const user = await createTestUser({ balance: 10000 });
+      const token = authToken(user);
+      const before = await snapshotUser(user._id);
+
+      const res = await postTrade(rulesApp, token, '/api/trade/limit', {
+        symbol: 'BTCUSDT',
+        type: 'BUY',
+        quantity: 0.1,
+        limitPrice: 40000
+      });
+
+      expect(res.status).toBe(503);
+      expect(res.body.code).toBe('MARKET_RULES_UNAVAILABLE');
+      expect(await snapshotUser(user._id)).toEqual(before);
+    });
+
+    test('accepts orders when the catalogue publishes complete rules', async () => {
+      const rulesApp = appWithRules({ symbol: 'BTCUSDT', ...RULES });
+      const user = await createTestUser({ balance: 10000 });
+      const token = authToken(user);
+
+      const market = await postTrade(rulesApp, token, '/api/trade/buy', {
+        symbol: 'BTCUSDT',
+        quantity: 0.1
+      });
+      expect(market.status).toBe(200);
+
+      const limit = await postTrade(rulesApp, token, '/api/trade/limit', {
+        symbol: 'BTCUSDT',
+        type: 'BUY',
+        quantity: 0.1,
+        limitPrice: 40000
+      });
+      expect(limit.status).toBe(200);
+      expect(limit.body.balance).toBe(1000);
+    });
+  });
 });

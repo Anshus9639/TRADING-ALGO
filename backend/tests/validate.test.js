@@ -1,10 +1,12 @@
 const {
   validateSymbol,
+  validateSymbolFormat,
   validateSide,
   validateQuantity,
   validateLimitPrice,
   validateNotional
 } = require('../lib/validate');
+const { symbolUniverse } = require('../services/symbolUniverse');
 const {
   roundTo,
   decimalPlaces,
@@ -29,6 +31,25 @@ describe('validateSymbol', () => {
   test('rejects unsupported and malformed symbols', () => {
     for (const symbol of ['DOGEUSDT', '', '   ', null, undefined, 123, {}]) {
       expect(validateSymbol(symbol).ok).toBe(false);
+    }
+  });
+
+  test('follows the active universe instead of a fixed list', () => {
+    symbolUniverse.setActive(['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'DOGEUSDT']);
+    try {
+      expect(validateSymbol('dogeusdt')).toEqual({ ok: true, value: 'DOGEUSDT' });
+      expect(validateSymbol('ADAUSDT').ok).toBe(false);
+      expect(validateSymbol('ADAUSDT').error).toContain('DOGEUSDT');
+    } finally {
+      symbolUniverse.reset();
+    }
+  });
+
+  test('format validation stays independent of the active universe', () => {
+    symbolUniverse.setActive(['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT']);
+    expect(validateSymbolFormat('DOGEUSDT')).toEqual({ ok: true, value: 'DOGEUSDT' });
+    for (const symbol of ['', 'DOGE', 'DOGE/USDT', null, 42]) {
+      expect(validateSymbolFormat(symbol).ok).toBe(false);
     }
   });
 });

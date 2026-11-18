@@ -1,7 +1,6 @@
 const http = require('http');
 const { Server } = require('socket.io');
 const mongoose = require('mongoose');
-const WebSocket = require('ws');
 
 const { loadConfig } = require('./config/env');
 
@@ -14,7 +13,10 @@ try {
 }
 
 const { createApp, corsOptions } = require('./app');
-const { marketFeed, setQuote } = require('./services/marketFeed');
+const { marketFeed } = require('./services/marketFeed');
+const { createMarketCatalogue } = require('./services/marketCatalogue');
+const { createMarketStream } = require('./services/marketStream');
+const { symbolUniverse } = require('./services/symbolUniverse');
 const { createMatcher } = require('./services/matcher');
 const { createTradeService } = require('./services/tradeService');
 const { findLegacyOrderBlockers } = require('./services/legacyOrders');
@@ -26,7 +28,10 @@ const User = require('./models/User');
 const Order = require('./models/Order');
 
 const runtimeStatus = createRuntimeStatus();
-const app = createApp({ runtimeStatus });
+let matcherTimer = null;
+// Filled with the catalogue instance below; the route resolves it per request.
+const marketContext = { catalogue: null };
+const app = createApp({ runtimeStatus, market: marketContext });
 
 const server = http.createServer(app);
 
@@ -34,6 +39,57 @@ const server = http.createServer(app);
 const io = new Server(server, { 
   cors: corsOptions 
 });
+
+// --- MARKET DATA ---
+// The catalogue decides which pairs are tradeable; the stream carries tickers
+// for that whole set plus candle/depth for whatever clients are viewing.
+const marketCatalogue = createMarketCatalogue({
+  universe: symbolUniverse,
+  ttlMs: config.market.cacheTtlMs,
+  timeoutMs: config.market.fetchTimeoutMs,
+  limit: config.market.universeSize,
+  onUpdate: applyCatalogue
+});
+
+const marketStream = createMarketStream({
+  io,
+  feed: marketFeed,
+  symbols: symbolUniverse.listActive()
+});
+marketContext.catalogue = marketCatalogue;
+
+function applyCatalogue(next) {
+  const symbols = next.symbols.map(market => market.symbol);
+  marketFeed.setSymbols(symbols);
+  marketStream.setSymbols(symbols);
+}
+
+io.on('connection', socket => {
+  let focus = null;
+
+  socket.on('market:focus', payload => {
+    const result = marketStream.acquireFocus(payload || {});
+    if (!result.ok) {
+      socket.emit('marketStatus', { status: 'focus_rejected', code: result.code });
+      return;
+    }
+    if (focus) marketStream.releaseFocus(focus);
+    focus = { symbol: result.symbol, interval: result.interval };
+    socket.emit('marketStatus', {
+      status: 'focused',
+      symbol: result.symbol,
+      interval: result.interval
+    });
+  });
+
+  socket.on('disconnect', () => {
+    if (focus) marketStream.releaseFocus(focus);
+    focus = null;
+  });
+});
+
+marketCatalogue.start({ intervalMs: config.market.cacheTtlMs });
+marketStream.start();
 
 // --- DATABASE ---
 // Trading requires multi-document transactions, which need a replica set.
@@ -107,7 +163,7 @@ mongoose.connect(config.mongoUri)
         tradeService
       });
 
-      setInterval(async () => {
+      matcherTimer = setInterval(async () => {
         try {
           const stats = await matcher.runCycle();
           // A skipped cycle proves nothing about recovery: the previous cycle
@@ -141,58 +197,34 @@ mongoose.connect(config.mongoUri)
     runtimeStatus.setStartupComplete(true);
   });
 
-// --- BINANCE WS BRIDGE (SELF-HEALING) ---
-const SYMBOLS = ['btcusdt', 'ethusdt', 'solusdt', 'bnbusdt'];
-let binanceConn;
-
-const connectBinance = () => {
-  const streams = [
-    ...SYMBOLS.map(s => `${s.toLowerCase()}@ticker`),
-    ...SYMBOLS.map(s => `${s.toLowerCase()}@kline_1m`),
-    ...SYMBOLS.map(s => `${s.toLowerCase()}@depth5`)
-  ].join('/');
-
-  binanceConn = new WebSocket(`wss://stream.binance.us:9443/stream?streams=${streams}`);
-
-  binanceConn.on('message', (data) => {
-    try {
-      const rawData = JSON.parse(data);
-      const msg = rawData.data || rawData;
-
-      if (msg.e === '24hrTicker') {
-        const currentPrice = parseFloat(msg.c);
-        if (setQuote(msg.s, currentPrice)) {
-          io.emit('marketUpdate', { symbol: msg.s, price: currentPrice.toFixed(2), change: msg.P });
-        }
-      } 
-      else if (msg.e === 'kline') {
-        io.emit('candleUpdate', { 
-          symbol: msg.s, 
-          time: Math.floor(msg.k.t / 1000), 
-          open: parseFloat(msg.k.o), 
-          high: parseFloat(msg.k.h), 
-          low: parseFloat(msg.k.l), 
-          close: parseFloat(msg.k.c) 
-        });
-      }
-      else if (msg.b || msg.bids) {
-        const streamName = rawData.stream || "";
-        const symbol = (msg.s || streamName.split('@')[0] || 'BTCUSDT').toUpperCase();
-        
-        io.emit('depthUpdate', { symbol, bids: (msg.b || msg.bids).slice(0, 8), asks: (msg.a || msg.asks).slice(0, 8) });
-      }
-    } catch (e) {}
-  });
-
-  binanceConn.on('error', (err) => console.error("WS Error:", err.message));
-  binanceConn.on('close', () => {
-    console.log("🔌 Reconnecting to Binance...");
-    setTimeout(connectBinance, 5000);
-  });
-};
-connectBinance();
-
 // --- ROUTES ---
 // Mounted in ./app.js (the Express app is imported above).
 
 server.listen(config.port, () => console.log(`🚀 Running on ${config.port}`));
+
+// Graceful shutdown: hosts signal intent before replacing an instance. Stop
+// scheduling work, release the exchange socket and catalogue timer, then close
+// the database handle. A force timer bounds a stuck connection drain.
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`⚠️ Received ${signal}; shutting down.`);
+
+  if (matcherTimer) clearInterval(matcherTimer);
+  matcherTimer = null;
+  marketCatalogue.stop();
+  marketStream.stop();
+
+  const forceExit = setTimeout(() => process.exit(1), 10000);
+  if (typeof forceExit.unref === 'function') forceExit.unref();
+
+  io.close(() => {
+    mongoose.connection.close(false)
+      .then(() => process.exit(0))
+      .catch(() => process.exit(1));
+  });
+}
+
+process.once('SIGTERM', () => shutdown('SIGTERM'));
+process.once('SIGINT', () => shutdown('SIGINT'));
