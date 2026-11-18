@@ -47,6 +47,17 @@ function partialFilterMatches(index) {
     && Object.keys(value).length === 1;
 }
 
+// A collection may hold several indexes with the same key pattern (for example
+// an older non-unique one next to the required unique index). Only an index
+// that also carries every required property proves the guarantee; the first
+// key-pattern match is used for reporting when none does.
+function selectIndex(indexes, matchesKey, isComplete) {
+  const candidates = indexes.filter(index => matchesKey(index.key));
+  if (candidates.length === 0) return { match: null, complete: false };
+  const complete = candidates.find(isComplete);
+  return { match: complete || candidates[0], complete: Boolean(complete) };
+}
+
 async function readIndexes(collection) {
   try {
     return await collection.indexes();
@@ -83,7 +94,23 @@ async function findInvalidClientOrderIds(collection) {
   };
   const malformedFilter = {
     clientOrderId: { $type: 'string' },
-    $expr: { $not: { $regexMatch: { input: '$clientOrderId', regex: CLIENT_ORDER_ID_PATTERN.source } } }
+    $expr: {
+      $not: {
+        $regexMatch: {
+          // $type: 'string' also matches an array containing a string, but
+          // $regexMatch only accepts a scalar. Arrays are coerced to '' so
+          // they are reported as malformed instead of aborting the preflight.
+          input: {
+            $cond: [
+              { $isArray: '$clientOrderId' },
+              '',
+              { $ifNull: ['$clientOrderId', ''] }
+            ]
+          },
+          regex: CLIENT_ORDER_ID_PATTERN.source
+        }
+      }
+    }
   };
 
   const [missingCount, malformedCount, samples] = await Promise.all([
@@ -112,7 +139,11 @@ async function checkIdempotencyIndex({ collection } = {}) {
   if (!collection) throw new TypeError('checkIdempotencyIndex requires a MongoDB collection.');
 
   const indexes = await readIndexes(collection);
-  const match = indexes.find(index => isExpectedKey(index.key));
+  const { match } = selectIndex(
+    indexes,
+    isExpectedKey,
+    index => index.unique === true && !index.partialFilterExpression
+  );
   const [duplicates, invalidClientOrderIds] = await Promise.all([
     findDuplicateKeys(collection),
     findInvalidClientOrderIds(collection)
@@ -164,7 +195,11 @@ async function checkTradeOrderIdIndex({ collection } = {}) {
   if (!collection) throw new TypeError('checkTradeOrderIdIndex requires a MongoDB collection.');
 
   const indexes = await readIndexes(collection);
-  const match = indexes.find(index => isExpectedTradeKey(index.key));
+  const { match } = selectIndex(
+    indexes,
+    isExpectedTradeKey,
+    index => index.unique === true && partialFilterMatches(index)
+  );
   const [duplicates, invalidOrderIds] = await Promise.all([
     findDuplicateTradeOrderIds(collection),
     collection.countDocuments({
@@ -225,7 +260,11 @@ async function checkUserEmailIndex({ collection } = {}) {
   if (!collection) throw new TypeError('checkUserEmailIndex requires a MongoDB collection.');
 
   const indexes = await readIndexes(collection);
-  const match = indexes.find(index => isExpectedUserKey(index.key));
+  const { match } = selectIndex(
+    indexes,
+    isExpectedUserKey,
+    index => index.unique === true && !index.partialFilterExpression
+  );
   const [duplicates, missingEmails] = await Promise.all([
     findDuplicateEmails(collection),
     collection.countDocuments({

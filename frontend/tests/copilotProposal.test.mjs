@@ -127,7 +127,7 @@ test('discard failure keeps the proposal so the user can retry', async () => {
   assert.equal(result.state.proposalId, state.proposalId);
 });
 
-test('discard clears locally when the proposal can no longer be used', async () => {
+test('an already-used proposal is never reported as discarded', async () => {
   const state = createProposalState(payload(), NOW);
   const http = {
     async post() {
@@ -142,8 +142,55 @@ test('discard clears locally when the proposal can no longer be used', async () 
 
   const result = await discardProposal({ http, state, token: 'token-1' });
 
-  assert.equal(result.ok, true);
-  assert.equal(result.state, null);
+  // The server consumed the proposal, so it may have executed. Discarding
+  // must keep it resolvable instead of claiming no trade exists.
+  assert.equal(result.ok, false);
+  assert.equal(result.blocked, true);
+  assert.equal(result.uncertain, true);
+  assert.equal(result.state.proposalId, state.proposalId);
+  assert.equal(result.state.uncertain, true);
+  assert.equal(canReconcile(result.state), true);
+});
+
+test('resolving an already-used proposal does not claim it was never executed', async () => {
+  const state = createProposalState(payload(), NOW);
+  const http = {
+    async post() {
+      throw {
+        response: {
+          status: 409,
+          data: { success: false, code: 'PROPOSAL_ALREADY_USED', message: 'Already used.' }
+        }
+      };
+    }
+  };
+
+  const result = await resolveDiscard({ http, state, token: 'token-1' });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.resolved, false);
+  assert.equal(result.executionKnown, false);
+  assert.equal(result.uncertain, true);
+  assert.equal(result.state.proposalId, state.proposalId);
+});
+
+test('a failed revoke after a not-executed lookup is not reported as resolved', async () => {
+  const state = { ...createProposalState(payload(), NOW), uncertain: true };
+  const http = {
+    async get() {
+      return { data: { success: true, execution: 'NOT_EXECUTED' } };
+    },
+    async post() {
+      throw Object.assign(new Error('Network Error'), { code: 'ERR_NETWORK' });
+    }
+  };
+
+  const result = await resolveDiscard({ http, state, token: 'token-1' });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.resolved, false);
+  assert.equal(result.executionKnown, true);
+  assert.equal(result.state.proposalId, state.proposalId);
 });
 
 test('expiry disables Confirm and blocks execution without a request', async () => {
@@ -397,7 +444,8 @@ test('AICopilot resolve and discard never replays the execution', () => {
     source.indexOf('const preview = proposal')
   );
 
-  assert.match(discardSection, /resolveDiscard\(\{ http: api, state: current, token \}\)/);
+  assert.match(discardSection, /resolveDiscard\(\{ http: api, state: current, token: sessionToken \}\)/);
+  assert.match(discardSection, /isSessionCurrent\(sessionToken\)/);
   assert.doesNotMatch(discardSection, /reconcileProposal/);
   assert.doesNotMatch(discardSection, /confirmProposal/);
   assert.doesNotMatch(discardSection, /copilot\/execute/);

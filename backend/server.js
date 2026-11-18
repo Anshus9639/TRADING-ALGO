@@ -21,6 +21,7 @@ const { findLegacyOrderBlockers } = require('./services/legacyOrders');
 const { createRuntimeStatus } = require('./services/runtimeStatus');
 const { checkDatabaseIndexes } = require('./scripts/check-idempotency-index');
 const { defaultTransactionSupport } = require('./lib/transactions');
+const { applySafeMongooseDefaults } = require('./lib/mongooseSetup');
 const User = require('./models/User');
 const Order = require('./models/Order');
 
@@ -47,6 +48,8 @@ mongoose.connection.on('error', (err) => {
   console.error('❌ MongoDB connection error:', err.message);
   runtimeStatus.setMongoConnected(false);
 });
+
+applySafeMongooseDefaults(mongoose);
 
 mongoose.connect(config.mongoUri)
   .then(async () => {

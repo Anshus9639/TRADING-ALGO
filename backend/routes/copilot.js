@@ -531,6 +531,18 @@ function createCopilotRouter({
 
       const settledResult = recallSettled(pendingKey(userId, proposalId));
       if (settledResult) {
+        // Re-read the canonical result before claiming nothing executed; a
+        // concurrent execution may have committed since the first lookup.
+        const confirmed = await tradeService.getExecutionResult({
+          userId,
+          clientOrderId: proposalId
+        });
+        if (confirmed) {
+          return res.status(confirmed.status).json({
+            ...confirmed.body,
+            execution: 'EXECUTED'
+          });
+        }
         return res.json({
           success: true,
           execution: 'NOT_EXECUTED',
@@ -550,6 +562,19 @@ function createCopilotRouter({
       if (info.state === 'USED' && stillSettling(proposalId, userId)) {
         const pending = pendingExecution();
         return res.status(pending.status).json(pending.body);
+      }
+
+      // Final canonical re-read: another instance may have committed the
+      // execution between the first lookup and this answer.
+      const confirmed = await tradeService.getExecutionResult({
+        userId,
+        clientOrderId: proposalId
+      });
+      if (confirmed) {
+        return res.status(confirmed.status).json({
+          ...confirmed.body,
+          execution: 'EXECUTED'
+        });
       }
 
       return res.json({

@@ -21,12 +21,31 @@ const AICopilot = ({ token, watchlist, onTradeComplete }) => {
   const [proposal, setProposal] = useState(null);
   const [now, setNow] = useState(() => Date.now());
   const confirmLock = useRef(createConfirmLock());
+  const tokenRef = useRef(token);
+  const mountedRef = useRef(true);
+
+  // The token at the start of an operation identifies the session its result
+  // belongs to. Responses that arrive after a logout or a new login must not
+  // apply a previous account's balance or trade to the current one.
+  const isSessionCurrent = (sessionToken) => (
+    mountedRef.current && tokenRef.current === sessionToken
+  );
 
   // Logout unmounts this panel; also clear any proposal if the token changes.
   useEffect(() => {
+    tokenRef.current = token;
     setProposal(null);
+    setLog(null);
+    setLoading(false);
     confirmLock.current = createConfirmLock();
   }, [token]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (!proposal) return undefined;
@@ -58,15 +77,17 @@ const AICopilot = ({ token, watchlist, onTradeComplete }) => {
     setLoading(true);
     setProposal(null);
     setLog({ text: 'Thinking...', status: 'loading' });
+    const sessionToken = token;
 
     try {
       // Stage 1 only: build a server-side proposal. No trade is sent here.
       const state = await requestProposal({
         http: api,
         prompt: trimmed,
-        token,
+        token: sessionToken,
         now: Date.now()
       });
+      if (!isSessionCurrent(sessionToken)) return;
       setNow(Date.now());
       setProposal(state);
       setPrompt('');
@@ -77,17 +98,19 @@ const AICopilot = ({ token, watchlist, onTradeComplete }) => {
         status: 'loading'
       });
     } catch (err) {
+      if (!isSessionCurrent(sessionToken)) return;
       const data = err.response?.data;
       const text = data?.code === 'CLARIFICATION_REQUIRED'
         ? data.clarification
         : data?.message || err.message || 'Agent failed to understand command.';
       setLog({ text: `Failed: ${text}`, status: 'error' });
     } finally {
-      setLoading(false);
+      if (isSessionCurrent(sessionToken)) setLoading(false);
     }
   };
 
-  const reportExecutionSuccess = (current, result) => {
+  const reportExecutionSuccess = (current, result, sessionToken) => {
+    if (!isSessionCurrent(sessionToken)) return;
     const trade = result.result || {};
     const confirmation = current.intent?.orderType === 'LIMIT'
       ? `${current.intent.side} ${current.intent.quantity} ${current.intent.symbol} limit @ $${current.intent.limitPrice}`
@@ -116,24 +139,29 @@ const AICopilot = ({ token, watchlist, onTradeComplete }) => {
       status: 'loading'
     });
 
+    const sessionToken = token;
     const result = asReconcile
       ? await reconcileProposal({
         http: api,
         state: current,
-        token,
+        token: sessionToken,
         now: Date.now(),
         lock: confirmLock.current
       })
       : await confirmProposal({
         http: api,
         state: current,
-        token,
+        token: sessionToken,
         now: Date.now(),
         lock: confirmLock.current
       });
 
+    // The session that started this execution is gone; its outcome belongs to
+    // that account and must not be applied to the current one.
+    if (!isSessionCurrent(sessionToken)) return;
+
     if (result.ok) {
-      reportExecutionSuccess(current, result);
+      reportExecutionSuccess(current, result, sessionToken);
     } else if (result.uncertain) {
       // The outcome is unknown, so the proposal and its id are kept. A retry or
       // reconciliation replays the same id; a new command must not replace it.
@@ -174,10 +202,12 @@ const AICopilot = ({ token, watchlist, onTradeComplete }) => {
     // Resolve & discard only looks up the outcome and revokes the proposal. It
     // never replays the execution: retrying the same id stays on the explicit
     // Retry/Reconcile path handled by handleConfirm.
-    const result = await resolveDiscard({ http: api, state: current, token });
+    const sessionToken = token;
+    const result = await resolveDiscard({ http: api, state: current, token: sessionToken });
+    if (!isSessionCurrent(sessionToken)) return;
 
     if (result.executed) {
-      reportExecutionSuccess(current, { result: result.result });
+      reportExecutionSuccess(current, { result: result.result }, sessionToken);
     } else if (result.ok) {
       setProposal(null);
       setLog({

@@ -1,3 +1,4 @@
+const User = require('../models/User');
 const Order = require('../models/Order');
 const Trade = require('../models/Trade');
 const {
@@ -46,10 +47,12 @@ function mapTrade(trade) {
   };
 }
 
-// Legacy embedded array shape (pre-Batch-D documents).
-function mapLegacyTrade(trade) {
+// Legacy embedded array shape (pre-Batch-D documents). The id is the resolved
+// identity (persisted _id, or the deterministic id for records that never had
+// one), which is what every other reader and cancel path uses.
+function mapLegacyTrade(trade, id = trade._id) {
   return {
-    _id: trade._id,
+    _id: id,
     orderId: null,
     symbol: trade.symbol,
     type: trade.type,
@@ -75,9 +78,9 @@ function mapOrder(order) {
   };
 }
 
-function mapLegacyOrder(order) {
+function mapLegacyOrder(order, id = order._id) {
   return {
-    _id: order._id,
+    _id: id,
     symbol: order.symbol,
     type: order.type,
     quantity: order.quantity,
@@ -136,7 +139,7 @@ async function loadPendingOrders(user) {
     if (!order) return;
     const id = legacyIds[index];
     if (!duplicateIds.has(id) && canonicalIds.has(id)) return;
-    const mapped = mapLegacyOrder(order);
+    const mapped = mapLegacyOrder(order, id);
     if (duplicateIds.has(id)) mapped.ambiguous = true;
     pending.push(mapped);
   });
@@ -162,7 +165,7 @@ async function loadTrades(user) {
     if (!trade) return;
     const id = legacyIds[index];
     if (!duplicateIds.has(id) && canonicalIds.has(id)) return;
-    const mapped = mapLegacyTrade(trade);
+    const mapped = mapLegacyTrade(trade, id);
     if (duplicateIds.has(id)) mapped.ambiguous = true;
     legacy.push(mapped);
   });
@@ -197,6 +200,45 @@ async function loadAccountView(user) {
   };
 }
 
+const SNAPSHOT_FIELDS = 'username email balance lockedBalance portfolio pendingOrders trades updatedAt';
+
+// The account view combines one document read with separate collection reads.
+// A trade that commits in between would produce a balance that does not match
+// its own trade list. Re-read the account after building the view and rebuild
+// it from the newer snapshot when the account changed, bounded so an active
+// account cannot stall a read.
+function accountSnapshot(user) {
+  return JSON.stringify({
+    balance: user.balance,
+    lockedBalance: user.lockedBalance || 0,
+    portfolio: (user.portfolio || []).map(position => [
+      position.symbol,
+      position.quantity,
+      position.lockedQuantity || 0,
+      position.avgPrice === undefined ? null : position.avgPrice,
+      position.costBasisStatus || 'KNOWN'
+    ]),
+    pendingOrderCount: (user.pendingOrders || []).length,
+    tradeCount: (user.trades || []).length,
+    updatedAt: user.updatedAt ? new Date(user.updatedAt).getTime() : null
+  });
+}
+
+async function loadConsistentAccountView(user, { UserModel = User, attempts = 3 } = {}) {
+  if (!user) return null;
+  let current = user;
+
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const view = await loadAccountView(current);
+    const latest = await UserModel.findById(current._id, SNAPSHOT_FIELDS).lean();
+    if (!latest) return view;
+    if (accountSnapshot(latest) === accountSnapshot(current)) return view;
+    current = latest;
+  }
+
+  return loadAccountView(current);
+}
+
 function serializePortfolio(user) {
   return (user.portfolio || []).map(toPlainPosition);
 }
@@ -210,5 +252,6 @@ module.exports = {
   loadPendingOrders,
   loadTrades,
   loadAccountView,
+  loadConsistentAccountView,
   serializePortfolio
 };

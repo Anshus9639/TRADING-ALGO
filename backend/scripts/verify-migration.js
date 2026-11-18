@@ -9,6 +9,14 @@ const Order = require('../models/Order');
 const Trade = require('../models/Trade');
 const { verifyMigration } = require('./legacyMigration');
 
+function readBackupPath(argv, index, { inline = false } = {}) {
+  const value = inline ? argv[index].slice('--backup='.length) : argv[index + 1];
+  if (value === undefined || value === '' || value.startsWith('-')) {
+    throw new Error('--backup requires a file path.');
+  }
+  return value;
+}
+
 function parseArgs(argv) {
   const args = { backup: null, json: false, strict: false, acceptUnknownBasis: false, help: false };
 
@@ -19,10 +27,10 @@ function parseArgs(argv) {
     else if (arg === '--accept-unknown-basis') args.acceptUnknownBasis = true;
     else if (arg === '--help' || arg === '-h') args.help = true;
     else if (arg === '--backup') {
-      args.backup = argv[index + 1];
+      args.backup = readBackupPath(argv, index);
       index += 1;
     } else if (arg.startsWith('--backup=')) {
-      args.backup = arg.slice('--backup='.length);
+      args.backup = readBackupPath(argv, index, { inline: true });
     } else {
       throw new Error(`Unknown argument: ${arg}`);
     }

@@ -498,7 +498,7 @@ describe('claim-lease limit matcher', () => {
     expect(orders.every(order => order.status === 'FILLED')).toBe(true);
   });
 
-  test('new arrivals after a full batch are examined without waiting for wrap-around', async () => {
+  test('new arrivals are examined after the bounded sweep completes', async () => {
     const user = await createTestUser({ balance: 10000 });
     await placeBuyLimit(user, {
       symbol: 'ETHUSDT',
@@ -515,6 +515,8 @@ describe('claim-lease limit matcher', () => {
       batchSize: 1
     });
 
+    // The sweep's upper bound is fixed when it starts, so the arrival is not
+    // folded into the running sweep.
     const firstCycle = await worker.runCycle();
     expect(firstCycle.examined).toBe(1);
     expect(firstCycle.filled).toBe(0);
@@ -524,7 +526,13 @@ describe('claim-lease limit matcher', () => {
 
     const secondCycle = await worker.runCycle();
     expect(secondCycle.examined).toBe(1);
-    expect(secondCycle.filled).toBe(1);
+    expect(secondCycle.filled).toBe(0);
+
+    // The sweep resets once it reaches its bound, and the next sweep examines
+    // the arrival without waiting for the deferred order to change.
+    const thirdCycle = await worker.runCycle();
+    expect(thirdCycle.examined).toBe(1);
+    expect(thirdCycle.filled).toBe(1);
 
     const created = await Order.findOne({ clientOrderId: newKey }).lean();
     expect(created.status).toBe('FILLED');
@@ -557,20 +565,54 @@ describe('claim-lease limit matcher', () => {
     expect(firstCycle.filled).toBe(1);
     expect(firstCycle.deferred).toBe(1);
 
-    // The sweep reached the end of the ordered set and resets.
+    // The sweep reached its fixed upper bound and reset.
     const secondCycle = await worker.runCycle();
-    expect(secondCycle.examined).toBe(0);
-
-    const thirdCycle = await worker.runCycle();
-    expect(thirdCycle.examined).toBe(1);
-    expect(thirdCycle.filled).toBe(0);
+    expect(secondCycle.examined).toBe(1);
+    expect(secondCycle.filled).toBe(0);
 
     feed.setQuote('ETHUSDT', 3500);
-    const fourthCycle = await worker.runCycle();
-    expect(fourthCycle.examined).toBe(1);
-    expect(fourthCycle.filled).toBe(1);
+    const thirdCycle = await worker.runCycle();
+    expect(thirdCycle.examined).toBe(1);
+    expect(thirdCycle.filled).toBe(1);
 
     const deferred = await Order.findOne({ clientOrderId: deferredKey }).lean();
     expect(deferred.status).toBe('FILLED');
+  });
+
+  test('continuous arrivals cannot starve a deferred order at the front', async () => {
+    const user = await createTestUser({ balance: 100000 });
+    const deferredKey = `starved-${new mongoose.Types.ObjectId()}`;
+    await placeBuyLimit(user, {
+      symbol: 'ETHUSDT',
+      quantity: 0.1,
+      limitPrice: 1000,
+      clientOrderId: deferredKey
+    });
+
+    const worker = createMatcher({
+      feed,
+      tradeService: service,
+      now: () => now,
+      workerId: 'starvation-worker',
+      batchSize: 1
+    });
+
+    // Every cycle adds a fillable arrival after the continuation key. A sweep
+    // without an upper bound would keep advancing and never revisit ETH.
+    const examined = [];
+    for (let cycle = 0; cycle < 6; cycle += 1) {
+      const stats = await worker.runCycle();
+      examined.push(stats.examined);
+      await placeBuyLimit(user, {
+        clientOrderId: `arrival-${cycle}-${new mongoose.Types.ObjectId()}`,
+        limitPrice: 60000
+      });
+    }
+
+    const deferred = await Order.findOne({ clientOrderId: deferredKey }).lean();
+    expect(deferred.status).toBe('OPEN');
+    const filled = await Order.countDocuments({ userId: user._id, status: 'FILLED' });
+    expect(filled).toBeGreaterThanOrEqual(3);
+    expect(examined.every(count => count === 1)).toBe(true);
   });
 });

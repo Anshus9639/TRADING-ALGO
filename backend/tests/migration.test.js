@@ -1071,4 +1071,160 @@ describe('legacy embedded data migration', () => {
     const untouched = await Order.findById(order._id).lean();
     expect(untouched.quantity).toBe(0.2);
   });
+
+  test('legacy trades without any timestamp migrate deterministically across reruns', async () => {
+    const userId = new mongoose.Types.ObjectId();
+    const trade = legacyTrade('BTCUSDT', 'BUY', 0.1, 40000);
+    await User.collection.insertOne({
+      _id: userId,
+      username: 'no-timestamps',
+      email: 'no-timestamps@example.test',
+      password: 'not-a-real-password-hash',
+      balance: 6000,
+      lockedBalance: 0,
+      portfolio: [{ symbol: 'BTCUSDT', quantity: 0.1, lockedQuantity: 0, avgPrice: 40000 }],
+      pendingOrders: [],
+      trades: [trade]
+    });
+
+    const first = await runMigration({ ...models(), mongoose, mode: 'apply' });
+    expect(first.usersFailed).toBe(0);
+    expect(first.ambiguity.issueCounts.MISSING_TIMESTAMP).toBe(1);
+
+    const migrated = await Trade.findById(trade._id).lean();
+    // Neither the trade nor user.createdAt has a timestamp, so the stable
+    // fallback is the account id's generation time, not the wall clock.
+    expect(new Date(migrated.timestamp).getTime())
+      .toBe(userId.getTimestamp().getTime());
+
+    const second = await runMigration({ ...models(), mongoose, mode: 'apply' });
+    expect(second.usersFailed).toBe(0);
+    expect(second.usersUpdated).toBe(0);
+    expect(second.ambiguity.issueCounts.CONFLICTING_EXISTING_TRADE).toBeUndefined();
+    expect(second.ambiguity.issueCounts.MISSING_TIMESTAMP).toBe(1);
+
+    const afterRerun = await Trade.findById(trade._id).lean();
+    expect(new Date(afterRerun.timestamp).getTime())
+      .toBe(new Date(migrated.timestamp).getTime());
+  });
+
+  test('an open canonical SELL without a portfolio position is reported, not funded', async () => {
+    const user = await createTestUser({
+      portfolio: [{ symbol: 'ETHUSDT', quantity: 1, avgPrice: 2000 }]
+    });
+    await Order.create({
+      userId: user._id,
+      symbol: 'BTCUSDT',
+      side: 'SELL',
+      orderType: 'LIMIT',
+      quantity: 0.5,
+      remainingQuantity: 0.5,
+      limitPrice: 50000,
+      status: 'OPEN',
+      clientOrderId: 'canonical-sell-without-position'
+    });
+
+    const report = await runMigration({ ...models(), mongoose, mode: 'dry-run' });
+
+    expect(report.ambiguity.issueCounts.UNMATCHED_CANONICAL_SELL_RESERVATION).toBe(1);
+    expect(report.ambiguity.errors).toBe(1);
+
+    const applied = await runMigration({ ...models(), mongoose, mode: 'apply' });
+    expect(applied.usersFailed).toBe(0);
+    const stored = await User.findById(user._id).lean();
+    expect(stored.portfolio.map(position => position.symbol)).toEqual(['ETHUSDT']);
+    expect(stored.portfolio[0].lockedQuantity).toBe(0);
+  });
+
+  test('audit tolerates null entries in pendingOrders', async () => {
+    const user = await createTestUser({
+      portfolio: [{ symbol: 'BTCUSDT', quantity: 0.1, avgPrice: 45000 }],
+      pendingOrders: [legacyOrder('BTCUSDT', 'BUY', 0.1, 40000, new Date())]
+    });
+    await User.collection.updateOne(
+      { _id: user._id },
+      { $push: { pendingOrders: null } }
+    );
+
+    const report = await auditLegacyData(models());
+
+    expect(report.ambiguity.issueCounts.INVALID_LEGACY_ORDER).toBe(1);
+    expect(report.legacy.openBuy).toBe(1);
+    expect(report.legacy.openSell).toBe(0);
+  });
+
+  test('backup verification parses, compares and checksums in a single pass', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'nexustrade-migration-'));
+    const backupFile = path.join(directory, 'users-backup.json');
+    try {
+      await createBatchUser(0);
+      await createBatchUser(1);
+      await createBackup(models(), backupFile);
+
+      const openSync = jest.spyOn(fs, 'openSync');
+      try {
+        const check = await verifyBackup(models(), backupFile);
+        expect(check.ok).toBe(true);
+        const opens = openSync.mock.calls.filter(([target]) => target === backupFile);
+        expect(opens).toHaveLength(1);
+      } finally {
+        openSync.mockRestore();
+      }
+
+      const tampered = JSON.parse(fs.readFileSync(backupFile, 'utf8'));
+      tampered.sha256 = backupHash([{ _id: 'different' }]);
+      fs.writeFileSync(backupFile, JSON.stringify(tampered));
+
+      const rejected = await verifyBackup(models(), backupFile);
+      expect(rejected.ok).toBe(false);
+      expect(rejected.error).toBe('Backup checksum does not match its contents.');
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test('the backup temporary file is created owner-only', async () => {
+    if (process.platform === 'win32') return;
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'nexustrade-migration-'));
+    const backupFile = path.join(directory, 'users-backup.json');
+    try {
+      await createBatchUser(0);
+      await createBackup(models(), backupFile);
+      const mode = fs.statSync(backupFile).mode & 0o777;
+      expect(mode).toBe(0o600);
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test('a stored zero average price cannot satisfy an unknown cost basis', async () => {
+    const user = await createTestUser({
+      portfolio: [{
+        symbol: 'BTCUSDT',
+        quantity: 1,
+        lockedQuantity: 0,
+        avgPrice: 0,
+        costBasisStatus: 'UNKNOWN'
+      }]
+    });
+    const raw = await User.findById(user._id).lean();
+
+    const plan = planAccount(raw);
+    expect(plan.portfolio.changed).toBe(true);
+    expect(plan.portfolio.positions[0]).toMatchObject({ avgPrice: null, costBasisStatus: 'UNKNOWN' });
+
+    const applied = await runMigration({ ...models(), mongoose, mode: 'apply' });
+    expect(applied.usersFailed).toBe(0);
+    const stored = await User.findById(user._id).lean();
+    expect(stored.portfolio[0].avgPrice).toBeNull();
+
+    // Reintroducing the zero through a raw write must fail verification.
+    await User.collection.updateOne(
+      { _id: user._id },
+      { $set: { 'portfolio.0.avgPrice': 0 } }
+    );
+    const verification = await verifyMigration(models());
+    expect(verification.ok).toBe(false);
+    expect(verification.mismatches.map(item => item.code)).toContain('COST_BASIS_MISMATCH');
+  });
 });

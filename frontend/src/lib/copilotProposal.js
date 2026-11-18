@@ -67,7 +67,6 @@ export async function requestProposal({ http, prompt, token, now = Date.now() })
 }
 
 const NON_FATAL_REVOKE_CODES = new Set([
-  'PROPOSAL_ALREADY_USED',
   'PROPOSAL_EXPIRED',
   'PROPOSAL_REVOKED',
   'PROPOSAL_NOT_FOUND',
@@ -75,8 +74,10 @@ const NON_FATAL_REVOKE_CODES = new Set([
 ]);
 
 // Discarding revokes the server-side proposal so it can never be executed.
-// It never submits a trade. Revocation failures caused by an already used,
-// expired, or revoked proposal are safe to treat as discarded locally.
+// It never submits a trade. Revocation failures caused by an already expired,
+// revoked, or malformed proposal are safe to treat as discarded locally.
+// PROPOSAL_ALREADY_USED is not: the server consumed the proposal, so the
+// outcome may be an executed trade and must be resolved instead.
 export async function discardProposal({ http, state, token }) {
   if (!state || typeof state.proposalId !== 'string' || state.proposalId === '') {
     return { ok: true, state: null };
@@ -91,15 +92,35 @@ export async function discardProposal({ http, state, token }) {
     return { ok: true, state: null };
   } catch (error) {
     const code = error?.response?.data?.code;
+    const message = error?.response?.data?.message
+      || error?.message
+      || 'Could not discard proposal.';
     if (NON_FATAL_REVOKE_CODES.has(code)) {
       return { ok: true, state: null };
+    }
+    if (code === 'PROPOSAL_ALREADY_USED') {
+      // A consumed proposal may already have produced an order. Keeping it
+      // uncertain forces an explicit status lookup or idempotent retry
+      // instead of reporting that no trade exists.
+      return {
+        ok: false,
+        blocked: true,
+        uncertain: true,
+        reason: code,
+        state: {
+          ...state,
+          status: PROPOSAL_STATUS.READY,
+          uncertain: true,
+          error: message
+        }
+      };
     }
     return {
       ok: false,
       reason: code || 'REVOKE_FAILED',
       state: {
         ...state,
-        error: error?.response?.data?.message || error?.message || 'Could not discard proposal.'
+        error: message
       }
     };
   }
@@ -154,6 +175,9 @@ export async function resolveDiscard({ http, state, token }) {
 
   if (!canReconcile(state)) {
     const discarded = await discardProposal({ http, state, token });
+    if (!discarded.ok) {
+      return { ...discarded, executionKnown: false, resolved: false };
+    }
     return { ...discarded, executionKnown: true, resolved: true };
   }
 
@@ -185,6 +209,11 @@ export async function resolveDiscard({ http, state, token }) {
   }
 
   const discarded = await discardProposal({ http, state, token });
+  if (!discarded.ok) {
+    // The status lookup proved no order existed, but the proposal is still not
+    // revoked, so it must stay resolvable.
+    return { ...discarded, executionKnown: true, resolved: false };
+  }
   return { ...discarded, executionKnown: true, resolved: true };
 }
 

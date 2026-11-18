@@ -11,6 +11,10 @@ const { loadAppConfig } = require('./config/env');
 // tests can import this factory without a full environment.
 const { corsOrigins, trustProxy } = loadAppConfig();
 
+// An external history request must never hold a Node request handler open
+// indefinitely; Binance can accept a connection and then stall.
+const HISTORY_FETCH_TIMEOUT_MS = 10000;
+
 const corsOptions = {
   origin: corsOrigins,
   methods: ["GET", "POST", "PUT", "DELETE"],
@@ -78,7 +82,8 @@ function createApp({
       const interval = req.query.interval || '1m';
 
       const response = await axios.get(
-        `https://api.binance.us/api/v3/klines?symbol=${symbol.toUpperCase()}&interval=${interval}&limit=500`
+        `https://api.binance.us/api/v3/klines?symbol=${symbol.toUpperCase()}&interval=${interval}&limit=500`,
+        { timeout: HISTORY_FETCH_TIMEOUT_MS }
       );
 
       const formattedData = response.data.map(d => ({

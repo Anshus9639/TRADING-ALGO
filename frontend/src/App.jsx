@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import io from 'socket.io-client';
 import { LayoutDashboard, Activity, Clock, LogOut } from 'lucide-react';
 import { api, API_ORIGIN, authHeaders } from './lib/api';
@@ -43,19 +43,31 @@ function App() {
   const [pendingOrders, setPendingOrders] = useState([]);
 
   // --- 1. PERSISTENCE LOGIC ---
+  // Tracks the session every in-flight response belongs to. Updated
+  // synchronously on login/logout so a late response can never apply a
+  // previous session's account data to the current one.
+  const tokenRef = useRef(token);
+
+  useEffect(() => {
+    tokenRef.current = token;
+  }, [token]);
+
   const fetchUserProfile = useCallback(async (authToken) => {
     try {
       const res = await api.get('/api/auth/me', authHeaders(authToken));
+      if (tokenRef.current !== authToken) return;
       setUser(res.data);
       setBalance(res.data.balance || 0);
       setPositions(res.data.portfolio || []);
       setTrades(res.data.trades ? [...res.data.trades].reverse() : []);
       setPendingOrders(res.data.pendingOrders || []); 
     } catch (err) {
+      // A failure for an earlier session must not log out the active one.
+      if (tokenRef.current !== authToken) return;
       console.error("Session expired or invalid");
       handleLogout();
     } finally {
-      setIsInitializing(false);
+      if (tokenRef.current === authToken) setIsInitializing(false);
     }
   }, []);
 
@@ -125,6 +137,7 @@ function App() {
   };
 
   const handleLogout = () => {
+    tokenRef.current = null;
     localStorage.removeItem('token');
     setToken(null);
     setUser(null);
@@ -135,6 +148,7 @@ function App() {
   };
 
   const handleLoginSuccess = (userData, userToken) => {
+    tokenRef.current = userToken;
     setToken(userToken);
     setUser(userData);
     setBalance(userData.balance || 0);

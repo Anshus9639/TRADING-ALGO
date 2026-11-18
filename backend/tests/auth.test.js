@@ -236,7 +236,7 @@ describe('authentication and session restoration', () => {
   });
 
   test('rejects malformed and oversized credentials', async () => {
-    const malformedEmails = ['not-an-email', 'missing@domain', '@example.test', `${'a'.repeat(250)}@example.test`];
+    const malformedEmails = ['not-an-email', 'two@at@example.test', '@example.test', `${'a'.repeat(250)}@example.test`];
     for (const email of malformedEmails) {
       const res = await request(app)
         .post('/api/auth/login')
@@ -244,10 +244,47 @@ describe('authentication and session restoration', () => {
       expect(res.status).toBe(400);
     }
 
+    // A dotted domain is still required when an account is created.
+    const dotlessSignup = await request(app)
+      .post('/api/auth/signup')
+      .send({ username: 'dotless', email: 'legacy@localhost', password: PASSWORD });
+    expect(dotlessSignup.status).toBe(400);
+
     const oversizedPassword = await request(app)
       .post('/api/auth/signup')
       .send({ username: 'too-long', email: 'too-long@example.test', password: 'x'.repeat(73) });
     expect(oversizedPassword.status).toBe(400);
+  });
+
+  test('an existing account with a local-only email domain can still log in', async () => {
+    const passwordHash = await bcrypt.hash(PASSWORD, 4);
+    const legacyEmail = `legacy-${Date.now()}@localhost`;
+    // Bypass signup validation: such accounts were created before the rule.
+    await User.create({
+      username: 'legacy-local',
+      email: legacyEmail,
+      password: passwordHash,
+      balance: 10000
+    });
+
+    const login = await request(app)
+      .post('/api/auth/login')
+      .send({ email: legacyEmail, password: PASSWORD });
+
+    expect(login.status).toBe(200);
+    expect(login.body.token).toBeTruthy();
+
+    const me = await request(app)
+      .get('/api/auth/me')
+      .set('x-auth-token', login.body.token);
+    expect(me.status).toBe(200);
+    expect(me.body.email).toBe(legacyEmail);
+
+    // Login still refuses non-string selectors and malformed addresses.
+    const operator = await request(app)
+      .post('/api/auth/login')
+      .send({ email: { $ne: null }, password: PASSWORD });
+    expect(operator.status).toBe(400);
   });
 
   test('enforces the signup password limit in UTF-8 bytes', async () => {

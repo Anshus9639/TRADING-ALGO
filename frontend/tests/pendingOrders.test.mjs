@@ -148,9 +148,18 @@ test('QuickOrder persists unresolved keys without persisting the token', () => {
   assert.match(source, /An earlier submission is unresolved/);
   assert.doesNotMatch(source, /localStorage/);
   assert.doesNotMatch(source, /pendingSubmissions\.current = new Map\(\)/);
+
+  // A submission captures its map and re-reads storage before reusing an id,
+  // and a late success only retires the id that request actually used.
+  assert.match(source, /pendingSubmissions\.current\.refresh\(\)/);
+  assert.match(source, /submissions\.deleteIf\(requestKey, clientOrderId\)/);
+  assert.match(source, /shouldRetirePendingKey\(status, code\)/);
+  // Results are only applied while the initiating session is still current.
+  assert.match(source, /tokenRef\.current === sessionToken/);
+  assert.match(source, /authHeaders\(sessionToken\)/);
 });
 
-test('a 429 keeps the pending id so a retry reuses the original id', () => {
+test('only an idempotency conflict retires a pending key', () => {
   const storage = createStorage();
   const token = tokenFor('user-123');
   const requestKey = '/api/trade/buy|BUY|BTCUSDT|0.1|MARKET';
@@ -158,24 +167,94 @@ test('a 429 keeps the pending id so a retry reuses the original id', () => {
   const id = createClientOrderId();
   submissions.set(requestKey, id);
 
-  // The rate limiter can answer before idempotency is checked, so the key must
-  // survive that outcome exactly like a network error.
-  if (shouldRetirePendingKey(429)) submissions.delete(requestKey);
+  // Rate limiting, auth middleware and request validation all answer before
+  // the backend looks the idempotency key up, so none of these statuses prove
+  // that an earlier attempt did not commit.
+  for (const status of [400, 401, 403, 404, 408, 422, 429, 500, undefined]) {
+    assert.equal(shouldRetirePendingKey(status, 'ANY_CODE'), false);
+  }
+
+  if (shouldRetirePendingKey(401, 'UNAUTHORIZED')) submissions.deleteIf(requestKey, id);
   assert.equal(submissions.get(requestKey), id);
+  assert.equal(createPendingSubmissionMap({ token, storage }).get(requestKey), id);
 
-  const retry = createPendingSubmissionMap({ token, storage });
-  assert.equal(retry.get(requestKey), id);
+  // A conflict is only definitive when the server reports the key collision
+  // it found after the idempotency lookup.
+  assert.equal(shouldRetirePendingKey(409), false);
+  assert.equal(shouldRetirePendingKey(409, 'PRICE_MOVED'), false);
+  assert.equal(shouldRetirePendingKey(409, 'IDEMPOTENCY_CONFLICT'), true);
 
-  // Only a definitive rejection retires the key.
-  assert.equal(shouldRetirePendingKey(400), true);
-  assert.equal(shouldRetirePendingKey(409), true);
-  assert.equal(shouldRetirePendingKey(408), false);
-  assert.equal(shouldRetirePendingKey(429), false);
-  assert.equal(shouldRetirePendingKey(500), false);
-  assert.equal(shouldRetirePendingKey(undefined), false);
+  assert.equal(submissions.deleteIf(requestKey, id), true);
+  assert.equal(submissions.get(requestKey), undefined);
+  assert.equal(createPendingSubmissionMap({ token, storage }).get(requestKey), undefined);
+});
 
-  if (shouldRetirePendingKey(400)) retry.delete(requestKey);
-  assert.equal(retry.get(requestKey), undefined);
+test('retiring a completed request does not delete a newer submission', () => {
+  const storage = createStorage();
+  const token = tokenFor('user-123');
+  const now = () => 1_700_000_000_000;
+  const requestKey = '/api/trade/buy|BUY|BTCUSDT|0.1|MARKET';
+  const first = createClientOrderId();
+  const second = createClientOrderId();
+
+  const original = createPendingSubmissionMap({ token, storage, now });
+  original.set(requestKey, first);
+
+  // A remount retires the completed id and starts a genuinely new submission
+  // under the same request key.
+  const remount = createPendingSubmissionMap({ token, storage, now });
+  assert.equal(remount.deleteIf(requestKey, first), true);
+  remount.set(requestKey, second);
+
+  // The original instance finishing late still holds the first id in memory
+  // but must not retire the newer submission persisted by the remount.
+  assert.equal(original.deleteIf(requestKey, first), false);
+  assert.equal(
+    createPendingSubmissionMap({ token, storage, now }).get(requestKey),
+    second
+  );
+});
+
+test('refresh observes a key retired by another instance', () => {
+  const storage = createStorage();
+  const token = tokenFor('user-123');
+  const now = () => 1_700_000_000_000;
+  const requestKey = '/api/trade/buy|BUY|BTCUSDT|0.1|MARKET';
+  const id = createClientOrderId();
+
+  const stale = createPendingSubmissionMap({ token, storage, now });
+  stale.set(requestKey, id);
+
+  const completed = createPendingSubmissionMap({ token, storage, now });
+  assert.equal(completed.deleteIf(requestKey, id), true);
+
+  // A stale in-memory copy would reuse an id whose request already completed.
+  assert.equal(stale.get(requestKey), id);
+  assert.equal(stale.refresh().get(requestKey), undefined);
+  assert.equal(stale.size(), 0);
+});
+
+test('resubmitting clears a tombstone this instance never loaded', () => {
+  const storage = createStorage();
+  const token = tokenFor('user-123');
+  const now = () => 1_700_000_000_000;
+  const requestKey = '/api/trade/buy|BUY|BTCUSDT|0.1|MARKET';
+  const first = createClientOrderId();
+  const second = createClientOrderId();
+
+  const staleTab = createPendingSubmissionMap({ token, storage, now });
+  staleTab.set(requestKey, first);
+
+  const deletingTab = createPendingSubmissionMap({ token, storage, now });
+  deletingTab.delete(requestKey);
+
+  // The stale tab never saw the tombstone and resubmits at the same
+  // millisecond. The new submission must win over the stale deletion.
+  staleTab.set(requestKey, second);
+
+  const reloaded = createPendingSubmissionMap({ token, storage, now });
+  assert.equal(reloaded.size(), 1);
+  assert.equal(reloaded.get(requestKey), second);
 });
 
 test('two tabs initialized before writing each keep their own pending entry', () => {

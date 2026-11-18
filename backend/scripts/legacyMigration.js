@@ -72,6 +72,33 @@ function normalizeAvgPrice(value) {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null;
 }
 
+// Distinguishes "no recoverable basis" (null/absent) from a stored numeric
+// value such as 0 that would otherwise normalize to the same null.
+function avgPriceMatches(current, expected) {
+  if (expected === null) return current === null || current === undefined;
+  return normalizeAvgPrice(current) === normalizeAvgPrice(expected);
+}
+
+function hasValidTimestamp(value) {
+  if (value instanceof Date) return !Number.isNaN(value.getTime());
+  if (value === undefined || value === null) return false;
+  return !Number.isNaN(new Date(value).getTime());
+}
+
+// When user.createdAt is also missing there is no real timestamp to borrow.
+// Falling back to "now" would make reruns disagree with the trade migrated by
+// the first run, so the ObjectId generation time (or the epoch) is used: it is
+// stable across runs and independent of the wall clock.
+function deterministicAccountTimestamp(user) {
+  const id = user && user._id;
+  if (id instanceof mongoose.Types.ObjectId) return id.getTimestamp();
+  const text = id === undefined || id === null ? '' : String(id);
+  if (text && mongoose.Types.ObjectId.isValid(text)) {
+    return new mongoose.Types.ObjectId(text).getTimestamp();
+  }
+  return new Date(0);
+}
+
 function optionalObjectId(value) {
   if (!value) return null;
   if (value instanceof mongoose.Types.ObjectId) return value;
@@ -263,7 +290,11 @@ function buildPositions(user, userId, issues) {
 
 function planAccount(user, existingOrders = [], existingTrades = [], { now = Date.now() } = {}) {
   const userId = user._id;
-  const fallbackTimestamp = normalizeTimestamp(user.createdAt, now);
+  const accountTimestampProvided = hasValidTimestamp(user.createdAt);
+  const fallbackTimestamp = accountTimestampProvided
+    ? new Date(user.createdAt)
+    : deterministicAccountTimestamp(user);
+  const fallbackSource = accountTimestampProvided ? 'user.createdAt' : 'deterministic account fallback';
   const issues = [];
   const orders = [];
   const trades = [];
@@ -361,7 +392,7 @@ function planAccount(user, existingOrders = [], existingTrades = [], { now = Dat
 
     const timestamp = normalizeTimestamp(raw.timestamp, fallbackTimestamp);
     if (!raw.timestamp) {
-      issues.push(issue('MISSING_TIMESTAMP', SEVERITY.WARNING, userId, legacyIdText, `Legacy order had no timestamp; user.createdAt (${fallbackTimestamp.toISOString()}) was used.`));
+      issues.push(issue('MISSING_TIMESTAMP', SEVERITY.WARNING, userId, legacyIdText, `Legacy order had no timestamp; ${fallbackSource} (${fallbackTimestamp.toISOString()}) was used.`));
     }
     if (!providedId) {
       issues.push(issue('GENERATED_LEGACY_ID', SEVERITY.WARNING, userId, legacyIdText, 'Legacy order had no _id; a deterministic id was generated.'));
@@ -412,7 +443,7 @@ function planAccount(user, existingOrders = [], existingTrades = [], { now = Dat
 
     const timestamp = normalizeTimestamp(raw.timestamp, fallbackTimestamp);
     if (!raw.timestamp) {
-      issues.push(issue('MISSING_TIMESTAMP', SEVERITY.WARNING, userId, legacyIdText, `Legacy trade had no timestamp; user.createdAt (${fallbackTimestamp.toISOString()}) was used.`));
+      issues.push(issue('MISSING_TIMESTAMP', SEVERITY.WARNING, userId, legacyIdText, `Legacy trade had no timestamp; ${fallbackSource} (${fallbackTimestamp.toISOString()}) was used.`));
     }
     if (!providedId) {
       issues.push(issue('GENERATED_LEGACY_ID', SEVERITY.WARNING, userId, legacyIdText, 'Legacy trade had no _id; a deterministic id was generated.'));
@@ -447,6 +478,7 @@ function planAccount(user, existingOrders = [], existingTrades = [], { now = Dat
   // rerunning apply cannot double count or double deduct.
   let reservedBalance = 0;
   const lockedBySymbol = new Map();
+  const canonicalSellReservations = [];
 
   for (const canonical of existingOrders) {
     if (canonical.status !== 'OPEN') continue;
@@ -459,6 +491,11 @@ function planAccount(user, existingOrders = [], existingTrades = [], { now = Dat
     if (canonical.side === 'BUY') {
       reservedBalance = roundTo(reservedBalance + roundTo(remaining * canonical.limitPrice));
     } else if (canonical.side === 'SELL') {
+      canonicalSellReservations.push({
+        orderId: String(canonical._id),
+        symbol: canonical.symbol,
+        remaining
+      });
       lockedBySymbol.set(
         canonical.symbol,
         roundTo((lockedBySymbol.get(canonical.symbol) || 0) + remaining)
@@ -503,6 +540,20 @@ function planAccount(user, existingOrders = [], existingTrades = [], { now = Dat
     );
   }
 
+  // A canonical SELL reservation is only reconcilable if the account really
+  // holds that symbol. Holdings are never invented for it; the mismatch is
+  // reported so an operator can resolve the escrow by hand.
+  for (const reservation of canonicalSellReservations) {
+    if (bySymbol.has(reservation.symbol)) continue;
+    issues.push(issue(
+      'UNMATCHED_CANONICAL_SELL_RESERVATION',
+      SEVERITY.ERROR,
+      userId,
+      reservation.orderId,
+      `Open SELL order reserves ${reservation.remaining} ${reservation.symbol} but the portfolio has no such position; holdings are not invented.`
+    ));
+  }
+
   for (const position of positions) {
     const expectedLock = roundTo(lockedBySymbol.get(position.symbol) || 0);
     if (position.lockedQuantity !== expectedLock) {
@@ -531,7 +582,7 @@ function planAccount(user, existingOrders = [], existingTrades = [], { now = Dat
         || current.symbol !== position.symbol
         || roundTo(asFinite(current.quantity, 0)) !== position.quantity
         || roundTo(asFinite(current.lockedQuantity, 0)) !== position.lockedQuantity
-        || normalizeAvgPrice(current.avgPrice) !== normalizeAvgPrice(position.avgPrice)
+        || !avgPriceMatches(current.avgPrice, position.avgPrice)
         || (current.costBasisStatus || 'KNOWN') !== position.costBasisStatus;
     });
 
@@ -999,6 +1050,9 @@ async function auditLegacyData(modelsInput = {}, { now = Date.now(), batchSize =
 
       const legacyOrders = Array.isArray(user.pendingOrders) ? user.pendingOrders : [];
       for (const order of legacyOrders) {
+        // Null entries are reported per-account by planAccount; counting them
+        // here must not abort the whole audit.
+        if (!order) continue;
         const side = String(order.type).toUpperCase();
         if (side === 'BUY') openBuy += 1;
         else if (side === 'SELL') openSell += 1;
@@ -1154,7 +1208,7 @@ async function verifyMigration(modelsInput = {}, {
             detail: `${position.symbol} costBasisStatus ${currentStatus} != expected ${expectedStatus}.`
           });
         }
-        if (normalizeAvgPrice(current.avgPrice) !== normalizeAvgPrice(position.avgPrice)) {
+        if (!avgPriceMatches(current.avgPrice, position.avgPrice)) {
           mismatches.push({
             code: 'COST_BASIS_MISMATCH',
             userId: plan.userId,
@@ -1240,7 +1294,9 @@ async function createBackup({ User }, file, { now = new Date(), batchSize = DEFA
   let streamed = 0;
 
   try {
-    handle = await fs.promises.open(tempFile, 'w');
+    // The backup contains every account record, so the temporary file is
+    // created owner-only before any content is written.
+    handle = await fs.promises.open(tempFile, 'w', 0o600);
     await handle.write(
       `{\n  "version": ${BACKUP_VERSION},\n  "createdAt": ${JSON.stringify(createdAt)},\n  "userCount": ${expectedCount},\n  "users": [`
     );
@@ -1538,37 +1594,46 @@ function readBackup(file, { chunkSize } = {}) {
 
 // Merge-joins the id-sorted backup against the id-sorted user cursor. Only one
 // record from each side is held at a time, so verification stays bounded even
-// for a collection with a very large number of users.
+// for a collection with a very large number of users. Parsing, comparison and
+// checksum all run in a single pass over one file descriptor; verifying a
+// checksum over one version of the file and comparing another version is not
+// possible.
 async function verifyBackup({ User }, file, { batchSize = DEFAULT_BATCH_SIZE, chunkSize } = {}) {
-  const read = readBackup(file, { chunkSize });
-  if (!read.ok) return read;
-  const { payload } = read;
-
   const missingUsers = [];
   const changedEmbedded = [];
   let currentUserCount = 0;
   let backupUsersChecked = 0;
   let previousBackupId = null;
   let outOfOrder = false;
+  let checksumEvent = null;
+  let backupEntry = null;
+  let readFailure = null;
 
   // createBackup writes users sorted by _id, which is what makes the merge
   // possible without a lookup map. Anything else is rejected rather than
   // silently producing an incomplete comparison.
-  const backupIterator = iterateBackupUsers(file, { chunkSize })[Symbol.asyncIterator]();
-  let backupEntry = null;
+  const events = readBackupEvents(file, { chunkSize })[Symbol.iterator]();
 
-  async function advanceBackup() {
-    const next = await backupIterator.next();
-    backupEntry = next.done ? null : next.value;
-    if (!backupEntry) return backupEntry;
+  function advanceBackup() {
+    const next = events.next();
+    if (next.done) {
+      backupEntry = null;
+      return false;
+    }
+    if (next.value.type === 'checksum') {
+      checksumEvent = next.value;
+      backupEntry = null;
+      return false;
+    }
+    backupEntry = next.value.user;
     const key = String(backupEntry._id);
     if (previousBackupId !== null && key <= previousBackupId) outOfOrder = true;
     previousBackupId = key;
-    return backupEntry;
+    return true;
   }
 
   try {
-    await advanceBackup();
+    advanceBackup();
     const cursor = User.collection.find({}).sort({ _id: 1 }).batchSize(normalizeBatchSize(batchSize));
     for await (const current of cursor) {
       currentUserCount += 1;
@@ -1577,7 +1642,7 @@ async function verifyBackup({ User }, file, { batchSize = DEFAULT_BATCH_SIZE, ch
       while (backupEntry && String(backupEntry._id) < key) {
         missingUsers.push(String(backupEntry._id));
         backupUsersChecked += 1;
-        await advanceBackup();
+        advanceBackup();
       }
 
       if (backupEntry && String(backupEntry._id) === key) {
@@ -1588,47 +1653,60 @@ async function verifyBackup({ User }, file, { batchSize = DEFAULT_BATCH_SIZE, ch
           || JSON.stringify(backupEntry.trades || []) !== JSON.stringify(current.trades || [])) {
           changedEmbedded.push(key);
         }
-        await advanceBackup();
+        advanceBackup();
       }
     }
 
     while (backupEntry) {
       missingUsers.push(String(backupEntry._id));
       backupUsersChecked += 1;
-      await advanceBackup();
+      advanceBackup();
     }
   } catch (err) {
-    return {
-      ok: false,
-      file,
-      version: payload.version,
-      createdAt: payload.createdAt,
-      userCount: payload.userCount,
-      currentUserCount,
-      missingUsers,
-      changedEmbedded,
-      error: `Backup verification failed while reading users: ${err.message}`
-    };
+    readFailure = err;
   } finally {
     try {
-      await backupIterator.return();
+      events.return();
     } catch {
       // The original result is more useful than a cleanup failure.
     }
   }
 
-  if (outOfOrder) {
+  const payload = checksumEvent
+    ? {
+      version: checksumEvent.meta.version,
+      createdAt: checksumEvent.meta.createdAt === undefined ? null : checksumEvent.meta.createdAt,
+      userCount: checksumEvent.meta.userCount,
+      sha256: checksumEvent.meta.sha256
+    }
+    : null;
+
+  function failure(error) {
     return {
       ok: false,
       file,
-      version: payload.version,
-      createdAt: payload.createdAt,
-      userCount: payload.userCount,
+      version: payload ? payload.version : null,
+      createdAt: payload ? payload.createdAt : null,
+      userCount: payload ? payload.userCount : null,
       currentUserCount,
+      backupUsersChecked,
       missingUsers,
       changedEmbedded,
-      error: 'Backup users are not sorted by _id; bounded verification cannot continue.'
+      error
     };
+  }
+
+  if (readFailure) {
+    return failure(`Backup verification failed while reading users: ${readFailure.message}`);
+  }
+  if (!checksumEvent || !checksumEvent.usersSeen || !payload || payload.version !== BACKUP_VERSION) {
+    return failure(`Backup file is not a version ${BACKUP_VERSION} migration backup.`);
+  }
+  if (payload.sha256 !== checksumEvent.sha256) {
+    return failure('Backup checksum does not match its contents.');
+  }
+  if (outOfOrder) {
+    return failure('Backup users are not sorted by _id; bounded verification cannot continue.');
   }
 
   return {

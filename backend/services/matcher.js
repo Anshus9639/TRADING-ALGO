@@ -42,9 +42,38 @@ function createMatcher({
   let running = false;
   // Continuation key of the last examined candidate. It advances through the
   // stable (createdAt, _id) order so removals between cycles cannot shift the
-  // page and skip orders, and it resets at the end of the collection so
-  // deferred orders at the front are revisited.
+  // page and skip orders, and it resets at the end of the sweep so deferred
+  // orders at the front are revisited.
   let cursor = null;
+  // Upper continuation key of the sweep that is currently in progress. It is
+  // fixed when the sweep starts: orders created afterwards cannot extend the
+  // sweep forever and starve deferred orders at the front.
+  let sweepBound = null;
+
+  function afterKey(key) {
+    return {
+      $or: [
+        { createdAt: { $gt: key.createdAt } },
+        { createdAt: key.createdAt, _id: { $gt: key.id } }
+      ]
+    };
+  }
+
+  function throughKey(key) {
+    return {
+      $or: [
+        { createdAt: { $lt: key.createdAt } },
+        { createdAt: key.createdAt, _id: { $lte: key.id } }
+      ]
+    };
+  }
+
+  function reachedBound(candidate, bound) {
+    const candidateTime = new Date(candidate.createdAt).getTime();
+    const boundTime = new Date(bound.createdAt).getTime();
+    if (candidateTime !== boundTime) return candidateTime > boundTime;
+    return String(candidate._id) >= String(bound.id);
+  }
 
   async function claim(orderId) {
     const timestamp = now();
@@ -154,28 +183,50 @@ function createMatcher({
       stats.recovered = recovery.modifiedCount || 0;
 
       const select = { status: 'OPEN', orderType: 'LIMIT' };
-      if (cursor) {
-        select.$or = [
-          { createdAt: { $gt: cursor.createdAt } },
-          { createdAt: cursor.createdAt, _id: { $gt: cursor.id } }
-        ];
+
+      // Start a new sweep by fixing its upper bound to the newest eligible
+      // order at this instant. Everything created later is deferred until the
+      // next sweep; this is what makes progress toward the wrap finite.
+      if (!cursor || !sweepBound) {
+        const boundary = await OrderModel.findOne({ status: 'OPEN', orderType: 'LIMIT' })
+          .sort({ createdAt: -1, _id: -1 })
+          .select({ createdAt: 1 })
+          .lean();
+        sweepBound = boundary && boundary.createdAt
+          ? { createdAt: boundary.createdAt, id: boundary._id }
+          : null;
+        cursor = null;
       }
 
-      const candidates = await OrderModel.find(select)
-        .sort({ createdAt: 1, _id: 1 })
-        .limit(batchSize)
-        .lean();
+      const candidates = sweepBound
+        ? await OrderModel.find({
+          ...select,
+          $and: [
+            throughKey(sweepBound),
+            ...(cursor ? [afterKey(cursor)] : [])
+          ]
+        })
+          .sort({ createdAt: 1, _id: 1 })
+          .limit(batchSize)
+          .lean()
+        : [];
 
-      // A short batch means the sweep reached the end of the eligible set, so
+      // A short batch means the sweep reached the end of its bounded set, so
       // the next cycle starts over. A full batch advances the continuation
-      // key, ensuring deferred orders at the front cannot starve later ones.
+      // key, ensuring deferred orders at the front cannot starve later ones,
+      // and the sweep resets as soon as it reaches its fixed upper bound.
       if (candidates.length < batchSize) {
         cursor = null;
+        sweepBound = null;
       } else {
         const last = candidates[candidates.length - 1];
         cursor = last && last.createdAt
           ? { createdAt: last.createdAt, id: last._id }
           : null;
+        if (!cursor || reachedBound(last, sweepBound)) {
+          cursor = null;
+          sweepBound = null;
+        }
       }
 
       stats.examined = candidates.length;

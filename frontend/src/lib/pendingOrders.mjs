@@ -21,16 +21,17 @@ function defaultStorage() {
   }
 }
 
-// Only a definitive rejection proves the server did not create the order.
-// Network failures, timeouts (408), rate limits (429) and 5xx answers all
-// leave the outcome unknown, so the idempotency key must survive for a retry.
-export function shouldRetirePendingKey(status) {
-  return typeof status === 'number'
-    && Number.isFinite(status)
-    && status >= 400
-    && status < 500
-    && status !== 408
-    && status !== 429;
+// A key may only be retired by an answer the server produces after it looked
+// the key up. Rate limiting, auth middleware and request validation all reply
+// before that lookup, so a 401 or other early 4xx says nothing about an
+// earlier attempt whose response was lost: the key must survive so the retry
+// replays the original request instead of creating a duplicate.
+const DEFINITIVE_RETIRE_CODES = new Set(['IDEMPOTENCY_CONFLICT']);
+
+export function shouldRetirePendingKey(status, code) {
+  return status === 409
+    && typeof code === 'string'
+    && DEFINITIVE_RETIRE_CODES.has(code);
 }
 
 function decodeBase64Url(segment) {
@@ -164,7 +165,12 @@ export function createPendingSubmissionMap({
     }
   }
 
-  if (storageKey && storage) {
+  // Reconciles the in-memory view with storage. It only adds or updates keys
+  // from persisted records and only removes keys that carry a tombstone, so a
+  // record that failed to persist (quota, private mode) is never dropped from
+  // memory and accidentally replaced by a fresh id.
+  function loadFromStorage() {
+    if (!storageKey || !storage) return;
     try {
       const timestamp = now();
       const keys = listStorageKeys(storage, storageKey);
@@ -187,6 +193,7 @@ export function createPendingSubmissionMap({
           // Future timestamps beyond normal clock skew and stale entries are
           // discarded rather than trusted indefinitely.
           if (!record || !isFresh(record.savedAt, timestamp, maxAgeMs)) {
+            entries.delete(requestKey);
             try { storage.removeItem(key); } catch { /* ignore */ }
             continue;
           }
@@ -227,10 +234,33 @@ export function createPendingSubmissionMap({
     }
   }
 
+  loadFromStorage();
+
+  function deleteEntry(requestKey) {
+    const removed = entries.delete(requestKey);
+    if (!storageKey || !storage) return removed;
+    try { storage.removeItem(entryKey(requestKey)); } catch { /* ignore */ }
+    try {
+      storage.setItem(tombstoneKey(requestKey), JSON.stringify({
+        version: STORAGE_VERSION,
+        deletedAt: now()
+      }));
+    } catch {
+      // Without a tombstone the entry key removal still prevents reuse.
+    }
+    return removed;
+  }
+
   return {
     storageKey,
     size() {
       return entries.size;
+    },
+    // Re-reads storage so a remounted instance sees keys retired (or created)
+    // by an earlier instance before it decides whether to reuse an id.
+    refresh() {
+      loadFromStorage();
+      return this;
     },
     get(requestKey) {
       return entries.get(requestKey)?.clientOrderId;
@@ -251,25 +281,38 @@ export function createPendingSubmissionMap({
       persistEntry(requestKey, record);
 
       // A new submission supersedes an earlier deletion of the same request.
-      if (tombstones.delete(requestKey)) {
-        try { storage?.removeItem(tombstoneKey(requestKey)); } catch { /* ignore */ }
+      // The tombstone is cleared even when this instance never loaded it and
+      // even when both timestamps fall in the same millisecond.
+      tombstones.delete(requestKey);
+      if (storageKey && storage) {
+        try { storage.removeItem(tombstoneKey(requestKey)); } catch { /* ignore */ }
       }
     },
-    delete(requestKey) {
-      const removed = entries.delete(requestKey);
-      if (!removed) return removed;
+    // Retires a key only when the stored record still belongs to the request
+    // that completed. A remount or another tab may already hold a newer,
+    // genuinely unresolved submission under the same request key.
+    deleteIf(requestKey, clientOrderId) {
       if (storageKey && storage) {
-        try { storage.removeItem(entryKey(requestKey)); } catch { /* ignore */ }
         try {
-          storage.setItem(tombstoneKey(requestKey), JSON.stringify({
-            version: STORAGE_VERSION,
-            deletedAt: now()
-          }));
+          const stored = readStoredRecord(storage.getItem(entryKey(requestKey)));
+          if (stored) {
+            return stored.clientOrderId === clientOrderId && deleteEntry(requestKey);
+          }
+          // Nothing persisted: the key was already retired, unless this
+          // instance is holding an entry that failed to persist.
+          const buffered = entries.get(requestKey);
+          return Boolean(buffered)
+            && buffered.clientOrderId === clientOrderId
+            && deleteEntry(requestKey);
         } catch {
-          // Without a tombstone the entry key removal still prevents reuse.
+          // Fall through to the in-memory record when storage is unreadable.
         }
       }
-      return removed;
+      const record = entries.get(requestKey);
+      return Boolean(record) && record.clientOrderId === clientOrderId && deleteEntry(requestKey);
+    },
+    delete(requestKey) {
+      return deleteEntry(requestKey);
     }
   };
 }

@@ -994,6 +994,85 @@ describe('copilot proposal and confirmation flow', () => {
     expect(status.body.newTrade._id).toEqual(executed.body.newTrade._id);
   });
 
+  test('execution status re-reads the canonical result before reporting NOT_EXECUTED', async () => {
+    const results = [
+      null,
+      { status: 200, body: { success: true, executedPrice: 50000, balance: 5000 } }
+    ];
+    const calls = [];
+    const fakeTradeService = {
+      async getExecutionResult() {
+        calls.push('getExecutionResult');
+        return results.shift() || null;
+      },
+      async executeMarketOrder() {
+        throw new Error('Status lookups must never execute.');
+      },
+      async placeLimitOrder() {
+        throw new Error('Status lookups must never execute.');
+      }
+    };
+
+    const { app } = makeApp({
+      intents: { 'buy 0.1 btc': modelIntent() },
+      tradeService: fakeTradeService
+    });
+    const user = await createTestUser({ balance: 10000 });
+    const token = authToken(user);
+    const parsed = await parse(app, token, 'Buy 0.1 BTC');
+    expect(parsed.status).toBe(200);
+
+    // A concurrent instance commits the execution between the first lookup and
+    // the answer; the status must report the trade instead of NOT_EXECUTED.
+    const status = await executionStatus(app, token, parsed.body.proposalId);
+
+    expect(status.status).toBe(200);
+    expect(status.body).toMatchObject({
+      success: true,
+      execution: 'EXECUTED',
+      executedPrice: 50000
+    });
+    expect(calls).toEqual(['getExecutionResult', 'getExecutionResult']);
+  });
+
+  test('a settled failure is re-checked before reporting NOT_EXECUTED', async () => {
+    const results = [
+      null,
+      null,
+      { status: 200, body: { success: true, executedPrice: 50000 } }
+    ];
+    const fakeTradeService = {
+      async getExecutionResult() {
+        return results.shift() || null;
+      },
+      async executeMarketOrder() {
+        return { status: 503, body: { success: false, message: 'Price unavailable.' } };
+      },
+      async placeLimitOrder() {
+        throw new Error('Unexpected limit order.');
+      }
+    };
+
+    const { app } = makeApp({
+      intents: { 'buy 0.1 btc': modelIntent() },
+      tradeService: fakeTradeService
+    });
+    const user = await createTestUser({ balance: 10000 });
+    const token = authToken(user);
+    const parsed = await parse(app, token, 'Buy 0.1 BTC');
+    expect(parsed.status).toBe(200);
+
+    const execution = await execute(app, token, parsed.body.proposalId);
+    expect(execution.status).toBe(503);
+
+    // The remembered settled failure must not hide a trade that committed
+    // afterwards under the same proposal id.
+    const status = await executionStatus(app, token, parsed.body.proposalId);
+
+    expect(status.status).toBe(200);
+    expect(status.body).toMatchObject({ execution: 'EXECUTED', executedPrice: 50000 });
+  });
+
   test('resolving and discarding a proposal never calls the trade service', async () => {
     const calls = [];
     const fakeTradeService = {

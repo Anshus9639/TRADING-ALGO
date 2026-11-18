@@ -16,6 +16,7 @@ const {
   loadPendingOrders,
   serializePortfolio
 } = require('./accountView');
+const { resolveLegacyOrderId } = require('../lib/legacyIdentity');
 
 const CLIENT_ORDER_ID_PATTERN = /^[A-Za-z0-9:_-]{1,100}$/;
 
@@ -219,6 +220,24 @@ function createTradeService({
         body: {
           success: true,
           message: `${order.side} Limit Order Placed at $${order.limitPrice}`,
+          balance: user.balance,
+          lockedBalance: user.lockedBalance || 0,
+          portfolio: serializePortfolio(user),
+          pendingOrders: await loadPendingOrders(user),
+          idempotent: true
+        }
+      };
+    }
+
+    // A retry that reaches an order while the matcher holds its claim must be
+    // told the placement was accepted, not treated as a new submission. The
+    // escrow was reserved by the original request and is not reserved again.
+    if (order.status === 'FILLING' && order.orderType === 'LIMIT') {
+      return {
+        status: 200,
+        body: {
+          success: true,
+          message: `${order.side} Limit Order is being filled`,
           balance: user.balance,
           lockedBalance: user.lockedBalance || 0,
           portfolio: serializePortfolio(user),
@@ -901,8 +920,11 @@ function createTradeService({
 
         // Legacy embedded orders created before Batch D are still cancellable
         // with their original escrow semantics until the gated migration runs.
+        // Match the resolved identity the account view exposes: records that
+        // never stored an _id are shown with a deterministic id, so comparing
+        // the hydrating synthetic _id would make them impossible to cancel.
         const legacyIndex = (user.pendingOrders || []).findIndex(
-          o => String(o._id) === String(orderId)
+          o => o && String(resolveLegacyOrderId(user._id, o)) === String(orderId)
         );
         if (legacyIndex === -1) return reject(404, 'Order not found.');
 

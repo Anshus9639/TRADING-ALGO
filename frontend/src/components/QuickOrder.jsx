@@ -19,11 +19,21 @@ const QuickOrder = ({ activeSymbol, currentPrice, token, onTradeComplete }) => {
   const [hasUnresolved, setHasUnresolved] = useState(
     () => pendingSubmissions.current.size() > 0
   );
+  const tokenRef = useRef(token);
+  const mountedRef = useRef(true);
 
   useEffect(() => {
+    tokenRef.current = token;
     pendingSubmissions.current = createPendingSubmissionMap({ token });
     setHasUnresolved(pendingSubmissions.current.size() > 0);
   }, [token]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   // 🚀 Auto-fill limit price with the current live price when switching to LIMIT tab
   useEffect(() => {
@@ -41,7 +51,13 @@ const QuickOrder = ({ activeSymbol, currentPrice, token, onTradeComplete }) => {
     if (orderType === 'LIMIT' && (!limitPrice || limitPrice <= 0)) return setMessage({ text: "Error: Enter a valid target price.", type: "error" });
 
     setLoading(true);
+    const sessionToken = token;
+    // The pending map is captured for this submission: a logout/login during
+    // the request must not redirect its storage writes into another scope.
+    const submissions = pendingSubmissions.current.refresh();
+    const isCurrent = () => mountedRef.current && tokenRef.current === sessionToken;
     let requestKey = null;
+    let clientOrderId = null;
     try {
       let endpoint = '';
       const numericQuantity = Number(quantity);
@@ -64,17 +80,22 @@ const QuickOrder = ({ activeSymbol, currentPrice, token, onTradeComplete }) => {
         numericQuantity,
         orderType === 'LIMIT' ? numericLimitPrice : 'MARKET'
       ].join('|');
-      const pending = pendingSubmissions.current.get(requestKey);
+      const pending = submissions.get(requestKey);
       if (pending) {
-        payload.clientOrderId = pending;
+        clientOrderId = pending;
       } else {
-        payload.clientOrderId = createClientOrderId();
-        pendingSubmissions.current.set(requestKey, payload.clientOrderId);
+        clientOrderId = createClientOrderId();
+        submissions.set(requestKey, clientOrderId);
       }
+      payload.clientOrderId = clientOrderId;
 
-      const res = await api.post(endpoint, payload, authHeaders(token));
-      pendingSubmissions.current.delete(requestKey);
-      setHasUnresolved(pendingSubmissions.current.size() > 0);
+      const res = await api.post(endpoint, payload, authHeaders(sessionToken));
+      // Only retire the key this request used. A newer unresolved submission
+      // created under the same request key keeps its own id.
+      submissions.deleteIf(requestKey, clientOrderId);
+
+      if (!isCurrent()) return;
+      setHasUnresolved(submissions.size() > 0);
 
       // Success! Show inline message
       const successText = orderType === 'LIMIT' 
@@ -89,22 +110,27 @@ const QuickOrder = ({ activeSymbol, currentPrice, token, onTradeComplete }) => {
       }
       
     } catch (err) {
-      // A definitive 4xx answer proves the server rejected the request, so its
-      // key can be retired. Network failures, timeouts, rate limits and 5xx
-      // responses are uncertain and keep the key so a retry replays the same
-      // order instead of placing a duplicate.
+      // Only a response produced after the backend looked the key up proves
+      // the order was not created. Early 4xx answers (auth, rate limiting,
+      // request validation) and uncertain failures keep the key for a retry.
       const status = err.response?.status;
-      if (requestKey && shouldRetirePendingKey(status)) {
-        pendingSubmissions.current.delete(requestKey);
+      const code = err.response?.data?.code;
+      if (requestKey && clientOrderId && shouldRetirePendingKey(status, code)) {
+        submissions.deleteIf(requestKey, clientOrderId);
       }
-      setHasUnresolved(pendingSubmissions.current.size() > 0);
+      if (!isCurrent()) return;
+      setHasUnresolved(submissions.size() > 0);
       // Error! Show inline message
       const errorMsg = err.response?.data?.message || "Trade failed due to server error.";
       setMessage({ text: `Rejected: ${errorMsg}`, type: "error" });
     } finally {
-      setLoading(false);
-      // Auto-hide the message after 3 seconds
-      setTimeout(() => setMessage(null), 3000);
+      if (isCurrent()) {
+        setLoading(false);
+        // Auto-hide the message after 3 seconds
+        setTimeout(() => {
+          if (mountedRef.current) setMessage(null);
+        }, 3000);
+      }
     }
   };
 

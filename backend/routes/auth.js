@@ -6,7 +6,7 @@ const jwt = require('jsonwebtoken');
 const auth = require('../middleware/auth');
 const { rateLimitOptions } = require('../middleware/rateLimit');
 const { getJwtSecret, getRateLimitConfig } = require('../config/env');
-const { loadAccountView } = require('../services/accountView');
+const { loadConsistentAccountView } = require('../services/accountView');
 
 const MAX_EMAIL_LENGTH = 254;
 const MAX_USERNAME_LENGTH = 50;
@@ -15,18 +15,23 @@ const MAX_USERNAME_LENGTH = 50;
 const MAX_PASSWORD_LENGTH = 72;
 // Allowlist of the fields the account view reads. The password hash is never
 // loaded for session restoration; an exclusion projection would still fetch a
-// document the hash analysis treats as password-bearing.
-const ACCOUNT_VIEW_FIELDS = 'username email balance lockedBalance portfolio pendingOrders trades';
-const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+// document the hash analysis treats as password-bearing. `updatedAt` lets the
+// view detect an account write that raced its collection reads.
+const ACCOUNT_VIEW_FIELDS = 'username email balance lockedBalance portfolio pendingOrders trades updatedAt';
+// New accounts must use a dotted domain. Accounts created before this rule may
+// hold a local-only domain (for example "trader@localhost"); login accepts any
+// single @ with a non-empty local part so those owners can still authenticate.
+const SIGNUP_EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const LOGIN_EMAIL_PATTERN = /^[^\s@]+@[^\s@]+$/;
 
 function readBodyObject(body) {
   return body && typeof body === 'object' && !Array.isArray(body) ? body : {};
 }
 
-function normalizeEmail(value) {
+function normalizeEmail(value, pattern = SIGNUP_EMAIL_PATTERN) {
   if (typeof value !== 'string') return null;
   const email = value.trim().toLowerCase();
-  if (!email || email.length > MAX_EMAIL_LENGTH || !EMAIL_PATTERN.test(email)) return null;
+  if (!email || email.length > MAX_EMAIL_LENGTH || !pattern.test(email)) return null;
   return email;
 }
 
@@ -54,7 +59,7 @@ function readLoginPassword(value) {
 }
 
 async function buildUserPayload(user) {
-  const view = await loadAccountView(user);
+  const view = await loadConsistentAccountView(user);
   return {
     id: view.id,
     username: view.username,
@@ -136,7 +141,7 @@ function createAuthRouter({ rateLimits = getRateLimitConfig() } = {}) {
   router.post('/login', credentialsLimiter, async (req, res) => {
     try {
       const body = readBodyObject(req.body);
-      const email = normalizeEmail(body.email);
+      const email = normalizeEmail(body.email, LOGIN_EMAIL_PATTERN);
       const password = readLoginPassword(body.password);
 
       // Reject non-string or malformed credentials before building a query.
