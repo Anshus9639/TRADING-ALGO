@@ -1,6 +1,6 @@
 const crypto = require('crypto');
 const Order = require('../models/Order');
-const { SUPPORTED_SYMBOLS } = require('../lib/validate');
+const { isSymbolFormat } = require('../lib/symbols');
 const { shouldExecuteLimitOrder } = require('./limitMatcher');
 
 const DEFAULT_BATCH_SIZE = 25;
@@ -12,7 +12,9 @@ function isPositiveFinite(value) {
 }
 
 function isMalformedOrder(order) {
-  if (!order || typeof order.symbol !== 'string' || !SUPPORTED_SYMBOLS.includes(order.symbol)) return true;
+  // A catalogue refresh must never turn a valid open order into a malformed
+  // one: only a structurally invalid symbol is unrecoverable here.
+  if (!order || !isSymbolFormat(order.symbol)) return true;
   if (!['BUY', 'SELL'].includes(order.side)) return true;
   if (!isPositiveFinite(order.quantity) || !isPositiveFinite(order.remainingQuantity)) return true;
   if (!isPositiveFinite(order.limitPrice)) return true;

@@ -203,3 +203,36 @@ describe('limit matcher freshness gating', () => {
     expect(shouldExecuteLimitOrder(unfillableSell, quote)).toBe(false);
   });
 });
+
+describe('marketFeed dynamic symbol set', () => {
+  test('swaps the supported set and reports membership', () => {
+    const feed = createMarketFeed({ symbols: ['BTCUSDT'] });
+
+    expect(feed.hasSymbol('BTCUSDT')).toBe(true);
+    expect(feed.hasSymbol('DOGEUSDT')).toBe(false);
+
+    const next = feed.setSymbols(['btcusdt', 'dogeusdt', 'DOGEUSDT']);
+    expect(next).toEqual(['BTCUSDT', 'DOGEUSDT']);
+    expect(feed.hasSymbol('DOGEUSDT')).toBe(true);
+  });
+
+  test('prunes quotes for symbols that leave the universe', () => {
+    const feed = createMarketFeed({ symbols: ['BTCUSDT', 'DOGEUSDT'] });
+    feed.setQuote('DOGEUSDT', 0.5);
+
+    feed.setSymbols(['BTCUSDT']);
+    expect(feed.hasSymbol('DOGEUSDT')).toBe(false);
+    expect(feed.getQuote('DOGEUSDT')).toEqual({ status: 'missing', symbol: 'DOGEUSDT' });
+
+    // A returning pair must not inherit its old observation.
+    feed.setSymbols(['BTCUSDT', 'DOGEUSDT']);
+    expect(feed.getQuote('DOGEUSDT')).toEqual({ status: 'missing', symbol: 'DOGEUSDT' });
+  });
+
+  test('keeps the current set when asked to apply an empty list', () => {
+    const feed = createMarketFeed({ symbols: ['BTCUSDT'] });
+
+    expect(feed.setSymbols([])).toEqual(['BTCUSDT']);
+    expect(feed.hasSymbol('BTCUSDT')).toBe(true);
+  });
+});

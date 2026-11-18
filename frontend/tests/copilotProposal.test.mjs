@@ -304,6 +304,32 @@ test('an uncertain 5xx keeps the proposal instead of discarding it', async () =>
   })), true);
 });
 
+test('a definitive MARKET_RULES_UNAVAILABLE rejection releases the proposal', async () => {
+  const failure = Object.assign(new Error('Request failed'), {
+    response: {
+      status: 503,
+      data: {
+        success: false,
+        code: 'MARKET_RULES_UNAVAILABLE',
+        message: 'Trading is temporarily unavailable for this market because exchange rules could not be verified.'
+      }
+    }
+  });
+  const http = recorder({ executeRejection: failure });
+  const state = createProposalState(payload(), NOW);
+
+  const result = await confirmProposal({ http, state, token: 'token-1', now: NOW });
+
+  // The backend raises this before any transaction, so no order can exist for
+  // the proposal id. It must not be offered as a retryable unknown outcome.
+  assert.equal(result.ok, false);
+  assert.equal(result.uncertain, undefined);
+  assert.equal(result.definitive, true);
+  assert.equal(result.reason, 'MARKET_RULES_UNAVAILABLE');
+  assert.equal(canConfirm(result.state, NOW), false);
+  assert.match(result.state.error, /temporarily unavailable/);
+});
+
 test('a definitive 4xx rejection discards the proposal and never retries', async () => {
   const failure = Object.assign(new Error('Request failed'), {
     response: {

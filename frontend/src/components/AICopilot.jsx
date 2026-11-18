@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Bot, Send, Sparkles, Check, X, AlertTriangle } from 'lucide-react';
+import { Send, Sparkles, Check, X, AlertTriangle } from 'lucide-react';
 import { api } from '../lib/api';
+import { formatPrice } from '../lib/marketFormat.mjs';
 import {
   createConfirmLock,
   requestProposal,
@@ -114,7 +115,7 @@ const AICopilot = ({ token, watchlist, onTradeComplete }) => {
     const trade = result.result || {};
     const confirmation = current.intent?.orderType === 'LIMIT'
       ? `${current.intent.side} ${current.intent.quantity} ${current.intent.symbol} limit @ $${current.intent.limitPrice}`
-      : `${current.intent?.side} ${current.intent?.quantity} ${current.intent?.symbol} @ $${Number(trade.executedPrice).toFixed(2)}`;
+      : `${current.intent?.side} ${current.intent?.quantity} ${current.intent?.symbol} @ $${formatPrice(Number(trade.executedPrice))}`;
 
     setLog({ text: `Success: ${confirmation}`, status: 'success' });
     setProposal(null);
@@ -235,29 +236,16 @@ const AICopilot = ({ token, watchlist, onTradeComplete }) => {
   const reconcileEnabled = canReconcile(proposal) && !loading;
 
   return (
-    <div className="bg-[#161a1e] p-4 rounded-xl border border-gray-800 relative overflow-hidden group">
-      
-      {/* --- ANIMATED BACKGROUND ELEMENTS --- */}
-      {/* Purple breathing orb */}
-      <div className="absolute -top-10 -right-10 w-40 h-40 bg-purple-600/20 rounded-full blur-3xl animate-pulse pointer-events-none" />
-      {/* Blue breathing orb (delayed pulse) */}
-      <div className="absolute -bottom-10 -left-10 w-40 h-40 bg-blue-600/10 rounded-full blur-3xl animate-pulse pointer-events-none" style={{ animationDelay: '1.5s' }} />
-      
-      {/* Static grid overlay for that "Terminal" feel */}
-      <div className="absolute inset-0 bg-[linear-gradient(rgba(255,255,255,0.02)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.02)_1px,transparent_1px)] bg-[size:20px_20px] pointer-events-none" />
+    <div className="panel relative overflow-hidden p-4">
+      <div className="pointer-events-none absolute -right-12 -top-12 h-36 w-36 rounded-full bg-violet/15 blur-3xl" aria-hidden="true" />
+      <div className="pointer-events-none absolute -bottom-12 -left-12 h-36 w-36 rounded-full bg-cyan/10 blur-3xl" aria-hidden="true" />
 
-      {/* Hover-reactive Bot Icon */}
-      <div className="absolute top-2 right-2 opacity-5 group-hover:opacity-20 group-hover:scale-110 transition-all duration-700 pointer-events-none">
-        <Bot size={120} className="text-purple-400" />
-      </div>
-      {/* ------------------------------------ */}
-
-      <h4 className="text-xs font-bold mb-3 flex items-center gap-2 text-purple-400 uppercase tracking-wider relative z-10">
-        <Sparkles size={14} className="animate-pulse" /> Bruda Bot
+      <h4 className="relative z-10 mb-3 flex items-center gap-2 font-display text-xs font-semibold uppercase tracking-[0.16em] text-ultraviolet">
+        <Sparkles size={14} aria-hidden="true" /> Bruda Bot
       </h4>
 
       <form onSubmit={handleCommand} className="relative z-10">
-        <div className="flex bg-[#0b0e11]/80 backdrop-blur-sm rounded border border-gray-800 focus-within:border-purple-500 transition-colors shadow-inner">
+        <div className="flex rounded-lg border border-line-subtle bg-void/70 backdrop-blur-sm transition-colors focus-within:border-violet/60">
           <input 
             type="text"
             value={prompt}
@@ -265,34 +253,35 @@ const AICopilot = ({ token, watchlist, onTradeComplete }) => {
             maxLength={500}
             disabled={loading || uncertain}
             placeholder='e.g., "Buy 0.5 BTC if it drops to $60,000"'
-            className="flex-1 bg-transparent text-sm text-white p-3 outline-none placeholder-gray-600 font-mono"
+            className="flex-1 bg-transparent p-3 font-mono text-sm text-ink-primary outline-none placeholder:text-ink-muted"
           />
           <button 
             type="submit" 
             disabled={loading || uncertain || !prompt.trim()}
-            className="p-3 text-gray-500 hover:text-purple-400 transition-all disabled:opacity-50 hover:scale-110"
+            aria-label="Ask the copilot"
+            className="p-3 text-ink-muted transition-colors hover:text-ultraviolet disabled:opacity-50"
           >
-            <Send size={18} />
+            <Send size={18} aria-hidden="true" />
           </button>
         </div>
       </form>
 
       {/* --- CONFIRMATION CARD: nothing executes until Confirm --- */}
       {proposal && preview && (
-        <div className="relative z-10 mt-3 rounded-lg border border-purple-500/40 bg-[#0b0e11]/90 p-3 font-mono text-[10px] text-gray-300 shadow-lg">
-          <div className="flex justify-between items-center mb-2">
-            <span className="text-purple-300 font-bold uppercase tracking-wider">Trade Proposal</span>
-            <span className={`px-2 py-0.5 rounded font-bold ${
+        <div className="relative z-10 mt-3 rounded-lg border border-violet/40 bg-void/90 p-3 font-mono text-[10px] text-ink-secondary shadow-panel">
+          <div className="mb-2 flex items-center justify-between">
+            <span className="font-semibold uppercase tracking-wider text-ultraviolet">Trade Proposal</span>
+            <span className={`rounded px-2 py-0.5 font-semibold ${
               uncertain
-                ? 'text-amber-400 bg-amber-500/10'
-                : expired ? 'text-red-400 bg-red-500/10' : 'text-yellow-400 bg-yellow-500/10'
+                ? 'bg-amber/10 text-amber'
+                : expired ? 'bg-negative/10 text-negative' : 'bg-violet/15 text-ultraviolet'
             }`}>
               {uncertain ? 'UNCONFIRMED' : expired ? 'EXPIRED' : `Expires in ${formatRemaining(proposal, now)}`}
             </span>
           </div>
 
           {uncertain && (
-            <div className="mb-2 flex gap-1.5 items-start text-amber-400">
+            <div className="mb-2 flex items-start gap-1.5 text-amber">
               <AlertTriangle size={11} className="mt-0.5 shrink-0" />
               <span>
                 Execution outcome is unknown. Retry with the same proposal, reconcile it after
@@ -302,17 +291,17 @@ const AICopilot = ({ token, watchlist, onTradeComplete }) => {
           )}
 
           <div className="grid grid-cols-2 gap-x-3 gap-y-1">
-            <span className="text-gray-500 uppercase">Side</span>
-            <span className={`font-bold ${preview.side === 'BUY' ? 'text-green-500' : 'text-red-500'}`}>
+            <span className="text-ink-muted uppercase">Side</span>
+            <span className={`font-semibold ${preview.side === 'BUY' ? 'text-positive' : 'text-negative'}`}>
               {preview.side}
             </span>
-            <span className="text-gray-500 uppercase">Pair</span>
-            <span className="font-bold text-white">{preview.symbol}</span>
-            <span className="text-gray-500 uppercase">Type</span>
+            <span className="text-ink-muted uppercase">Pair</span>
+            <span className="font-semibold text-ink-primary">{preview.symbol}</span>
+            <span className="text-ink-muted uppercase">Type</span>
             <span>{preview.orderType}</span>
-            <span className="text-gray-500 uppercase">Quantity</span>
+            <span className="text-ink-muted uppercase">Quantity</span>
             <span>{preview.quantity}</span>
-            <span className="text-gray-500 uppercase">
+            <span className="text-ink-muted uppercase">
               {preview.orderType === 'LIMIT' ? 'Limit Price' : 'Market Price'}
             </span>
             <span>
@@ -320,9 +309,9 @@ const AICopilot = ({ token, watchlist, onTradeComplete }) => {
                 ? Number(preview.limitPrice).toLocaleString()
                 : Number(preview.quotePrice).toLocaleString()}
             </span>
-            <span className="text-gray-500 uppercase">Est. Total</span>
+            <span className="text-ink-muted uppercase">Est. Total</span>
             <span className="font-bold">${Number(preview.estimatedValue).toLocaleString()}</span>
-            <span className="text-gray-500 uppercase">
+            <span className="text-ink-muted uppercase">
               {preview.side === 'BUY' ? 'Available USDT' : `Available ${preview.symbol}`}
             </span>
             <span>
@@ -333,7 +322,7 @@ const AICopilot = ({ token, watchlist, onTradeComplete }) => {
           </div>
 
           {preview.warnings && preview.warnings.length > 0 && (
-            <div className="mt-2 space-y-1 text-amber-400">
+            <div className="mt-2 space-y-1 text-amber">
               {preview.warnings.map((warning, index) => (
                 <div key={index} className="flex gap-1.5 items-start">
                   <AlertTriangle size={11} className="mt-0.5 shrink-0" />
@@ -349,7 +338,7 @@ const AICopilot = ({ token, watchlist, onTradeComplete }) => {
                 type="button"
                 onClick={() => handleConfirm(true)}
                 disabled={!reconcileEnabled}
-                className="flex-1 flex items-center justify-center gap-1 bg-amber-500/20 border border-amber-500/40 text-amber-400 font-bold py-1.5 rounded hover:bg-amber-500/30 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                className="flex-1 flex items-center justify-center gap-1 rounded border border-amber/40 bg-amber/15 py-1.5 font-semibold text-amber transition-colors hover:bg-amber/25 disabled:cursor-not-allowed disabled:opacity-40"
               >
                 <AlertTriangle size={12} /> Reconcile
               </button>
@@ -358,7 +347,7 @@ const AICopilot = ({ token, watchlist, onTradeComplete }) => {
                 type="button"
                 onClick={() => handleConfirm(false)}
                 disabled={!confirmEnabled}
-                className="flex-1 flex items-center justify-center gap-1 bg-green-500/20 border border-green-500/40 text-green-400 font-bold py-1.5 rounded hover:bg-green-500/30 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                className="flex-1 flex items-center justify-center gap-1 rounded border border-positive/40 bg-positive/15 py-1.5 font-semibold text-positive transition-colors hover:bg-positive/25 disabled:cursor-not-allowed disabled:opacity-40"
               >
                 <Check size={12} /> {uncertain ? 'Retry execution' : 'Confirm'}
               </button>
@@ -367,7 +356,7 @@ const AICopilot = ({ token, watchlist, onTradeComplete }) => {
               type="button"
               onClick={handleDiscard}
               disabled={loading}
-              className="flex-1 flex items-center justify-center gap-1 bg-gray-800/60 border border-gray-700 text-gray-400 font-bold py-1.5 rounded hover:bg-gray-700 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+              className="flex-1 flex items-center justify-center gap-1 rounded border border-line-strong bg-panel-2/60 py-1.5 font-semibold text-ink-secondary transition-colors hover:bg-panel-3 disabled:cursor-not-allowed disabled:opacity-40"
             >
               <X size={12} /> {uncertain ? 'Resolve & discard' : 'Discard'}
             </button>
@@ -377,10 +366,10 @@ const AICopilot = ({ token, watchlist, onTradeComplete }) => {
 
       {/* Dynamic Status Log */}
       {log && (
-        <div className={`relative z-10 mt-3 text-[10px] font-mono font-bold px-2 py-1.5 rounded animate-pulse shadow-lg ${
-          log.status === 'success' ? 'text-green-400 bg-green-500/10 border border-green-500/20' : 
-          log.status === 'error' ? 'text-red-400 bg-red-500/10 border border-red-500/20' : 
-          'text-purple-400 bg-purple-500/10 border border-purple-500/20'
+        <div className={`relative z-10 mt-3 rounded border px-2 py-1.5 font-mono text-[10px] font-semibold ${
+          log.status === 'success' ? 'border-positive/20 bg-positive/10 text-positive' :
+          log.status === 'error' ? 'border-negative/20 bg-negative/10 text-negative' :
+          'border-violet/20 bg-violet/10 text-ultraviolet'
         }`}>
            {log.text}
         </div>

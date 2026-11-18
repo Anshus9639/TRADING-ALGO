@@ -1,5 +1,5 @@
 const { GoogleGenerativeAI, SchemaType } = require('@google/generative-ai');
-const { SUPPORTED_SYMBOLS } = require('../../lib/validate');
+const { symbolUniverse } = require('../symbolUniverse');
 const { DEFAULT_GEMINI_MODEL, DEFAULT_GEMINI_TIMEOUT_MS } = require('../../config/env');
 
 class AiUnavailableError extends Error {
@@ -121,11 +121,18 @@ function stripMarkdownFences(text) {
     .trim();
 }
 
+function resolveSymbolList(source) {
+  const list = typeof source === 'function' ? source() : source;
+  if (!Array.isArray(list)) return null;
+  const cleaned = Array.from(new Set(list.filter(s => typeof s === 'string' && s)));
+  return cleaned.length > 0 ? cleaned : null;
+}
+
 function createGeminiIntentExtractor({
   apiKey,
   model = DEFAULT_GEMINI_MODEL,
   timeoutMs = DEFAULT_GEMINI_TIMEOUT_MS,
-  symbols = SUPPORTED_SYMBOLS
+  symbols = () => symbolUniverse.listActive()
 } = {}) {
   if (!apiKey) throw new AiUnavailableError('AI copilot is not configured.');
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
@@ -133,19 +140,36 @@ function createGeminiIntentExtractor({
   }
 
   const genAI = new GoogleGenerativeAI(apiKey);
-  const generativeModel = genAI.getGenerativeModel({
-    model,
-    generationConfig: {
-      responseMimeType: 'application/json',
-      responseSchema: buildResponseSchema(symbols)
+  // The catalogue can change at runtime, so the schema is rebuilt whenever the
+  // active symbol set changes instead of being frozen at construction.
+  const modelsBySymbols = new Map();
+
+  function modelFor(symbolList) {
+    const key = symbolList.join(',');
+    let generativeModel = modelsBySymbols.get(key);
+    if (!generativeModel) {
+      generativeModel = genAI.getGenerativeModel({
+        model,
+        generationConfig: {
+          responseMimeType: 'application/json',
+          responseSchema: buildResponseSchema(symbolList)
+        }
+      });
+      modelsBySymbols.set(key, generativeModel);
     }
-  });
+    return generativeModel;
+  }
 
   async function extract({ prompt, context } = {}) {
+    const symbolList = resolveSymbolList(symbols);
+    if (!symbolList) {
+      throw new AiUnavailableError('No tradeable markets are currently available.');
+    }
+
     let text;
     try {
-      const result = await generativeModel.generateContent(
-        buildIntentPrompt({ prompt, context, symbols }),
+      const result = await modelFor(symbolList).generateContent(
+        buildIntentPrompt({ prompt, context, symbols: symbolList }),
         { timeout: timeoutMs }
       );
       text = result.response.text();

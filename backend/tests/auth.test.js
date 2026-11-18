@@ -370,3 +370,124 @@ describe('authentication and session restoration', () => {
     expect(duplicate.status).toBe(400);
   });
 });
+
+describe('per-user watchlist', () => {
+  let app;
+
+  beforeAll(async () => {
+    await startTestDb();
+  }, 120000);
+
+  afterAll(async () => {
+    await stopTestDb();
+  });
+
+  beforeEach(() => {
+    app = createApp({ feed: createMarketFeed() });
+  });
+
+  async function signedInUser(overrides = {}) {
+    const user = await createLoginUser(overrides);
+    const login = await request(app)
+      .post('/api/auth/login')
+      .send({ email: user.email, password: PASSWORD });
+    return { user, token: login.body.token };
+  }
+
+  test('stores normalized, deduplicated symbols and returns them on session restore', async () => {
+    const { token } = await signedInUser();
+
+    const put = await request(app)
+      .put('/api/auth/watchlist')
+      .set('x-auth-token', token)
+      .send({ symbols: [' ethusdt ', 'BTCUSDT', 'ETHUSDT'] });
+
+    expect(put.status).toBe(200);
+    expect(put.body).toEqual({ symbols: ['ETHUSDT', 'BTCUSDT'] });
+
+    const get = await request(app)
+      .get('/api/auth/watchlist')
+      .set('x-auth-token', token);
+    expect(get.status).toBe(200);
+    expect(get.body).toEqual({ symbols: ['ETHUSDT', 'BTCUSDT'] });
+
+    const me = await request(app)
+      .get('/api/auth/me')
+      .set('x-auth-token', token);
+    expect(me.body.watchlist).toEqual(['ETHUSDT', 'BTCUSDT']);
+  });
+
+  test('stored watchlists are isolated per account', async () => {
+    const owner = await signedInUser();
+    const other = await signedInUser();
+
+    await request(app)
+      .put('/api/auth/watchlist')
+      .set('x-auth-token', owner.token)
+      .send({ symbols: ['BTCUSDT'] });
+
+    const otherRead = await request(app)
+      .get('/api/auth/watchlist')
+      .set('x-auth-token', other.token);
+    expect(otherRead.body).toEqual({ symbols: [] });
+
+    await request(app)
+      .put('/api/auth/watchlist')
+      .set('x-auth-token', other.token)
+      .send({ symbols: ['ETHUSDT'] });
+
+    const ownerRead = await request(app)
+      .get('/api/auth/watchlist')
+      .set('x-auth-token', owner.token);
+    expect(ownerRead.body).toEqual({ symbols: ['BTCUSDT'] });
+  });
+
+  test('rejects inactive or malformed symbols and keeps the stored list intact', async () => {
+    const { token } = await signedInUser();
+
+    await request(app)
+      .put('/api/auth/watchlist')
+      .set('x-auth-token', token)
+      .send({ symbols: ['BTCUSDT'] });
+
+    for (const symbols of [['DOGEUSDT'], ['BTC/USDT'], [null], 'BTCUSDT']) {
+      const res = await request(app)
+        .put('/api/auth/watchlist')
+        .set('x-auth-token', token)
+        .send({ symbols });
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('INVALID_WATCHLIST');
+    }
+
+    const get = await request(app)
+      .get('/api/auth/watchlist')
+      .set('x-auth-token', token);
+    expect(get.body).toEqual({ symbols: ['BTCUSDT'] });
+  });
+
+  test('bounds the watchlist size and allows clearing it', async () => {
+    const { token } = await signedInUser();
+
+    const tooMany = Array.from({ length: 26 }, (_, index) => `SYMBOL${index}USDT`);
+    const rejected = await request(app)
+      .put('/api/auth/watchlist')
+      .set('x-auth-token', token)
+      .send({ symbols: tooMany });
+    expect(rejected.status).toBe(400);
+
+    const cleared = await request(app)
+      .put('/api/auth/watchlist')
+      .set('x-auth-token', token)
+      .send({ symbols: [] });
+    expect(cleared.status).toBe(200);
+    expect(cleared.body).toEqual({ symbols: [] });
+  });
+
+  test('requires authentication', async () => {
+    const get = await request(app).get('/api/auth/watchlist');
+    const put = await request(app).put('/api/auth/watchlist').send({ symbols: [] });
+
+    expect(get.status).toBe(401);
+    expect(put.status).toBe(401);
+  });
+});

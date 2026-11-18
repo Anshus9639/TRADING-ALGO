@@ -51,6 +51,16 @@ const UserSchema = new mongoose.Schema({
       timestamp: { type: Date, default: Date.now }
     }
   ],
+
+  // Symbols pinned in the user's market navigator. Purely presentational: the
+  // tradeable set is always decided by the live catalogue.
+  watchlist: [
+    {
+      type: String,
+      uppercase: true,
+      maxlength: 20
+    }
+  ],
   
   trades: [
     {

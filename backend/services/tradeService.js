@@ -1,12 +1,14 @@
 const mongoose = require('mongoose');
 const {
   validateSymbol,
+  validateSymbolFormat,
   validateSide,
   validateQuantity,
   validateLimitPrice,
   validateNotional
 } = require('../lib/validate');
 const { roundTo, DUST_THRESHOLD } = require('../lib/numbers');
+const { checkMarketRules, hasUsableMarketRules } = require('../lib/exchangeFilters');
 const { assertTransition } = require('../lib/orderState');
 const { shouldExecuteLimitOrder } = require('./limitMatcher');
 const { TRANSACTIONS_UNAVAILABLE, createTransactionSupport } = require('../lib/transactions');
@@ -144,10 +146,32 @@ function createTradeService({
   Trade = require('../models/Trade'),
   transactionSupport = null,
   runtimeStatus = null,
+  getMarketRules = null,
   now = Date.now
 } = {}) {
   if (!feed || typeof feed.getQuote !== 'function') {
     throw new TypeError('createTradeService requires a market feed instance.');
+  }
+
+  // Per-symbol exchange filters (tick/lot/minimums) come from the live
+  // catalogue. When a provider is configured, complete filters are required:
+  // new orders fail closed instead of being validated against global limits
+  // the exchange may not honour. A provider therefore also acts as the
+  // authority for which symbols currently have verifiable trading rules.
+  function resolveMarketRules(symbol) {
+    if (typeof getMarketRules !== 'function') {
+      return { required: false, rules: null };
+    }
+    const rules = getMarketRules(symbol);
+    return { required: true, rules: hasUsableMarketRules(rules) ? rules : null };
+  }
+
+  function marketRulesUnavailable() {
+    return reject(
+      503,
+      'Trading is temporarily unavailable for this market because exchange rules could not be verified.',
+      'MARKET_RULES_UNAVAILABLE'
+    );
   }
 
   const support = transactionSupport
@@ -266,7 +290,9 @@ function createTradeService({
     clientOrderId,
     executionQuote = null
   }) {
-    const symbolCheck = validateSymbol(symbol);
+    // Format-only first: a retried request for a pair that has since left the
+    // live catalogue must still be able to replay its original order.
+    const symbolCheck = validateSymbolFormat(symbol);
     if (!symbolCheck.ok) return reject(400, symbolCheck.error);
 
     const sideCheck = validateSide(side);
@@ -296,6 +322,16 @@ function createTradeService({
       if (resolved) return resolved;
     }
 
+    const activeCheck = validateSymbol(normalizedSymbol);
+    if (!activeCheck.ok) return reject(400, activeCheck.error);
+
+    // A pair the catalogue cannot describe with complete filters is not
+    // tradeable, even though the global limits alone would accept it. This
+    // runs after the prior-order replay so an accepted order still returns its
+    // original result when exchange metadata later becomes unavailable.
+    const marketRules = resolveMarketRules(normalizedSymbol);
+    if (marketRules.required && !marketRules.rules) return marketRulesUnavailable();
+
     // A quote accepted by a caller (AI drift check) is used for settlement so
     // the price shown and the price filled are the same observation. Freshness
     // is still verified against the authoritative feed.
@@ -315,6 +351,16 @@ function createTradeService({
     if (!notionalCheck.ok) return reject(400, notionalCheck.error);
     const notional = notionalCheck.value;
 
+    // Refuse a size or value the market itself would reject. An explicit
+    // quantity is never rounded into something the user did not request.
+    const rulesCheck = checkMarketRules({
+      quantity: normalizedQuantity,
+      price: executionPrice,
+      rules: marketRules.rules,
+      enforceTick: false
+    });
+    if (!rulesCheck.ok) return reject(400, rulesCheck.error, 'INVALID_ORDER_PRECISION');
+
     try {
       const outcome = await runTransaction(async session => {
         // A retry can reach its transaction after the original request has
@@ -331,6 +377,17 @@ function createTradeService({
             409,
             'Execution quote expired before settlement. Request a fresh proposal.',
             'PRICE_CHANGED'
+          );
+        }
+
+        // A manual order has no caller-supplied observation, so the feed is the
+        // only source. It must still be fresh at settlement, not merely when
+        // the request was accepted.
+        if (!executionQuote && feed.getQuote(normalizedSymbol).status !== 'ok') {
+          throw new TradeRejection(
+            503,
+            'Market price expired before settlement. Please retry.',
+            'PRICE_UNAVAILABLE'
           );
         }
 
@@ -455,7 +512,9 @@ function createTradeService({
     limitPrice,
     clientOrderId
   }) {
-    const symbolCheck = validateSymbol(symbol);
+    // Format-only first: replaying a prior order must outrank the live
+    // catalogue check (see executeMarketOrder).
+    const symbolCheck = validateSymbolFormat(symbol);
     if (!symbolCheck.ok) return reject(400, symbolCheck.error);
 
     const sideCheck = validateSide(side);
@@ -493,6 +552,21 @@ function createTradeService({
       const resolved = await resolveExistingOrder(prior, expected);
       if (resolved) return resolved;
     }
+
+    const activeCheck = validateSymbol(normalizedSymbol);
+    if (!activeCheck.ok) return reject(400, activeCheck.error);
+
+    // New LIMIT orders fail closed for the same reason as market orders; the
+    // prior-order replay above keeps an existing order addressable.
+    const marketRules = resolveMarketRules(normalizedSymbol);
+    if (marketRules.required && !marketRules.rules) return marketRulesUnavailable();
+
+    const rulesCheck = checkMarketRules({
+      quantity: normalizedQuantity,
+      price: normalizedLimitPrice,
+      rules: marketRules.rules
+    });
+    if (!rulesCheck.ok) return reject(400, rulesCheck.error, 'INVALID_ORDER_PRECISION');
 
     // New LIMIT orders are refused while the matcher cannot safely execute
     // them (legacy gate, transactions, indexes, or a failed matcher). Market

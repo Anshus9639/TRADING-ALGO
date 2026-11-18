@@ -7,8 +7,12 @@ const {
   roundTo,
   decimalPlaces
 } = require('./numbers');
+const { PINNED_SYMBOLS, normalizeSymbol } = require('./symbols');
+const { symbolUniverse } = require('../services/symbolUniverse');
 
-const SUPPORTED_SYMBOLS = Object.freeze(['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT']);
+// Retained for compatibility with older imports. Trading validity is decided
+// by the catalogue-backed universe, not by this pinned display list.
+const SUPPORTED_SYMBOLS = PINNED_SYMBOLS;
 const SUPPORTED_SIDES = Object.freeze(['BUY', 'SELL']);
 // Manual orders must carry a client-generated UUID. AI execution uses the
 // server-issued proposal id as its key, so this check is applied at the HTTP
@@ -23,11 +27,21 @@ function valid(value) {
   return { ok: true, value };
 }
 
-function validateSymbol(input) {
+// Format-only normalization for paths that must replay an existing order
+// before deciding whether the pair is currently tradeable.
+function validateSymbolFormat(input) {
   if (typeof input !== 'string') return invalid('Symbol must be a string.');
-  const symbol = input.trim().toUpperCase();
-  if (!SUPPORTED_SYMBOLS.includes(symbol)) {
-    return invalid(`Unsupported symbol. Allowed: ${SUPPORTED_SYMBOLS.join(', ')}.`);
+  const symbol = normalizeSymbol(input);
+  if (!symbol) return invalid('Symbol must be an uppercase alphanumeric pair.');
+  return valid(symbol);
+}
+
+function validateSymbol(input) {
+  const formatCheck = validateSymbolFormat(input);
+  if (!formatCheck.ok) return formatCheck;
+  const symbol = formatCheck.value;
+  if (!symbolUniverse.isActive(symbol)) {
+    return invalid(`Unsupported symbol. Allowed: ${symbolUniverse.listActive().join(', ')}.`);
   }
   return valid(symbol);
 }
@@ -92,6 +106,7 @@ module.exports = {
   SUPPORTED_SYMBOLS,
   SUPPORTED_SIDES,
   validateSymbol,
+  validateSymbolFormat,
   validateSide,
   validateQuantity,
   validateLimitPrice,

@@ -1,9 +1,10 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { api, authHeaders } from '../lib/api';
+import { formatPrice, marketTradingBlocked } from '../lib/marketFormat.mjs';
 import { createClientOrderId } from '../lib/orderId.mjs';
 import { createPendingSubmissionMap, shouldRetirePendingKey } from '../lib/pendingOrders.mjs';
 
-const QuickOrder = ({ activeSymbol, currentPrice, token, onTradeComplete }) => {
+const QuickOrder = ({ activeSymbol, currentPrice, market, token, onTradeComplete }) => {
   const [orderType, setOrderType] = useState('MARKET'); // 🚀 New: Tracks Market vs Limit
   const [quantity, setQuantity] = useState(0.1);
   const [limitPrice, setLimitPrice] = useState(''); // 🚀 New: Tracks target price
@@ -21,6 +22,9 @@ const QuickOrder = ({ activeSymbol, currentPrice, token, onTradeComplete }) => {
   );
   const tokenRef = useRef(token);
   const mountedRef = useRef(true);
+  // The backend refuses new orders for a pair whose exchange filters are not
+  // known. Mirror that here so the panel says so before a request is sent.
+  const tradingBlocked = marketTradingBlocked(market);
 
   useEffect(() => {
     tokenRef.current = token;
@@ -100,7 +104,7 @@ const QuickOrder = ({ activeSymbol, currentPrice, token, onTradeComplete }) => {
       // Success! Show inline message
       const successText = orderType === 'LIMIT' 
         ? `Success: ${side} Limit placed at $${payload.limitPrice}` 
-        : `Success: ${side} ${quantity} ${activeSymbol} @ $${Number(res.data.executedPrice).toFixed(2)}`;
+        : `Success: ${side} ${quantity} ${activeSymbol} @ $${formatPrice(Number(res.data.executedPrice))}`;
       
       setMessage({ text: successText, type: "success" });
       
@@ -135,20 +139,20 @@ const QuickOrder = ({ activeSymbol, currentPrice, token, onTradeComplete }) => {
   };
 
   return (
-    <div className="bg-[#161a1e] p-5 rounded-xl border border-gray-800 space-y-4">
+    <div className="panel-raised space-y-3 p-4">
       {/* Header & Toggle */}
-      <div className="flex justify-between items-center border-b border-gray-800 pb-2">
-        <h4 className="text-sm font-bold">Quick Order</h4>
-        <div className="flex bg-[#0b0e11] rounded p-0.5 border border-gray-700">
+      <div className="flex items-center justify-between border-b border-line-subtle pb-2">
+        <h4 className="font-display text-sm font-semibold">Quick Order</h4>
+        <div className="flex rounded-md border border-line-subtle bg-void/60 p-0.5">
           <button 
             onClick={() => setOrderType('MARKET')}
-            className={`text-[10px] px-3 py-1 rounded uppercase font-bold transition-all ${orderType === 'MARKET' ? 'bg-gray-700 text-white' : 'text-gray-500 hover:text-gray-300'}`}
+            className={`text-[10px] px-3 py-1 rounded uppercase font-semibold tracking-wider transition-all ${orderType === 'MARKET' ? 'bg-violet/25 text-ultraviolet' : 'text-ink-muted hover:text-ink-primary'}`}
           >
             Market
           </button>
           <button 
             onClick={() => setOrderType('LIMIT')}
-            className={`text-[10px] px-3 py-1 rounded uppercase font-bold transition-all ${orderType === 'LIMIT' ? 'bg-gray-700 text-white' : 'text-gray-500 hover:text-gray-300'}`}
+            className={`text-[10px] px-3 py-1 rounded uppercase font-semibold tracking-wider transition-all ${orderType === 'LIMIT' ? 'bg-violet/25 text-ultraviolet' : 'text-ink-muted hover:text-ink-primary'}`}
           >
             Limit
           </button>
@@ -156,14 +160,20 @@ const QuickOrder = ({ activeSymbol, currentPrice, token, onTradeComplete }) => {
       </div>
       
       {/* Dynamic Message Box */}
+      {tradingBlocked && (
+        <div className="rounded-md border border-amber/25 bg-amber/10 p-2 text-center text-xs font-semibold text-amber">
+          Trading is temporarily unavailable for this market: exchange rules could not be verified.
+        </div>
+      )}
+
       {message && (
-        <div className={`p-2 rounded text-xs font-bold text-center ${message.type === 'success' ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>
+        <div className={`rounded-md border p-2 text-center text-xs font-semibold ${message.type === 'success' ? 'border-positive/25 bg-positive/10 text-positive' : 'border-negative/25 bg-negative/10 text-negative'}`}>
           {message.text}
         </div>
       )}
 
       {hasUnresolved && (
-        <div className="p-2 rounded text-[10px] font-mono text-amber-400 bg-amber-500/10 border border-amber-500/20">
+        <div className="rounded-md border border-amber/25 bg-amber/10 p-2 font-mono text-[10px] text-amber">
           An earlier submission is unresolved. Repeating the same order reuses its original
           idempotency key instead of placing a duplicate.
         </div>
@@ -173,28 +183,28 @@ const QuickOrder = ({ activeSymbol, currentPrice, token, onTradeComplete }) => {
         {/* Conditional Target Price Input (Only shows if LIMIT is selected) */}
         {orderType === 'LIMIT' && (
           <div>
-            <label className="text-gray-400 text-xs mb-1 block">Target Price (USDT)</label>
+            <label className="mb-1 block text-xs text-ink-secondary">Target Price (USDT)</label>
             <input 
               type="number" 
               value={limitPrice}
               onChange={(e) => setLimitPrice(e.target.value)}
               step="0.01"
               min="0.01"
-              className="w-full bg-[#0b0e11] text-white p-3 rounded border border-gray-700 outline-none focus:border-yellow-500 transition-colors text-sm"
+              className="control w-full text-sm"
             />
           </div>
         )}
 
         {/* Quantity Input */}
         <div>
-          <label className="text-gray-400 text-xs mb-1 block">Amount ({activeSymbol?.replace('USDT', '')})</label>
+          <label className="mb-1 block text-xs text-ink-secondary">Amount ({activeSymbol?.replace('USDT', '')})</label>
           <input 
             type="number" 
             value={quantity}
             onChange={(e) => setQuantity(e.target.value)}
             step="0.01"
             min="0.01"
-            className="w-full bg-[#0b0e11] text-white p-3 rounded border border-gray-700 outline-none focus:border-yellow-500 transition-colors text-sm"
+            className="control w-full text-sm"
           />
         </div>
       </div>
@@ -203,15 +213,15 @@ const QuickOrder = ({ activeSymbol, currentPrice, token, onTradeComplete }) => {
       <div className="flex gap-2 pt-2">
         <button 
           onClick={() => handleTrade('BUY')}
-          disabled={loading}
-          className="flex-1 bg-green-600 hover:bg-green-500 text-white font-bold py-3 rounded text-sm transition-colors disabled:opacity-50"
+          disabled={loading || tradingBlocked}
+          className="flex-1 rounded-lg bg-positive py-3 text-sm font-semibold text-void transition-colors hover:bg-positive/90 disabled:opacity-50"
         >
           {loading ? 'Processing...' : (orderType === 'LIMIT' ? 'LIMIT BUY' : 'MARKET BUY')}
         </button>
         <button 
           onClick={() => handleTrade('SELL')}
-          disabled={loading}
-          className="flex-1 bg-red-600 hover:bg-red-500 text-white font-bold py-3 rounded text-sm transition-colors disabled:opacity-50"
+          disabled={loading || tradingBlocked}
+          className="flex-1 rounded-lg bg-negative py-3 text-sm font-semibold text-void transition-colors hover:bg-negative/90 disabled:opacity-50"
         >
           {loading ? 'Processing...' : (orderType === 'LIMIT' ? 'LIMIT SELL' : 'MARKET SELL')}
         </button>

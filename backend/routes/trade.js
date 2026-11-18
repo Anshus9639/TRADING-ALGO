@@ -9,10 +9,24 @@ const { validateClientOrderId } = require('../lib/validate');
 function createTradeRouter({
   feed,
   runtimeStatus = null,
+  market = null,
   rateLimit: rateLimitConfig = getRateLimitConfig().trade
 } = {}) {
   const router = express.Router();
-  const tradeService = createTradeService({ feed, runtimeStatus });
+  const tradeService = createTradeService({
+    feed,
+    runtimeStatus,
+    // The catalogue resolves lazily per request; its active set changes as the
+    // market refreshes, and a delisted pair must still replay a prior order.
+    // A market context also makes complete exchange filters mandatory for new
+    // orders (503 MARKET_RULES_UNAVAILABLE when the metadata is missing), and
+    // the closure keeps fail-closed behavior while the catalogue is attached.
+    getMarketRules: market
+      ? symbol => (market.catalogue && typeof market.catalogue.getSymbol === 'function'
+        ? market.catalogue.getSymbol(symbol)
+        : null)
+      : null
+  });
   const tradeLimiter = rateLimitConfig.max > 0 && rateLimitConfig.windowMs > 0
     ? rateLimit(rateLimitOptions(rateLimitConfig))
     : (_req, _res, next) => next();

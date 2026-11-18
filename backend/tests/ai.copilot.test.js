@@ -60,12 +60,13 @@ describe('copilot proposal and confirmation flow', () => {
     feed.setQuote('BNBUSDT', 600);
   });
 
-  function makeApp({ intents = {}, feed: feedOverride, ...overrides } = {}) {
+  function makeApp({ intents = {}, feed: feedOverride, market = undefined, ...overrides } = {}) {
     const proposalStore = overrides.proposalStore
       || createProposalStore({ now: () => clock });
 
     const app = createApp({
       feed: feedOverride || feed,
+      market,
       copilot: {
         ai: fakeAi(intents),
         proposalStore,
@@ -1115,5 +1116,87 @@ describe('copilot proposal and confirmation flow', () => {
     expect(late.status).toBe(409);
     expect(late.body.code).toBe('PROPOSAL_REVOKED');
     expect(calls).not.toContain('executeMarketOrder');
+  });
+
+  describe('exchange rule availability', () => {
+    const RULES = {
+      tickSize: 0.5,
+      stepSize: 0.001,
+      minQty: 0.001,
+      minNotional: 10
+    };
+
+    test('refuses to build a proposal when the pair has no exchange rules', async () => {
+      const market = { catalogue: { getSymbol: () => null } };
+      const { app } = makeApp({
+        intents: { 'buy 0.1 btc': modelIntent() },
+        market
+      });
+      const user = await createTestUser({ balance: 10000 });
+      const token = authToken(user);
+      const before = await snapshotUser(user._id);
+
+      const res = await parse(app, token, 'Buy 0.1 BTC');
+
+      expect(res.status).toBe(503);
+      expect(res.body.code).toBe('MARKET_RULES_UNAVAILABLE');
+      expect(res.body.proposalId).toBeUndefined();
+      expect(await snapshotUser(user._id)).toEqual(before);
+    });
+
+    test('refuses to execute a stored proposal after its rules disappear', async () => {
+      let rules = RULES;
+      const market = { catalogue: { getSymbol: () => rules } };
+      const { app } = makeApp({
+        intents: { 'buy 0.1 btc': modelIntent() },
+        market
+      });
+      const user = await createTestUser({ balance: 10000 });
+      const token = authToken(user);
+
+      const parsed = await parse(app, token, 'Buy 0.1 BTC');
+      expect(parsed.status).toBe(200);
+
+      rules = null;
+      const before = await snapshotUser(user._id);
+      const executed = await execute(app, token, parsed.body.proposalId);
+
+      expect(executed.status).toBe(503);
+      expect(executed.body.code).toBe('MARKET_RULES_UNAVAILABLE');
+      expect(await snapshotUser(user._id)).toEqual(before);
+      expect(await Order.countDocuments({ userId: user._id })).toBe(0);
+
+      // Even after metadata recovers, the consumed proposal replays the same
+      // rejection instead of turning into a late execution.
+      rules = RULES;
+      const retried = await execute(app, token, parsed.body.proposalId);
+      expect(retried.status).toBe(503);
+      expect(retried.body.code).toBe('MARKET_RULES_UNAVAILABLE');
+      expect(await Order.countDocuments({ userId: user._id })).toBe(0);
+    });
+
+    test('an executed proposal still replays after its rules disappear', async () => {
+      let rules = RULES;
+      const market = { catalogue: { getSymbol: () => rules } };
+      const { app } = makeApp({
+        intents: { 'buy 0.1 btc': modelIntent() },
+        market
+      });
+      const user = await createTestUser({ balance: 10000 });
+      const token = authToken(user);
+
+      const parsed = await parse(app, token, 'Buy 0.1 BTC');
+      const first = await execute(app, token, parsed.body.proposalId);
+      expect(first.status).toBe(200);
+
+      const before = await snapshotUser(user._id);
+      rules = null;
+      const replay = await execute(app, token, parsed.body.proposalId);
+
+      expect(replay.status).toBe(200);
+      expect(replay.body.idempotent).toBe(true);
+      expect(await snapshotUser(user._id)).toEqual(before);
+      expect(await Order.countDocuments({ userId: user._id })).toBe(1);
+    });
   });
 });

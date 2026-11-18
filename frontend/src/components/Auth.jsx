@@ -16,21 +16,16 @@ const Auth = ({ onLogin }) => {
 
     const endpoint = isLogin ? '/api/auth/login' : '/api/auth/signup';
 
-    // 🚀 OPTIMIZATION 1: Payload Cleaning
-    // Removes the 'username' field during login to prevent Backend 400 errors
-    const payload = isLogin 
-      ? { email: formData.email, password: formData.password } 
+    // Payload Cleaning: the login endpoint only accepts credentials.
+    const payload = isLogin
+      ? { email: formData.email, password: formData.password }
       : formData;
 
     try {
       const res = await api.post(endpoint, payload);
 
       if (isLogin) {
-        // 🚀 OPTIMIZATION 2: Persistence
         localStorage.setItem('token', res.data.token);
-        
-        // 🚀 OPTIMIZATION 3: Full Handshake
-        // Sending BOTH user and token so App.jsx can pass them to the Trade component
         onLogin(res.data.user, res.data.token);
       } else {
         alert(res.data.msg || "Identity Created. Please Authorize.");
@@ -45,21 +40,25 @@ const Auth = ({ onLogin }) => {
   };
 
   return (
-    <div className="flex items-center justify-center min-h-screen bg-[#0b0e11]">
-      <div className="w-full max-w-md p-8 bg-[#161a1e] border border-gray-800 rounded-2xl shadow-2xl">
-        <div className="text-center mb-8">
-          <h1 className="text-3xl font-bold text-yellow-500 mb-2 font-mono tracking-tighter">NEXUSTRADE</h1>
-          <p className="text-gray-400 text-sm font-mono uppercase">
-            {isLogin ? '> Welcome back, Terminal User' : '> Initialize new trading identity'}
+    <div className="flex min-h-[100dvh] items-center justify-center bg-void px-4 py-10">
+      <div className="panel-raised w-full max-w-md p-6 sm:p-8">
+        <div className="mb-7 text-center">
+          <span className="mx-auto mb-3 flex h-11 w-11 items-center justify-center rounded-xl border border-violet/40 bg-violet/15 font-display text-lg font-bold text-ultraviolet text-glow-violet">
+            N
+          </span>
+          <h1 className="font-display text-2xl font-semibold tracking-tight">NexusTrade</h1>
+          <p className="mt-1 font-mono text-[11px] uppercase tracking-[0.2em] text-ink-muted">
+            {isLogin ? 'Secure terminal access' : 'Create trading identity'}
           </p>
         </div>
 
-        <form onSubmit={handleSubmit} className="space-y-4">
+        <form onSubmit={handleSubmit} className="space-y-3">
           {!isLogin && (
             <input
               type="text"
-              placeholder="USERNAME"
-              className="w-full bg-[#0b0e11] border border-gray-700 p-3 rounded font-mono text-sm focus:border-yellow-500 outline-none text-white transition-all"
+              placeholder="Username"
+              aria-label="Username"
+              className="control w-full"
               onChange={(e) => setFormData({ ...formData, username: e.target.value })}
               required
             />
@@ -67,36 +66,38 @@ const Auth = ({ onLogin }) => {
 
           <input
             type="email"
-            placeholder="EMAIL ADDRESS"
-            className="w-full bg-[#0b0e11] border border-gray-700 p-3 rounded font-mono text-sm focus:border-yellow-500 outline-none text-white transition-all"
+            placeholder="Email address"
+            aria-label="Email address"
+            className="control w-full"
             onChange={(e) => setFormData({ ...formData, email: e.target.value })}
             required
           />
 
           <input
             type="password"
-            placeholder="PASSWORD"
-            className="w-full bg-[#0b0e11] border border-gray-700 p-3 rounded font-mono text-sm focus:border-yellow-500 outline-none text-white transition-all"
+            placeholder="Password"
+            aria-label="Password"
+            className="control w-full"
             onChange={(e) => setFormData({ ...formData, password: e.target.value })}
             required
           />
 
-          <button 
+          <button
             disabled={loading}
-            className="w-full bg-yellow-500 hover:bg-yellow-400 text-black font-bold py-3 rounded-lg transition-all mt-4 uppercase tracking-widest text-sm disabled:opacity-50"
+            className="mt-2 w-full rounded-lg bg-violet py-3 text-sm font-semibold text-void transition-colors hover:bg-ultraviolet disabled:opacity-50"
           >
-            {loading ? 'Processing...' : isLogin ? 'Authorize Access' : 'Create Identity'}
+            {loading ? 'Processing…' : isLogin ? 'Authorize access' : 'Create identity'}
           </button>
         </form>
 
-        <div className="mt-8 pt-6 border-t border-gray-800 text-center">
-          <p className="text-gray-500 text-xs font-mono">
-            {isLogin ? "NEW TO THE PLATFORM?" : "CREDENTIALS ALREADY EXIST?"}
+        <div className="mt-7 border-t border-line-subtle pt-5 text-center">
+          <p className="text-xs text-ink-muted">
+            {isLogin ? 'New to the platform?' : 'Credentials already exist?'}
             <button
-              className="text-yellow-500 ml-2 hover:underline font-bold"
+              className="ml-2 font-semibold text-ultraviolet transition-colors hover:text-aqua"
               onClick={() => setIsLogin(!isLogin)}
             >
-              {isLogin ? '[REGISTER]' : '[LOGIN]'}
+              {isLogin ? 'Register' : 'Sign in'}
             </button>
           </p>
         </div>

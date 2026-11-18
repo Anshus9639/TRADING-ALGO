@@ -228,6 +228,11 @@ export function isUncertainFailure(error) {
   return status >= 500 || status === 408;
 }
 
+// The backend raises these before it opens any transaction, so the response
+// proves no order exists for the proposal id. Retrying replays the same
+// rejection instead of resolving an unknown outcome.
+const DEFINITIVE_5XX_CODES = new Set(['MARKET_RULES_UNAVAILABLE']);
+
 export async function confirmProposal({
   http,
   state,
@@ -300,7 +305,9 @@ export async function confirmProposal({
     const status = error?.response?.status;
     const recoveryRejected = state.uncertain === true && (status === 401 || status === 429);
 
-    if (error.pending || recoveryRejected || isUncertainFailure(error)) {
+    if (error.pending
+      || recoveryRejected
+      || (isUncertainFailure(error) && !DEFINITIVE_5XX_CODES.has(code))) {
       return {
         ok: false,
         uncertain: true,
