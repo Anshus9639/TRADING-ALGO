@@ -1,31 +1,34 @@
-const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const mongoose = require('mongoose');
 const WebSocket = require('ws');
-const cors = require('cors');
-const axios = require('axios');
-require('dotenv').config();
 
+const { loadConfig } = require('./config/env');
+
+let config;
+try {
+  config = loadConfig();
+} catch (err) {
+  console.error(`❌ Configuration error: ${err.message}`);
+  process.exit(1);
+}
+
+const { createApp, corsOptions } = require('./app');
+const { marketFeed, setQuote } = require('./services/marketFeed');
+const { createMatcher } = require('./services/matcher');
+const { createTradeService } = require('./services/tradeService');
+const { findLegacyOrderBlockers } = require('./services/legacyOrders');
+const { createRuntimeStatus } = require('./services/runtimeStatus');
+const { checkDatabaseIndexes } = require('./scripts/check-idempotency-index');
+const { defaultTransactionSupport } = require('./lib/transactions');
+const { applySafeMongooseDefaults } = require('./lib/mongooseSetup');
 const User = require('./models/User');
+const Order = require('./models/Order');
 
-const app = express();
+const runtimeStatus = createRuntimeStatus();
+const app = createApp({ runtimeStatus });
+
 const server = http.createServer(app);
-
-// 🚀 THE FIX: Unified CORS rules (NO Trailing Slash!)
-const corsOptions = {
-  origin: [
-    "http://localhost:3000",
-    "http://localhost:5173",
-    "https://trading-algo-oa9r.vercel.app" // Exact match, no slash at the end!
-  ],
-  methods: ["GET", "POST", "PUT", "DELETE"],
-  credentials: true 
-};
-
-// Apply to Express
-app.use(cors(corsOptions)); 
-app.use(express.json());
 
 // Apply to Socket.io
 const io = new Server(server, { 
@@ -33,13 +36,113 @@ const io = new Server(server, {
 });
 
 // --- DATABASE ---
-mongoose.connect(process.env.MONGO_URI)
-  .then(() => console.log('✅ MongoDB Connected'))
-  .catch(err => console.error('❌ DB Error:', err));
+// Trading requires multi-document transactions, which need a replica set.
+// Readiness and LIMIT placement are gated on every prerequisite below; none of
+// these checks create or modify indexes.
+mongoose.connection.on('connected', () => runtimeStatus.setMongoConnected(true));
+mongoose.connection.on('disconnected', () => {
+  console.error('⚠️ MongoDB disconnected; trading readiness is now false.');
+  runtimeStatus.setMongoConnected(false);
+});
+mongoose.connection.on('error', (err) => {
+  console.error('❌ MongoDB connection error:', err.message);
+  runtimeStatus.setMongoConnected(false);
+});
+
+applySafeMongooseDefaults(mongoose);
+
+mongoose.connect(config.mongoUri)
+  .then(async () => {
+    runtimeStatus.setMongoConnected(true);
+    console.log('✅ MongoDB Connected');
+
+    try {
+      const supported = await defaultTransactionSupport.isSupported();
+      runtimeStatus.setTransactionsVerified(supported);
+      if (!supported) {
+        console.error('❌ MongoDB transactions are unavailable (standalone deployment). Trading endpoints will refuse orders until a replica set is configured.');
+        runtimeStatus.markMatcherBlocked('TRANSACTIONS_UNAVAILABLE');
+        runtimeStatus.setStartupComplete(true);
+        return;
+      }
+      console.log('✅ MongoDB transaction support verified');
+
+      // Read-only index verification. A missing or malformed index makes the
+      // process not ready; the operator must fix it with an approved migration.
+      const indexReport = await checkDatabaseIndexes({ db: mongoose.connection.db });
+      runtimeStatus.setIndexesVerified(indexReport.ok);
+      if (!indexReport.ok) {
+        console.error(`❌ Required index preflight failed: ${indexReport.failedChecks.join(', ')}`);
+        runtimeStatus.markMatcherBlocked('INDEXES_UNVERIFIED');
+        runtimeStatus.setStartupComplete(true);
+        return;
+      }
+      console.log('✅ Required indexes verified');
+
+      // Deployment policy: the canonical matcher only executes canonical
+      // orders. Embedded legacy orders remain cancellable with their original
+      // refund semantics but can never fill, so the matcher stays disabled
+      // while any unmigrated, malformed, or duplicate-id order exists.
+      const blockers = await findLegacyOrderBlockers({ User, Order });
+      const gateClear = blockers.length === 0;
+      runtimeStatus.setLegacyGateClear(gateClear);
+      if (!gateClear) {
+        const orderCount = blockers.reduce((sum, entry) => sum + entry.count, 0);
+        const accountLabel = blockers.length >= 100 ? '100+' : String(blockers.length);
+        const duplicateAccounts = blockers.filter(entry => entry.reasons.includes('DUPLICATE_ORDER_ID')).length;
+        const missingIdAccounts = blockers.filter(entry => entry.reasons.includes('MISSING_ORDER_ID')).length;
+        console.error(`❌ Matcher not started: ${orderCount} embedded pending order(s) across ${accountLabel} account(s) are not safely migratable.`);
+        console.error(`   duplicate-id accounts=${duplicateAccounts} missing-id accounts=${missingIdAccounts}`);
+        console.error('   Legacy orders remain cancellable and refundable, but they cannot fill.');
+        console.error('   Run scripts/migrate-embedded-to-collections.js (dry run, then approved apply), resolve reported ambiguity, and restart.');
+        runtimeStatus.markMatcherBlocked('LEGACY_GATE_BLOCKED');
+        runtimeStatus.setStartupComplete(true);
+        return;
+      }
+      console.log('✅ Legacy order gate is clear');
+
+      const tradeService = createTradeService({ feed: marketFeed, runtimeStatus });
+      const matcher = createMatcher({
+        feed: marketFeed,
+        tradeService
+      });
+
+      setInterval(async () => {
+        try {
+          const stats = await matcher.runCycle();
+          // A skipped cycle proves nothing about recovery: the previous cycle
+          // may still be running or the matcher may still be FAILED. Only a
+          // completed, non-skipped cycle may restore ACTIVE readiness.
+          if (!stats.skipped) {
+            runtimeStatus.markMatcherActive();
+            if (stats.filled > 0 || stats.failed > 0 || stats.recovered > 0) {
+              console.log('⚡ Matcher cycle:', JSON.stringify(stats));
+            }
+          }
+        } catch (err) {
+          runtimeStatus.markMatcherFailed('MATCHER_CYCLE_FAILED', err.message);
+          console.error('⚠️ Order Engine Error:', err.message);
+        }
+      }, 3000);
+
+      runtimeStatus.markMatcherActive();
+      runtimeStatus.setStartupComplete(true);
+      console.log('✅ Matching engine started');
+    } catch (err) {
+      console.error('❌ Startup readiness checks failed:', err.message);
+      runtimeStatus.markMatcherFailed('STARTUP_CHECK_FAILED', err.message);
+      runtimeStatus.setStartupComplete(true);
+    }
+  })
+  .catch(err => {
+    console.error('❌ DB Error:', err.message);
+    runtimeStatus.setMongoConnected(false);
+    runtimeStatus.markMatcherFailed('MONGO_CONNECT_FAILED', err.message);
+    runtimeStatus.setStartupComplete(true);
+  });
 
 // --- BINANCE WS BRIDGE (SELF-HEALING) ---
 const SYMBOLS = ['btcusdt', 'ethusdt', 'solusdt', 'bnbusdt'];
-const livePrices = {};
 let binanceConn;
 
 const connectBinance = () => {
@@ -58,8 +161,9 @@ const connectBinance = () => {
 
       if (msg.e === '24hrTicker') {
         const currentPrice = parseFloat(msg.c);
-        livePrices[msg.s] = currentPrice;
-        io.emit('marketUpdate', { symbol: msg.s, price: parseFloat(msg.c).toFixed(2), change: msg.P });
+        if (setQuote(msg.s, currentPrice)) {
+          io.emit('marketUpdate', { symbol: msg.s, price: currentPrice.toFixed(2), change: msg.P });
+        }
       } 
       else if (msg.e === 'kline') {
         io.emit('candleUpdate', { 
@@ -88,114 +192,7 @@ const connectBinance = () => {
 };
 connectBinance();
 
-setInterval(async () => {
-  try {
-    // 1. Find all users who have at least one pending order
-    const usersWithOrders = await User.find({ 'pendingOrders.0': { $exists: true } });
-
-    for (let user of usersWithOrders) {
-      let databaseModified = false;
-
-      // 2. Loop backwards so we can safely delete completed orders from the array
-      for (let i = user.pendingOrders.length - 1; i >= 0; i--) {
-        const order = user.pendingOrders[i];
-        const currentPrice = livePrices[order.symbol];
-
-        if (!currentPrice) continue; // Skip if we don't have a price yet
-
-        let shouldExecute = false;
-        
-        // LIMIT BUY Logic: Execute if live price drops BELOW or EQUAL TO target
-        if (order.type === 'BUY' && currentPrice <= order.limitPrice) {
-          shouldExecute = true;
-        } 
-        // LIMIT SELL Logic: Execute if live price rises ABOVE or EQUAL TO target
-        else if (order.type === 'SELL' && currentPrice >= order.limitPrice) {
-          shouldExecute = true;
-        }
-
-        // 3. EXECUTE THE TRADE
-        if (shouldExecute) {
-          console.log(`⚡ EXECUTING LIMIT ORDER: ${order.type} ${order.symbol} @ $${order.limitPrice}`);
-
-          if (order.type === 'BUY') {
-            // Escrow already took their USDT. Now, give them the Crypto!
-            const assetIndex = user.portfolio.findIndex(p => p.symbol === order.symbol);
-            if (assetIndex > -1) {
-              const oldQty = user.portfolio[assetIndex].quantity;
-              const oldAvg = user.portfolio[assetIndex].avgPrice || 0;
-              const newQty = oldQty + order.quantity;
-              
-              // Recalculate Average Entry Price (AEP)
-              user.portfolio[assetIndex].avgPrice = ((oldQty * oldAvg) + (order.quantity * order.limitPrice)) / newQty;
-              user.portfolio[assetIndex].quantity = newQty;
-            } else {
-              user.portfolio.push({ symbol: order.symbol, quantity: order.quantity, avgPrice: order.limitPrice });
-            }
-          } 
-          else if (order.type === 'SELL') {
-            // Escrow already took their Crypto. Now, give them the USDT!
-            const revenue = order.quantity * order.limitPrice;
-            user.balance += revenue;
-          }
-
-          // Log the executed trade
-          user.trades.push({
-            symbol: order.symbol,
-            type: order.type, // Tag it so the UI knows it was an auto-trade
-            quantity: order.quantity,
-            price: order.limitPrice,
-            timestamp: new Date()
-          });
-
-          // Remove it from the pending queue
-          user.pendingOrders.splice(i, 1);
-          databaseModified = true;
-        }
-      }
-
-      // 4. Save the user only if an order actually triggered
-      if (databaseModified) {
-        await user.save();
-        console.log(`✅ Saved executed orders for user ${user._id}`);
-      }
-    }
-  } catch (err) {
-    console.error("⚠️ Order Engine Error:", err.message);
-  }
-}, 3000);
-
 // --- ROUTES ---
-app.use('/api/auth', require('./routes/auth'));
-app.use('/api/trade', require('./routes/trade'));
-app.use('/api/copilot', require('./routes/copilot'));
+// Mounted in ./app.js (the Express app is imported above).
 
-// 3. FIXED HISTORY (The "Pattern" Fix)
- app.get('/api/history/:symbol', async (req, res) => {
-  try {
-    const { symbol } = req.params;
-    // 🚀 Look for the interval in the URL query, default to 1m
-    const interval = req.query.interval || '1m'; 
-    
-    const response = await axios.get(
-      `https://api.binance.us/api/v3/klines?symbol=${symbol.toUpperCase()}&interval=${interval}&limit=500`
-    );
-
-    const formattedData = response.data.map(d => ({
-      time: Math.floor(d[0] / 1000),
-      open: parseFloat(d[1]),
-      high: parseFloat(d[2]),
-      low: parseFloat(d[3]),
-      close: parseFloat(d[4]),
-    }));
-
-    res.json(formattedData);
-  } catch (err) {
-    res.status(500).json({ error: "Failed to fetch history" });
-  }
-});
-
-app.get('/', (req, res) => res.send('API LIVE'));
-
-const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => console.log(`🚀 Running on ${PORT}`));
+server.listen(config.port, () => console.log(`🚀 Running on ${config.port}`));

@@ -88,6 +88,8 @@ MONGO_URI=your_mongodb_connection_string
 JWT_SECRET=your_secure_random_secret
 GEMINI_API_KEY=your_gemini_api_key_here
 
+Rate limits use `express-rate-limit` with its in-memory store. Limits are therefore enforced per backend process; a multi-instance deployment needs a shared store (for example Redis) to apply one consistent limit across instances. Set `TRUST_PROXY=1` only when running behind Render's single proxy hop; leave it `false` for local or direct traffic.
+
 Start the engine:
 npm run dev
 

@@ -1,7 +1,7 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import io from 'socket.io-client';
-import axios from 'axios';
 import { LayoutDashboard, Activity, Clock, LogOut } from 'lucide-react';
+import { api, API_ORIGIN, authHeaders } from './lib/api';
 
 // Components
 import Auth from './components/Auth';
@@ -12,7 +12,7 @@ import ActivityDashboard from './components/ActivityDashboard';
 import AICopilot from './components/AICopilot';
 
 // Initialize socket outside to prevent multiple connections on re-render
-const socket = io('https://trading-algo-nqud.onrender.com');
+const socket = io(API_ORIGIN);
 
 function App() {
   // --- SESSION STATES ---
@@ -43,21 +43,31 @@ function App() {
   const [pendingOrders, setPendingOrders] = useState([]);
 
   // --- 1. PERSISTENCE LOGIC ---
+  // Tracks the session every in-flight response belongs to. Updated
+  // synchronously on login/logout so a late response can never apply a
+  // previous session's account data to the current one.
+  const tokenRef = useRef(token);
+
+  useEffect(() => {
+    tokenRef.current = token;
+  }, [token]);
+
   const fetchUserProfile = useCallback(async (authToken) => {
     try {
-      const res = await axios.get('https://trading-algo-nqud.onrender.com/api/auth/me', {
-        headers: { 'x-auth-token': authToken }
-      });
+      const res = await api.get('/api/auth/me', authHeaders(authToken));
+      if (tokenRef.current !== authToken) return;
       setUser(res.data);
       setBalance(res.data.balance || 0);
       setPositions(res.data.portfolio || []);
       setTrades(res.data.trades ? [...res.data.trades].reverse() : []);
       setPendingOrders(res.data.pendingOrders || []); 
     } catch (err) {
+      // A failure for an earlier session must not log out the active one.
+      if (tokenRef.current !== authToken) return;
       console.error("Session expired or invalid");
       handleLogout();
     } finally {
-      setIsInitializing(false);
+      if (tokenRef.current === authToken) setIsInitializing(false);
     }
   }, []);
 
@@ -74,7 +84,7 @@ function App() {
     const fetchHistory = async () => {
       try {
         setHistory([]); 
-        const res = await axios.get(`https://trading-algo-nqud.onrender.com/api/history/${activeSymbol}?interval=${chartInterval}`);
+        const res = await api.get(`/api/history/${activeSymbol}?interval=${chartInterval}`);
         setHistory(res.data);
       } catch (err) { 
         console.error("Market history unavailable"); 
@@ -106,7 +116,11 @@ function App() {
   // --- 3. HELPER FUNCTIONS ---
   const calculatePnL = () => {
     const position = positions.find(p => p.symbol === activeSymbol);
-    if (!position) return "0.00";
+    if (!position) return 0;
+
+    // A legacy position without a recoverable basis must not be valued as if
+    // it were bought at zero. Surface the uncertainty instead.
+    if (position.costBasisStatus === 'UNKNOWN' || position.avgPrice == null) return null;
 
     let livePrice = parseFloat(watchlist[activeSymbol]?.price || 0);
 
@@ -117,13 +131,13 @@ function App() {
       livePrice = latestCandle.close;
     }
 
-    if (livePrice === 0) return "0.00";
+    if (livePrice === 0) return 0;
 
-    const pnl = (livePrice - position.avgPrice) * position.quantity;
-    return pnl.toFixed(2);
+    return (livePrice - position.avgPrice) * position.quantity;
   };
 
   const handleLogout = () => {
+    tokenRef.current = null;
     localStorage.removeItem('token');
     setToken(null);
     setUser(null);
@@ -134,6 +148,7 @@ function App() {
   };
 
   const handleLoginSuccess = (userData, userToken) => {
+    tokenRef.current = userToken;
     setToken(userToken);
     setUser(userData);
     setBalance(userData.balance || 0);
@@ -256,9 +271,21 @@ function App() {
                     </div>
                     <div className="bg-[#161a1e] p-4 rounded-xl border border-gray-800">
                       <p className="text-gray-500 text-[10px] uppercase font-bold mb-1">Unrealized PnL</p>
-                      <h3 className={`text-xl font-mono font-bold ${parseFloat(calculatePnL()) >= 0 ? 'text-green-500' : 'text-red-500'}`}>
-                        {parseFloat(calculatePnL()) >= 0 ? '+' : ''}${calculatePnL()}
-                      </h3>
+                      {(() => {
+                        const pnl = calculatePnL();
+                        if (pnl === null) {
+                          return (
+                            <h3 className="text-xl font-mono font-bold text-gray-500" title="Historical cost basis is unavailable">
+                              N/A
+                            </h3>
+                          );
+                        }
+                        return (
+                          <h3 className={`text-xl font-mono font-bold ${pnl >= 0 ? 'text-green-500' : 'text-red-500'}`}>
+                            {pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}
+                          </h3>
+                        );
+                      })()}
                     </div>
                   </div>
 

@@ -1,5 +1,7 @@
-import React, { useState, useEffect } from 'react';
-import axios from 'axios';
+import React, { useState, useEffect, useRef } from 'react';
+import { api, authHeaders } from '../lib/api';
+import { createClientOrderId } from '../lib/orderId.mjs';
+import { createPendingSubmissionMap, shouldRetirePendingKey } from '../lib/pendingOrders.mjs';
 
 const QuickOrder = ({ activeSymbol, currentPrice, token, onTradeComplete }) => {
   const [orderType, setOrderType] = useState('MARKET'); // 🚀 New: Tracks Market vs Limit
@@ -7,6 +9,31 @@ const QuickOrder = ({ activeSymbol, currentPrice, token, onTradeComplete }) => {
   const [limitPrice, setLimitPrice] = useState(''); // 🚀 New: Tracks target price
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState(null); 
+  // Keyed per submission so a retry of an unresolved order reuses its original
+  // idempotency key, and a different order cannot overwrite that identity.
+  // The map is user-scoped and survives a page refresh without persisting tokens.
+  const pendingSubmissions = useRef(null);
+  if (!pendingSubmissions.current) {
+    pendingSubmissions.current = createPendingSubmissionMap({ token });
+  }
+  const [hasUnresolved, setHasUnresolved] = useState(
+    () => pendingSubmissions.current.size() > 0
+  );
+  const tokenRef = useRef(token);
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    tokenRef.current = token;
+    pendingSubmissions.current = createPendingSubmissionMap({ token });
+    setHasUnresolved(pendingSubmissions.current.size() > 0);
+  }, [token]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   // 🚀 Auto-fill limit price with the current live price when switching to LIMIT tab
   useEffect(() => {
@@ -21,34 +48,59 @@ const QuickOrder = ({ activeSymbol, currentPrice, token, onTradeComplete }) => {
     // Safety Checks
     if (!token) return setMessage({ text: "Error: Please log in.", type: "error" });
     if (quantity <= 0) return setMessage({ text: "Error: Quantity must be > 0.", type: "error" });
-    if (orderType === 'MARKET' && !currentPrice) return setMessage({ text: "Error: Waiting for live price...", type: "error" });
     if (orderType === 'LIMIT' && (!limitPrice || limitPrice <= 0)) return setMessage({ text: "Error: Enter a valid target price.", type: "error" });
 
     setLoading(true);
+    const sessionToken = token;
+    // The pending map is captured for this submission: a logout/login during
+    // the request must not redirect its storage writes into another scope.
+    const submissions = pendingSubmissions.current.refresh();
+    const isCurrent = () => mountedRef.current && tokenRef.current === sessionToken;
+    let requestKey = null;
+    let clientOrderId = null;
     try {
       let endpoint = '';
-      let payload = { symbol: activeSymbol, quantity: Number(quantity) };
+      const numericQuantity = Number(quantity);
+      const numericLimitPrice = Number(limitPrice);
+      const payload = { symbol: activeSymbol, quantity: numericQuantity };
 
       // 🚀 Route the data based on Market vs Limit
       if (orderType === 'MARKET') {
         endpoint = side === 'BUY' ? '/api/trade/buy' : '/api/trade/sell';
-        payload.price = Number(currentPrice);
       } else {
         endpoint = '/api/trade/limit'; // Routes to your Escrow system
         payload.type = side; // 'BUY' or 'SELL'
-        payload.limitPrice = Number(limitPrice);
+        payload.limitPrice = numericLimitPrice;
       }
 
-      const res = await axios.post(
-        `https://trading-algo-nqud.onrender.com${endpoint}`, 
-        payload,
-        { headers: { 'x-auth-token': token } }
-      );
+      requestKey = [
+        endpoint,
+        side,
+        activeSymbol,
+        numericQuantity,
+        orderType === 'LIMIT' ? numericLimitPrice : 'MARKET'
+      ].join('|');
+      const pending = submissions.get(requestKey);
+      if (pending) {
+        clientOrderId = pending;
+      } else {
+        clientOrderId = createClientOrderId();
+        submissions.set(requestKey, clientOrderId);
+      }
+      payload.clientOrderId = clientOrderId;
+
+      const res = await api.post(endpoint, payload, authHeaders(sessionToken));
+      // Only retire the key this request used. A newer unresolved submission
+      // created under the same request key keeps its own id.
+      submissions.deleteIf(requestKey, clientOrderId);
+
+      if (!isCurrent()) return;
+      setHasUnresolved(submissions.size() > 0);
 
       // Success! Show inline message
       const successText = orderType === 'LIMIT' 
         ? `Success: ${side} Limit placed at $${payload.limitPrice}` 
-        : `Success: ${side} ${quantity} ${activeSymbol}`;
+        : `Success: ${side} ${quantity} ${activeSymbol} @ $${Number(res.data.executedPrice).toFixed(2)}`;
       
       setMessage({ text: successText, type: "success" });
       
@@ -58,13 +110,27 @@ const QuickOrder = ({ activeSymbol, currentPrice, token, onTradeComplete }) => {
       }
       
     } catch (err) {
+      // Only a response produced after the backend looked the key up proves
+      // the order was not created. Early 4xx answers (auth, rate limiting,
+      // request validation) and uncertain failures keep the key for a retry.
+      const status = err.response?.status;
+      const code = err.response?.data?.code;
+      if (requestKey && clientOrderId && shouldRetirePendingKey(status, code)) {
+        submissions.deleteIf(requestKey, clientOrderId);
+      }
+      if (!isCurrent()) return;
+      setHasUnresolved(submissions.size() > 0);
       // Error! Show inline message
       const errorMsg = err.response?.data?.message || "Trade failed due to server error.";
       setMessage({ text: `Rejected: ${errorMsg}`, type: "error" });
     } finally {
-      setLoading(false);
-      // Auto-hide the message after 3 seconds
-      setTimeout(() => setMessage(null), 3000);
+      if (isCurrent()) {
+        setLoading(false);
+        // Auto-hide the message after 3 seconds
+        setTimeout(() => {
+          if (mountedRef.current) setMessage(null);
+        }, 3000);
+      }
     }
   };
 
@@ -93,6 +159,13 @@ const QuickOrder = ({ activeSymbol, currentPrice, token, onTradeComplete }) => {
       {message && (
         <div className={`p-2 rounded text-xs font-bold text-center ${message.type === 'success' ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>
           {message.text}
+        </div>
+      )}
+
+      {hasUnresolved && (
+        <div className="p-2 rounded text-[10px] font-mono text-amber-400 bg-amber-500/10 border border-amber-500/20">
+          An earlier submission is unresolved. Repeating the same order reuses its original
+          idempotency key instead of placing a duplicate.
         </div>
       )}
 

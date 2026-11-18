@@ -1,0 +1,1750 @@
+const crypto = require('crypto');
+const fs = require('fs');
+const { StringDecoder } = require('string_decoder');
+const mongoose = require('mongoose');
+
+const DefaultUser = require('../models/User');
+const DefaultOrder = require('../models/Order');
+const DefaultTrade = require('../models/Trade');
+const {
+  validateSymbol,
+  validateSide,
+  validateQuantity,
+  validateLimitPrice,
+  validateNotional
+} = require('../lib/validate');
+const { roundTo } = require('../lib/numbers');
+const {
+  deterministicId,
+  legacyOrderId,
+  legacyTradeId,
+  resolveLegacyOrderId,
+  resolveLegacyTradeId
+} = require('../lib/legacyIdentity');
+
+/*
+ * Legacy embedded data (pre-Batch-D) semantics:
+ *   - pendingOrders BUY: balance was reduced by quantity * limitPrice at placement.
+ *   - pendingOrders SELL: portfolio.quantity was reduced at placement.
+ *   - trades: append-only history without canonical Order/Trade documents.
+ *
+ * This migration copies that data into the canonical collections without
+ * touching the embedded arrays. It preserves embedded ids, reconstructs SELL
+ * total holdings/lockedQuantity, and annotates lockedBalance for legacy BUY
+ * reservations. Anything that cannot be reconstructed safely is reported and
+ * left untouched instead of being guessed.
+ */
+
+const BACKUP_VERSION = 1;
+const DEFAULT_BATCH_SIZE = 100;
+const SEVERITY = Object.freeze({ ERROR: 'error', WARNING: 'warning' });
+const EPSILON = 1e-9;
+
+const DEFAULT_TX_OPTIONS = Object.freeze({
+  readConcern: { level: 'snapshot' },
+  writeConcern: { w: 'majority' },
+  readPreference: 'primary'
+});
+
+function defaultModels(overrides = {}) {
+  return {
+    User: overrides.User || DefaultUser,
+    Order: overrides.Order || DefaultOrder,
+    Trade: overrides.Trade || DefaultTrade
+  };
+}
+
+function issue(code, severity, userId, target, detail) {
+  return {
+    code,
+    severity,
+    userId: userId ? String(userId) : null,
+    target: target === undefined || target === null ? null : String(target),
+    detail: detail || null
+  };
+}
+
+function asFinite(value, fallback = 0) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+function normalizeAvgPrice(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null;
+}
+
+// Distinguishes "no recoverable basis" (null/absent) from a stored numeric
+// value such as 0 that would otherwise normalize to the same null.
+function avgPriceMatches(current, expected) {
+  if (expected === null) return current === null || current === undefined;
+  return normalizeAvgPrice(current) === normalizeAvgPrice(expected);
+}
+
+function hasValidTimestamp(value) {
+  if (value instanceof Date) return !Number.isNaN(value.getTime());
+  if (value === undefined || value === null) return false;
+  return !Number.isNaN(new Date(value).getTime());
+}
+
+// When user.createdAt is also missing there is no real timestamp to borrow.
+// Falling back to "now" would make reruns disagree with the trade migrated by
+// the first run, so the ObjectId generation time (or the epoch) is used: it is
+// stable across runs and independent of the wall clock.
+function deterministicAccountTimestamp(user) {
+  const id = user && user._id;
+  if (id instanceof mongoose.Types.ObjectId) return id.getTimestamp();
+  const text = id === undefined || id === null ? '' : String(id);
+  if (text && mongoose.Types.ObjectId.isValid(text)) {
+    return new mongoose.Types.ObjectId(text).getTimestamp();
+  }
+  return new Date(0);
+}
+
+function optionalObjectId(value) {
+  if (!value) return null;
+  if (value instanceof mongoose.Types.ObjectId) return value;
+  const text = String(value);
+  return mongoose.Types.ObjectId.isValid(text) ? new mongoose.Types.ObjectId(text) : null;
+}
+
+// Legacy orders predate clientOrderId and carry no idempotency key. Deriving it
+// from the owning user and the embedded order id makes reruns stable and keeps
+// the key unique across users even if two embedded order ids collide. Legacy
+// keys are internal, so they intentionally bypass the manual-API UUID validator.
+function legacyOrderKey(userId, legacyId) {
+  return `legacy:${String(userId)}:${String(legacyId)}`;
+}
+
+function normalizeTimestamp(value, fallback) {
+  if (value instanceof Date && !Number.isNaN(value.getTime())) return value;
+  if (value !== undefined && value !== null) {
+    const parsed = new Date(value);
+    if (!Number.isNaN(parsed.getTime())) return parsed;
+  }
+  return new Date(fallback);
+}
+
+function validationError(result) {
+  return result && result.ok === false ? result.error : null;
+}
+
+function validateLegacyOrder(raw) {
+  const symbol = validateSymbol(raw.symbol);
+  if (!symbol.ok) return { ok: false, error: validationError(symbol) };
+  const side = validateSide(raw.type);
+  if (!side.ok) return { ok: false, error: validationError(side) };
+  const quantity = validateQuantity(raw.quantity);
+  if (!quantity.ok) return { ok: false, error: validationError(quantity) };
+  const limitPrice = validateLimitPrice(raw.limitPrice);
+  if (!limitPrice.ok) return { ok: false, error: validationError(limitPrice) };
+  const notional = validateNotional(quantity.value, limitPrice.value);
+  if (!notional.ok) return { ok: false, error: validationError(notional) };
+
+  return {
+    ok: true,
+    value: {
+      symbol: symbol.value,
+      side: side.value,
+      quantity: quantity.value,
+      limitPrice: limitPrice.value,
+      reservedAmount: notional.value
+    }
+  };
+}
+
+function validateLegacyTrade(raw) {
+  const symbol = validateSymbol(raw.symbol);
+  if (!symbol.ok) return { ok: false, error: validationError(symbol) };
+  const side = validateSide(raw.type);
+  if (!side.ok) return { ok: false, error: validationError(side) };
+  const quantity = validateQuantity(raw.quantity);
+  if (!quantity.ok) return { ok: false, error: validationError(quantity) };
+  const price = validateLimitPrice(raw.price);
+  if (!price.ok) return { ok: false, error: validationError(price) };
+
+  return {
+    ok: true,
+    value: {
+      symbol: symbol.value,
+      side: side.value,
+      quantity: quantity.value,
+      executionPrice: price.value,
+      notional: roundTo(quantity.value * price.value)
+    }
+  };
+}
+
+function matchesMigratedOrder(canonical, value, userId, legacyId) {
+  const expectedClientId = legacyOrderKey(userId, legacyId);
+  return canonical.symbol === value.symbol
+    && canonical.side === value.side
+    && canonical.orderType === 'LIMIT'
+    && canonical.quantity === value.quantity
+    && canonical.limitPrice === value.limitPrice
+    && canonical.clientOrderId === expectedClientId;
+}
+
+function matchesMigratedTrade(canonical, value, timestamp) {
+  return canonical.symbol === value.symbol
+    && canonical.side === value.side
+    && canonical.quantity === value.quantity
+    && canonical.executionPrice === value.executionPrice
+    && new Date(canonical.timestamp).getTime() === timestamp.getTime();
+}
+
+function buildOrderDocument({ userId, id, value, timestamp }) {
+  return {
+    _id: id,
+    userId,
+    symbol: value.symbol,
+    side: value.side,
+    orderType: 'LIMIT',
+    quantity: value.quantity,
+    remainingQuantity: value.quantity,
+    limitPrice: value.limitPrice,
+    status: 'OPEN',
+    clientOrderId: legacyOrderKey(userId, id),
+    filledPrice: null,
+    filledAt: null,
+    cancelledAt: null,
+    attempts: 0,
+    lastError: null,
+    claimedBy: null,
+    claimedAt: null,
+    leaseExpiresAt: null,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    __v: 0
+  };
+}
+
+function buildTradeDocument({ userId, id, value, timestamp }) {
+  return {
+    _id: id,
+    userId,
+    orderId: null,
+    symbol: value.symbol,
+    side: value.side,
+    quantity: value.quantity,
+    executionPrice: value.executionPrice,
+    notional: value.notional,
+    // Legacy trades do not carry a reliable cost basis for PnL. Leaving this
+    // null is deliberate: reconstructing it could invent financial history.
+    realizedPnl: null,
+    clientOrderId: null,
+    timestamp,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    __v: 0
+  };
+}
+
+function buildPositions(user, userId, issues) {
+  const positions = [];
+  const bySymbol = new Map();
+
+  for (const raw of Array.isArray(user.portfolio) ? user.portfolio : []) {
+    const symbol = typeof raw.symbol === 'string' ? raw.symbol.trim().toUpperCase() : '';
+    if (!symbol) {
+      issues.push(issue('INVALID_POSITION', SEVERITY.ERROR, userId, null, 'Portfolio entry without a symbol; user migration is blocked.'));
+      return { positions: [], bySymbol, blocked: true };
+    }
+    if (bySymbol.has(symbol)) {
+      issues.push(issue('DUPLICATE_POSITION_SYMBOL', SEVERITY.ERROR, userId, symbol, 'Duplicate portfolio symbol; user migration is blocked to avoid dropping holdings.'));
+      return { positions: [], bySymbol, blocked: true };
+    }
+
+    const quantity = asFinite(raw.quantity, Number.NaN);
+    const lockedQuantity = asFinite(raw.lockedQuantity, 0);
+    const avgPrice = normalizeAvgPrice(raw.avgPrice);
+
+    if (!Number.isFinite(quantity) || quantity < 0) {
+      issues.push(issue('INVALID_POSITION_QUANTITY', SEVERITY.ERROR, userId, symbol, `Position quantity ${raw.quantity} is not a non-negative number.`));
+      return { positions: [], bySymbol, blocked: true };
+    }
+    if (lockedQuantity < 0) {
+      issues.push(issue('NEGATIVE_LOCKED_QUANTITY', SEVERITY.ERROR, userId, symbol, `lockedQuantity ${lockedQuantity} is negative.`));
+      return { positions: [], bySymbol, blocked: true };
+    }
+
+    // A missing basis is preserved as unknown, never rewritten to zero. Known
+    // positive bases are carried through byte-for-byte.
+    const costBasisKnown = avgPrice !== null || quantity === 0;
+    if (quantity > 0 && !costBasisKnown) {
+      issues.push(issue('MISSING_COST_BASIS', SEVERITY.WARNING, userId, symbol, 'Position has quantity but no recoverable average cost basis; avgPrice is stored as null and marked UNKNOWN.'));
+    }
+
+    const position = {
+      _id: optionalObjectId(raw._id) || undefined,
+      symbol,
+      quantity: roundTo(quantity),
+      lockedQuantity: roundTo(lockedQuantity),
+      avgPrice: costBasisKnown ? avgPrice : null,
+      costBasisStatus: costBasisKnown ? 'KNOWN' : 'UNKNOWN'
+    };
+    positions.push(position);
+    bySymbol.set(symbol, position);
+  }
+
+  return { positions, bySymbol, blocked: false };
+}
+
+function planAccount(user, existingOrders = [], existingTrades = [], { now = Date.now() } = {}) {
+  const userId = user._id;
+  const accountTimestampProvided = hasValidTimestamp(user.createdAt);
+  const fallbackTimestamp = accountTimestampProvided
+    ? new Date(user.createdAt)
+    : deterministicAccountTimestamp(user);
+  const fallbackSource = accountTimestampProvided ? 'user.createdAt' : 'deterministic account fallback';
+  const issues = [];
+  const orders = [];
+  const trades = [];
+
+  const portfolio = buildPositions(user, userId, issues);
+  if (portfolio.blocked) {
+    return {
+      userId: String(userId),
+      blocked: true,
+      issues,
+      orders: [],
+      trades: [],
+      portfolio: { positions: [], changed: false },
+      lockedBalance: asFinite(user.lockedBalance, 0),
+      lockedBalanceChanged: false
+    };
+  }
+
+  const { positions, bySymbol } = portfolio;
+  const legacyOrders = Array.isArray(user.pendingOrders) ? user.pendingOrders : [];
+  const legacyTrades = Array.isArray(user.trades) ? user.trades : [];
+
+  // Duplicate embedded identities make ownership of the canonical twin
+  // ambiguous. Blocking the whole account is deliberate: migrating one copy
+  // would either silently discard the other or invent a second order. The
+  // check resolves generated ids too, so id-less duplicates are caught by the
+  // same rule.
+  function duplicateIdentityGroups(records, resolveId) {
+    const counts = new Map();
+    for (const record of records) {
+      if (!record) continue;
+      const id = resolveId(userId, record);
+      if (!id) continue;
+      counts.set(id, (counts.get(id) || 0) + 1);
+    }
+    return [...counts.entries()]
+      .filter(([, count]) => count > 1)
+      .map(([id, count]) => ({ id, count }));
+  }
+
+  const duplicateOrderIds = duplicateIdentityGroups(legacyOrders, resolveLegacyOrderId);
+  const duplicateTradeIds = duplicateIdentityGroups(legacyTrades, resolveLegacyTradeId);
+
+  for (const group of duplicateOrderIds) {
+    issues.push(issue('DUPLICATE_LEGACY_ID', SEVERITY.ERROR, userId, group.id, `${group.count} embedded pending orders share this _id; the account is blocked pending manual remediation.`));
+  }
+  for (const group of duplicateTradeIds) {
+    issues.push(issue('DUPLICATE_LEGACY_ID', SEVERITY.ERROR, userId, group.id, `${group.count} embedded trades share this _id; the account is blocked pending manual remediation.`));
+  }
+
+  if (duplicateOrderIds.length > 0 || duplicateTradeIds.length > 0) {
+    return {
+      userId: String(userId),
+      blocked: true,
+      issues,
+      orders: [],
+      trades: [],
+      duplicateOrderIds,
+      duplicateTradeIds,
+      portfolio: { positions: [], changed: false },
+      lockedBalance: asFinite(user.lockedBalance, 0),
+      lockedBalanceChanged: false
+    };
+  }
+
+  const ordersById = new Map(existingOrders.map(order => [String(order._id), order]));
+  const ordersByClientId = new Map(
+    existingOrders
+      .filter(order => order.clientOrderId)
+      .map(order => [order.clientOrderId, order])
+  );
+  const tradesById = new Map(existingTrades.map(trade => [String(trade._id), trade]));
+
+  const seenOrderIds = new Set();
+  for (let index = 0; index < legacyOrders.length; index += 1) {
+    const raw = legacyOrders[index] || {};
+    const providedId = optionalObjectId(raw._id);
+    const legacyId = providedId || legacyOrderId(userId, raw);
+    const legacyIdText = String(legacyId);
+
+    if (seenOrderIds.has(legacyIdText)) {
+      issues.push(issue('DUPLICATE_LEGACY_ID', SEVERITY.ERROR, userId, legacyIdText, 'Two embedded pending orders share the same _id; the duplicate is not migrated.'));
+      continue;
+    }
+    seenOrderIds.add(legacyIdText);
+
+    const validated = validateLegacyOrder(raw);
+    if (!validated.ok) {
+      issues.push(issue('INVALID_LEGACY_ORDER', SEVERITY.ERROR, userId, legacyIdText, validated.error));
+      if (String(raw.type).toUpperCase() === 'SELL') {
+        issues.push(issue('IRRECOVERABLE_ESCROW', SEVERITY.ERROR, userId, legacyIdText, 'Invalid legacy SELL order may have deducted holdings that cannot be reconstructed.'));
+      }
+      continue;
+    }
+
+    const timestamp = normalizeTimestamp(raw.timestamp, fallbackTimestamp);
+    if (!raw.timestamp) {
+      issues.push(issue('MISSING_TIMESTAMP', SEVERITY.WARNING, userId, legacyIdText, `Legacy order had no timestamp; ${fallbackSource} (${fallbackTimestamp.toISOString()}) was used.`));
+    }
+    if (!providedId) {
+      issues.push(issue('GENERATED_LEGACY_ID', SEVERITY.WARNING, userId, legacyIdText, 'Legacy order had no _id; a deterministic id was generated.'));
+    }
+
+    const canonical = ordersById.get(legacyIdText) || ordersByClientId.get(legacyOrderKey(userId, legacyIdText));
+    if (canonical) {
+      if (matchesMigratedOrder(canonical, validated.value, userId, legacyIdText)) {
+        orders.push({ action: 'already-migrated', legacyId: legacyIdText, legacy: raw, canonicalId: String(canonical._id) });
+      } else {
+        issues.push(issue('CONFLICTING_EXISTING_ORDER', SEVERITY.ERROR, userId, legacyIdText, 'A canonical order with the same id already exists with different financial fields.'));
+        orders.push({ action: 'conflict', legacyId: legacyIdText, legacy: raw, canonicalId: String(canonical._id) });
+      }
+      continue;
+    }
+
+    orders.push({
+      action: 'insert',
+      legacyId: legacyIdText,
+      legacy: raw,
+      document: buildOrderDocument({
+        userId,
+        id: legacyId,
+        value: validated.value,
+        timestamp
+      })
+    });
+  }
+
+  const seenTradeIds = new Set();
+  for (let index = 0; index < legacyTrades.length; index += 1) {
+    const raw = legacyTrades[index] || {};
+    const providedId = optionalObjectId(raw._id);
+    const legacyId = providedId || legacyTradeId(userId, raw);
+    const legacyIdText = String(legacyId);
+
+    if (seenTradeIds.has(legacyIdText)) {
+      issues.push(issue('DUPLICATE_LEGACY_ID', SEVERITY.ERROR, userId, legacyIdText, 'Two embedded trades share the same _id; the duplicate is not migrated.'));
+      continue;
+    }
+    seenTradeIds.add(legacyIdText);
+
+    const validated = validateLegacyTrade(raw);
+    if (!validated.ok) {
+      issues.push(issue('INVALID_LEGACY_TRADE', SEVERITY.ERROR, userId, legacyIdText, validated.error));
+      continue;
+    }
+
+    const timestamp = normalizeTimestamp(raw.timestamp, fallbackTimestamp);
+    if (!raw.timestamp) {
+      issues.push(issue('MISSING_TIMESTAMP', SEVERITY.WARNING, userId, legacyIdText, `Legacy trade had no timestamp; ${fallbackSource} (${fallbackTimestamp.toISOString()}) was used.`));
+    }
+    if (!providedId) {
+      issues.push(issue('GENERATED_LEGACY_ID', SEVERITY.WARNING, userId, legacyIdText, 'Legacy trade had no _id; a deterministic id was generated.'));
+    }
+
+    const canonical = tradesById.get(legacyIdText);
+    if (canonical) {
+      if (matchesMigratedTrade(canonical, validated.value, timestamp)) {
+        trades.push({ action: 'already-migrated', legacyId: legacyIdText, legacy: raw, canonicalId: String(canonical._id) });
+      } else {
+        issues.push(issue('CONFLICTING_EXISTING_TRADE', SEVERITY.ERROR, userId, legacyIdText, 'A canonical trade with the same _id already exists with different financial fields.'));
+        trades.push({ action: 'conflict', legacyId: legacyIdText, legacy: raw, canonicalId: String(canonical._id) });
+      }
+      continue;
+    }
+
+    trades.push({
+      action: 'insert',
+      legacyId: legacyIdText,
+      legacy: raw,
+      document: buildTradeDocument({
+        userId,
+        id: legacyId,
+        value: validated.value,
+        timestamp
+      })
+    });
+  }
+
+  // Locks are recomputed from the canonical OPEN orders plus not-yet-migrated
+  // legacy orders. Migrated legacy orders are already counted as canonical, so
+  // rerunning apply cannot double count or double deduct.
+  let reservedBalance = 0;
+  const lockedBySymbol = new Map();
+  const canonicalSellReservations = [];
+
+  for (const canonical of existingOrders) {
+    if (canonical.status !== 'OPEN') continue;
+    if (canonical.orderType !== 'LIMIT') {
+      issues.push(issue('ORPHANED_CANONICAL_OPEN_MARKET', SEVERITY.WARNING, userId, String(canonical._id), 'A canonical market order is OPEN; it is excluded from lock reconciliation.'));
+      continue;
+    }
+    const remaining = asFinite(canonical.remainingQuantity, canonical.quantity);
+    if (remaining <= 0) continue;
+    if (canonical.side === 'BUY') {
+      reservedBalance = roundTo(reservedBalance + roundTo(remaining * canonical.limitPrice));
+    } else if (canonical.side === 'SELL') {
+      canonicalSellReservations.push({
+        orderId: String(canonical._id),
+        symbol: canonical.symbol,
+        remaining
+      });
+      lockedBySymbol.set(
+        canonical.symbol,
+        roundTo((lockedBySymbol.get(canonical.symbol) || 0) + remaining)
+      );
+    }
+  }
+
+  for (const planned of orders) {
+    if (planned.action !== 'insert') continue;
+    const doc = planned.document;
+    if (doc.side === 'BUY') {
+      reservedBalance = roundTo(reservedBalance + roundTo(doc.quantity * doc.limitPrice));
+      continue;
+    }
+
+    let position = bySymbol.get(doc.symbol);
+    if (!position) {
+      position = {
+        _id: undefined,
+        symbol: doc.symbol,
+        quantity: 0,
+        lockedQuantity: 0,
+        avgPrice: null,
+        costBasisStatus: 'UNKNOWN'
+      };
+      positions.push(position);
+      bySymbol.set(doc.symbol, position);
+      issues.push(issue('MISSING_POSITION_RECONSTRUCTED', SEVERITY.WARNING, userId, doc.symbol, 'Legacy SELL order had no portfolio position; the deducted quantity is reconstructed from the order.'));
+      issues.push(issue('MISSING_COST_BASIS', SEVERITY.WARNING, userId, doc.symbol, 'Reconstructed position has no recoverable cost basis; avgPrice remains null and UNKNOWN.'));
+    }
+    // The legacy engine deducted holdings when the SELL limit was placed.
+    // Restore the total holding and mark it locked. Legacy orders carry no
+    // purchase price, so a position with no recoverable average price must be
+    // UNKNOWN once holdings become positive again.
+    position.quantity = roundTo(position.quantity + doc.quantity);
+    if (normalizeAvgPrice(position.avgPrice) === null) {
+      position.costBasisStatus = 'UNKNOWN';
+    }
+    lockedBySymbol.set(
+      doc.symbol,
+      roundTo((lockedBySymbol.get(doc.symbol) || 0) + doc.quantity)
+    );
+  }
+
+  // A canonical SELL reservation is only reconcilable if the account really
+  // holds that symbol. Holdings are never invented for it; the mismatch is
+  // reported so an operator can resolve the escrow by hand.
+  for (const reservation of canonicalSellReservations) {
+    if (bySymbol.has(reservation.symbol)) continue;
+    issues.push(issue(
+      'UNMATCHED_CANONICAL_SELL_RESERVATION',
+      SEVERITY.ERROR,
+      userId,
+      reservation.orderId,
+      `Open SELL order reserves ${reservation.remaining} ${reservation.symbol} but the portfolio has no such position; holdings are not invented.`
+    ));
+  }
+
+  for (const position of positions) {
+    const expectedLock = roundTo(lockedBySymbol.get(position.symbol) || 0);
+    if (position.lockedQuantity !== expectedLock) {
+      if (position.lockedQuantity > expectedLock) {
+        issues.push(issue('STALE_LOCK_CLEARED', SEVERITY.WARNING, userId, position.symbol, `lockedQuantity ${position.lockedQuantity} exceeded open SELL orders (${expectedLock}); annotation was reconciled.`));
+      }
+      position.lockedQuantity = expectedLock;
+    }
+    if (position.quantity + EPSILON < position.lockedQuantity) {
+      issues.push(issue('NEGATIVE_AVAILABLE', SEVERITY.ERROR, userId, position.symbol, `Available quantity would be ${roundTo(position.quantity - position.lockedQuantity)}.`));
+    }
+  }
+
+  const currentLockedBalance = asFinite(user.lockedBalance, 0);
+  if (currentLockedBalance < 0) {
+    issues.push(issue('NEGATIVE_LOCKED_BALANCE', SEVERITY.WARNING, userId, null, `lockedBalance ${currentLockedBalance} is negative; annotation was reconciled.`));
+  } else if (currentLockedBalance !== reservedBalance) {
+    issues.push(issue('LOCK_BALANCE_ADJUSTED', SEVERITY.WARNING, userId, null, `lockedBalance ${currentLockedBalance} did not equal open BUY reservations (${reservedBalance}); annotation was reconciled.`));
+  }
+
+  const currentPositions = Array.isArray(user.portfolio) ? user.portfolio : [];
+  const positionsChanged = positions.length !== currentPositions.length
+    || positions.some((position, index) => {
+      const current = currentPositions[index];
+      return !current
+        || current.symbol !== position.symbol
+        || roundTo(asFinite(current.quantity, 0)) !== position.quantity
+        || roundTo(asFinite(current.lockedQuantity, 0)) !== position.lockedQuantity
+        || !avgPriceMatches(current.avgPrice, position.avgPrice)
+        || (current.costBasisStatus || 'KNOWN') !== position.costBasisStatus;
+    });
+
+  const lockChanged = roundTo(currentLockedBalance) !== reservedBalance;
+
+  return {
+    userId: String(userId),
+    blocked: false,
+    issues,
+    orders,
+    trades,
+    portfolio: { positions, changed: positionsChanged },
+    lockedBalance: reservedBalance,
+    lockedBalanceChanged: lockChanged
+  };
+}
+
+function planHasChanges(plan) {
+  if (plan.blocked) return false;
+  return plan.orders.some(item => item.action === 'insert')
+    || plan.trades.some(item => item.action === 'insert')
+    || plan.portfolio.changed
+    || plan.lockedBalanceChanged;
+}
+
+function summarizePlan(plan) {
+  const ordersToInsert = plan.orders.filter(item => item.action === 'insert').length;
+  const tradesToInsert = plan.trades.filter(item => item.action === 'insert').length;
+  return {
+    userId: plan.userId,
+    blocked: plan.blocked === true,
+    ordersToInsert,
+    tradesToInsert,
+    ordersAlreadyMigrated: plan.orders.filter(item => item.action === 'already-migrated').length,
+    tradesAlreadyMigrated: plan.trades.filter(item => item.action === 'already-migrated').length,
+    conflicts: plan.orders.filter(item => item.action === 'conflict').length
+      + plan.trades.filter(item => item.action === 'conflict').length,
+    portfolioChanged: plan.portfolio.changed,
+    lockedBalanceChanged: plan.lockedBalanceChanged,
+    issues: plan.issues
+  };
+}
+
+// Reports are built as batches are processed. Nothing here retains a global
+// collection of users, orders, trades or plans.
+function createSummaryAccumulator({ mode = null, startedAt = null } = {}) {
+  const issueCounts = {};
+  const issues = [];
+  const totals = {
+    usersScanned: 0,
+    usersBlocked: 0,
+    usersWithChanges: 0,
+    legacyPendingOrders: 0,
+    legacyTrades: 0,
+    ordersToInsert: 0,
+    tradesToInsert: 0,
+    ordersAlreadyMigrated: 0,
+    tradesAlreadyMigrated: 0,
+    conflicts: 0
+  };
+
+  function add(plan) {
+    const summary = summarizePlan(plan);
+    if (summary.blocked) totals.usersBlocked += 1;
+    if (planHasChanges(plan)) totals.usersWithChanges += 1;
+    totals.usersScanned += 1;
+    totals.legacyPendingOrders += plan.orders.length;
+    totals.legacyTrades += plan.trades.length;
+    totals.ordersToInsert += summary.ordersToInsert;
+    totals.tradesToInsert += summary.tradesToInsert;
+    totals.ordersAlreadyMigrated += summary.ordersAlreadyMigrated;
+    totals.tradesAlreadyMigrated += summary.tradesAlreadyMigrated;
+    totals.conflicts += summary.conflicts;
+
+    for (const entry of plan.issues) {
+      issueCounts[entry.code] = (issueCounts[entry.code] || 0) + 1;
+      issues.push(entry);
+    }
+  }
+
+  function finish(finishedAt = null) {
+    const errors = issues.filter(entry => entry.severity === SEVERITY.ERROR).length;
+    return {
+      mode,
+      startedAt,
+      finishedAt,
+      totals,
+      ambiguity: {
+        total: issues.length,
+        errors,
+        warnings: issues.length - errors,
+        issueCounts,
+        issues
+      }
+    };
+  }
+
+  return { add, finish };
+}
+
+function summarizePlans(plans, meta = {}) {
+  const accumulator = createSummaryAccumulator(meta);
+  for (const plan of plans) accumulator.add(plan);
+  return accumulator.finish(meta.finishedAt || null);
+}
+
+function groupByUser(documents) {
+  const map = new Map();
+  for (const document of documents) {
+    const key = String(document.userId);
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(document);
+  }
+  return map;
+}
+
+function normalizeBatchSize(batchSize) {
+  return Number.isInteger(batchSize) && batchSize > 0 ? batchSize : DEFAULT_BATCH_SIZE;
+}
+
+// planAccount only needs three things from the canonical collections: OPEN
+// orders for lock reconciliation, canonical orders that a legacy record
+// resolves to, and canonical trades that a legacy trade resolves to. Reading a
+// user's entire trade history could exhaust memory for a large account, so the
+// lookup ids are computed first and passed to the database as a filter.
+function collectLegacyLookupIds(users) {
+  const orderIds = [];
+  const orderClientIds = [];
+  const tradeIds = [];
+
+  for (const user of users) {
+    for (const raw of Array.isArray(user.pendingOrders) ? user.pendingOrders : []) {
+      if (!raw) continue;
+      const legacyId = optionalObjectId(raw._id) || legacyOrderId(user._id, raw);
+      orderIds.push(legacyId);
+      orderClientIds.push(legacyOrderKey(user._id, legacyId));
+    }
+    for (const raw of Array.isArray(user.trades) ? user.trades : []) {
+      if (!raw) continue;
+      tradeIds.push(optionalObjectId(raw._id) || legacyTradeId(user._id, raw));
+    }
+  }
+
+  return { orderIds, orderClientIds, tradeIds };
+}
+
+function canonicalOrderFilter(userIdMatcher, { orderIds, orderClientIds }) {
+  const filter = { userId: userIdMatcher };
+  if (orderIds.length > 0 || orderClientIds.length > 0) {
+    filter.$or = [
+      { status: 'OPEN' },
+      { _id: { $in: orderIds } },
+      { clientOrderId: { $in: orderClientIds } }
+    ];
+  } else {
+    filter.status = 'OPEN';
+  }
+  return filter;
+}
+
+async function loadBatchRecords(models, users) {
+  const userIds = users.map(user => user._id);
+  const lookups = collectLegacyLookupIds(users);
+  const tradeFilter = lookups.tradeIds.length > 0
+    ? { userId: { $in: userIds }, _id: { $in: lookups.tradeIds } }
+    : null;
+
+  const [orders, trades] = await Promise.all([
+    models.Order.collection.find(canonicalOrderFilter({ $in: userIds }, lookups)).toArray(),
+    tradeFilter ? models.Trade.collection.find(tradeFilter).toArray() : []
+  ]);
+  const ordersByUser = groupByUser(orders);
+  const tradesByUser = groupByUser(trades);
+
+  return users.map(user => ({
+    user,
+    orders: ordersByUser.get(String(user._id)) || [],
+    trades: tradesByUser.get(String(user._id)) || []
+  }));
+}
+
+// The user cursor is read in fixed-size batches. `limit` is applied to the
+// cursor before iteration, so a limited run never reads other users' records.
+async function* iterateUserBatches(models, { batchSize = DEFAULT_BATCH_SIZE, limit = null } = {}) {
+  const size = normalizeBatchSize(batchSize);
+  const cursor = models.User.collection.find({}).sort({ _id: 1 }).batchSize(size);
+  if (limit) cursor.limit(limit);
+
+  let batch = [];
+  for await (const user of cursor) {
+    batch.push(user);
+    if (batch.length >= size) {
+      yield await loadBatchRecords(models, batch);
+      batch = [];
+    }
+  }
+  if (batch.length > 0) {
+    yield await loadBatchRecords(models, batch);
+  }
+}
+
+async function countCollections(models) {
+  const [users, orders, trades] = await Promise.all([
+    models.User.collection.countDocuments({}),
+    models.Order.collection.countDocuments({}),
+    models.Trade.collection.countDocuments({})
+  ]);
+  return { users, orders, trades };
+}
+
+function duplicateGroupsFor(records) {
+  const counts = new Map();
+  for (const record of records) {
+    if (!record || !record._id) continue;
+    const id = String(record._id);
+    counts.set(id, (counts.get(id) || 0) + 1);
+  }
+  return [...counts.entries()]
+    .filter(([, count]) => count > 1)
+    .map(([id, count]) => ({ id, count }));
+}
+
+async function transactionsSupported(mongooseInstance) {
+  const admin = mongooseInstance.connection.db.admin();
+  const hello = await admin.command({ hello: 1 });
+  return Boolean(hello.setName) || Boolean(hello.isMongos) || hello.msg === 'isdbgrid';
+}
+
+function cleanPosition(position) {
+  const doc = {
+    symbol: position.symbol,
+    quantity: position.quantity,
+    lockedQuantity: position.lockedQuantity,
+    avgPrice: position.avgPrice,
+    costBasisStatus: position.costBasisStatus
+  };
+  if (position._id) doc._id = position._id;
+  return doc;
+}
+
+async function applyUserPlan({ User, Order, Trade, mongoose: mongooseInstance, userId, now = Date.now() }) {
+  const session = await mongooseInstance.startSession();
+  let result;
+  try {
+    await session.withTransaction(async () => {
+      const [rawUser, user] = await Promise.all([
+        User.collection.findOne({ _id: userId }, { session }),
+        User.findById(userId).session(session)
+      ]);
+      if (!rawUser || !user) {
+        result = { userId: String(userId), action: 'missing', ordersInserted: 0, tradesInserted: 0 };
+        return;
+      }
+      const lookups = collectLegacyLookupIds([rawUser]);
+      const tradesQuery = lookups.tradeIds.length > 0
+        ? Trade.collection.find(
+          { userId, _id: { $in: lookups.tradeIds } },
+          { session }
+        ).toArray()
+        : Promise.resolve([]);
+      const [existingOrders, existingTrades] = await Promise.all([
+        Order.collection.find(canonicalOrderFilter(userId, lookups), { session }).toArray(),
+        tradesQuery
+      ]);
+
+      const plan = planAccount(rawUser, existingOrders, existingTrades, { now });
+      if (plan.blocked) {
+        result = {
+          userId: String(userId),
+          action: 'blocked',
+          ordersInserted: 0,
+          tradesInserted: 0,
+          issues: plan.issues
+        };
+        return;
+      }
+      if (!planHasChanges(plan)) {
+        result = {
+          userId: String(userId),
+          action: 'unchanged',
+          ordersInserted: 0,
+          tradesInserted: 0,
+          issues: plan.issues
+        };
+        return;
+      }
+
+      let ordersInserted = 0;
+      let tradesInserted = 0;
+
+      for (const planned of plan.orders) {
+        if (planned.action !== 'insert') continue;
+        await Order.collection.insertOne(planned.document, { session });
+        ordersInserted += 1;
+      }
+      for (const planned of plan.trades) {
+        if (planned.action !== 'insert') continue;
+        await Trade.collection.insertOne(planned.document, { session });
+        tradesInserted += 1;
+      }
+
+      if (plan.portfolio.changed) {
+        user.portfolio = plan.portfolio.positions.map(cleanPosition);
+      }
+      if (plan.lockedBalanceChanged) {
+        user.lockedBalance = plan.lockedBalance;
+      }
+      if (plan.portfolio.changed || plan.lockedBalanceChanged) {
+        await user.save({ session });
+      }
+
+      result = {
+        userId: String(userId),
+        action: 'updated',
+        ordersInserted,
+        tradesInserted,
+        portfolioChanged: plan.portfolio.changed,
+        lockedBalanceChanged: plan.lockedBalanceChanged,
+        issues: plan.issues
+      };
+    }, DEFAULT_TX_OPTIONS);
+  } catch (err) {
+    result = {
+      userId: String(userId),
+      action: 'failed',
+      ordersInserted: 0,
+      tradesInserted: 0,
+      error: err.code || err.name || 'ERROR',
+      message: err.message
+    };
+  } finally {
+    await session.endSession();
+  }
+  return result;
+}
+
+async function runMigration({
+  User,
+  Order,
+  Trade,
+  mongoose: mongooseInstance,
+  mode = 'dry-run',
+  limit = null,
+  now = Date.now(),
+  batchSize = DEFAULT_BATCH_SIZE
+} = {}) {
+  if (mode !== 'dry-run' && mode !== 'apply') {
+    throw new TypeError('mode must be "dry-run" or "apply".');
+  }
+  const models = defaultModels({ User, Order, Trade });
+  const db = mongooseInstance || mongoose;
+  const startedAt = new Date().toISOString();
+
+  if (mode === 'apply') {
+    const supported = await transactionsSupported(db);
+    if (!supported) {
+      throw new Error('Refusing to apply the migration without MongoDB transaction support (a replica set is required).');
+    }
+  }
+
+  if (mode === 'dry-run') {
+    const accumulator = createSummaryAccumulator({ mode, startedAt });
+    for await (const batch of iterateUserBatches(models, { batchSize, limit })) {
+      for (const { user, orders, trades } of batch) {
+        accumulator.add(planAccount(user, orders, trades, { now }));
+      }
+    }
+    return {
+      ...accumulator.finish(new Date().toISOString()),
+      writes: { users: 0, orders: 0, trades: 0 }
+    };
+  }
+
+  const size = normalizeBatchSize(batchSize);
+  let userCursor = models.User.collection.find({}).sort({ _id: 1 }).batchSize(size).project({ _id: 1 });
+  if (limit) userCursor = userCursor.limit(limit);
+
+  const issueCounts = {};
+  const issues = [];
+  const failures = [];
+  const counters = {
+    scanned: 0,
+    updated: 0,
+    unchanged: 0,
+    blocked: 0,
+    missing: 0,
+    failed: 0,
+    orders: 0,
+    trades: 0
+  };
+
+  for await (const { _id } of userCursor) {
+    const result = await applyUserPlan({
+      User: models.User,
+      Order: models.Order,
+      Trade: models.Trade,
+      mongoose: db,
+      userId: _id,
+      now
+    });
+
+    counters.scanned += 1;
+    if (result.action === 'updated') {
+      counters.updated += 1;
+      counters.orders += result.ordersInserted || 0;
+      counters.trades += result.tradesInserted || 0;
+    } else if (result.action === 'unchanged') {
+      counters.unchanged += 1;
+    } else if (result.action === 'blocked') {
+      counters.blocked += 1;
+    } else if (result.action === 'missing') {
+      counters.missing += 1;
+    } else {
+      counters.failed += 1;
+      failures.push(result);
+    }
+
+    for (const entry of result.issues || []) {
+      issueCounts[entry.code] = (issueCounts[entry.code] || 0) + 1;
+      issues.push(entry);
+    }
+  }
+
+  const errors = issues.filter(entry => entry.severity === SEVERITY.ERROR).length;
+  return {
+    mode,
+    startedAt,
+    finishedAt: new Date().toISOString(),
+    usersScanned: counters.scanned,
+    usersUpdated: counters.updated,
+    usersUnchanged: counters.unchanged,
+    usersBlocked: counters.blocked,
+    usersMissing: counters.missing,
+    usersFailed: counters.failed,
+    failures,
+    writes: {
+      users: counters.updated,
+      orders: counters.orders,
+      trades: counters.trades
+    },
+    ambiguity: {
+      total: issues.length,
+      errors,
+      warnings: issues.length - errors,
+      issueCounts,
+      issues
+    }
+  };
+}
+
+async function auditLegacyData(modelsInput = {}, { now = Date.now(), batchSize = DEFAULT_BATCH_SIZE } = {}) {
+  const models = defaultModels(modelsInput);
+  const startedAt = new Date().toISOString();
+  const accumulator = createSummaryAccumulator({ mode: 'audit', startedAt });
+  let openBuy = 0;
+  let openSell = 0;
+  const duplicateOrderGroups = [];
+  const duplicateTradeGroups = [];
+  const unknownCostBasis = [];
+
+  for await (const batch of iterateUserBatches(models, { batchSize })) {
+    for (const { user, orders, trades } of batch) {
+      const plan = planAccount(user, orders, trades, { now });
+      accumulator.add(plan);
+
+      const legacyOrders = Array.isArray(user.pendingOrders) ? user.pendingOrders : [];
+      for (const order of legacyOrders) {
+        // Null entries are reported per-account by planAccount; counting them
+        // here must not abort the whole audit.
+        if (!order) continue;
+        const side = String(order.type).toUpperCase();
+        if (side === 'BUY') openBuy += 1;
+        else if (side === 'SELL') openSell += 1;
+      }
+
+      for (const group of duplicateGroupsFor(legacyOrders)) {
+        duplicateOrderGroups.push({
+          userId: String(user._id),
+          legacyOrderId: group.id,
+          count: group.count
+        });
+      }
+      for (const group of duplicateGroupsFor(Array.isArray(user.trades) ? user.trades : [])) {
+        duplicateTradeGroups.push({
+          userId: String(user._id),
+          legacyTradeId: group.id,
+          count: group.count
+        });
+      }
+
+      for (const position of plan.portfolio.positions) {
+        if (position.costBasisStatus === 'UNKNOWN' && position.quantity > 0) {
+          unknownCostBasis.push({
+            userId: plan.userId,
+            symbol: position.symbol,
+            quantity: position.quantity
+          });
+        }
+      }
+    }
+  }
+
+  const finishedAt = new Date().toISOString();
+  const summary = accumulator.finish(finishedAt);
+  const collections = await countCollections(models);
+
+  return {
+    readOnly: true,
+    checkedAt: finishedAt,
+    collections,
+    legacy: {
+      users: summary.totals.usersScanned,
+      pendingOrders: summary.totals.legacyPendingOrders,
+      openBuy,
+      openSell,
+      trades: summary.totals.legacyTrades,
+      duplicateOrderGroups,
+      duplicateTradeGroups,
+      unknownCostBasis
+    },
+    migration: {
+      usersWithChanges: summary.totals.usersWithChanges,
+      usersBlocked: summary.totals.usersBlocked,
+      ordersToInsert: summary.totals.ordersToInsert,
+      tradesToInsert: summary.totals.tradesToInsert,
+      ordersAlreadyMigrated: summary.totals.ordersAlreadyMigrated,
+      tradesAlreadyMigrated: summary.totals.tradesAlreadyMigrated,
+      conflicts: summary.totals.conflicts
+    },
+    ambiguity: summary.ambiguity,
+    notes: [
+      'Embedded pendingOrders and trades are never modified or deleted by this batch.',
+      'Legacy trades are copied without synthesized realized PnL.',
+      'Positions without a recoverable cost basis are marked UNKNOWN with a null avgPrice.',
+      'Duplicate embedded _ids block the affected account pending manual remediation.',
+      'Apply requires an explicit flag, confirmation env var, and a backup file.'
+    ]
+  };
+}
+
+async function verifyMigration(modelsInput = {}, {
+  backupFile = null,
+  now = Date.now(),
+  batchSize = DEFAULT_BATCH_SIZE
+} = {}) {
+  const models = defaultModels(modelsInput);
+  const mismatches = [];
+  const issues = [];
+  const unknownCostBasis = [];
+  let usersChecked = 0;
+  let migratedOrders = 0;
+  let migratedTrades = 0;
+  let pendingRecords = 0;
+
+  for await (const batch of iterateUserBatches(models, { batchSize })) {
+    for (const { user, orders, trades } of batch) {
+      const plan = planAccount(user, orders, trades, { now });
+      usersChecked += 1;
+      issues.push(...plan.issues);
+      migratedOrders += plan.orders.filter(item => item.action === 'already-migrated').length;
+      migratedTrades += plan.trades.filter(item => item.action === 'already-migrated').length;
+      pendingRecords += plan.orders.filter(item => item.action === 'insert').length
+        + plan.trades.filter(item => item.action === 'insert').length;
+
+      if (plan.blocked) {
+        mismatches.push({ code: 'BLOCKED_USER', userId: plan.userId, detail: 'User was not migrated because legacy data is ambiguous.' });
+        continue;
+      }
+      const pendingOrders = plan.orders.filter(item => item.action === 'insert');
+      const pendingTrades = plan.trades.filter(item => item.action === 'insert');
+      if (pendingOrders.length > 0) {
+        mismatches.push({ code: 'UNMIGRATED_ORDERS', userId: plan.userId, detail: `${pendingOrders.length} valid legacy order(s) are not in the canonical collection.` });
+      }
+      if (pendingTrades.length > 0) {
+        mismatches.push({ code: 'UNMIGRATED_TRADES', userId: plan.userId, detail: `${pendingTrades.length} valid legacy trade(s) are not in the canonical collection.` });
+      }
+      // A canonical twin with different financial fields is a reconciliation
+      // failure in its own right, independent of how locks happen to line up.
+      const conflictingOrders = plan.orders.filter(item => item.action === 'conflict');
+      const conflictingTrades = plan.trades.filter(item => item.action === 'conflict');
+      if (conflictingOrders.length > 0) {
+        mismatches.push({ code: 'CONFLICTING_ORDERS', userId: plan.userId, detail: `${conflictingOrders.length} canonical order(s) disagree with the embedded legacy record.` });
+      }
+      if (conflictingTrades.length > 0) {
+        mismatches.push({ code: 'CONFLICTING_TRADES', userId: plan.userId, detail: `${conflictingTrades.length} canonical trade(s) disagree with the embedded legacy record.` });
+      }
+
+      if (user.balance < 0) {
+        mismatches.push({ code: 'NEGATIVE_BALANCE', userId: plan.userId, detail: `balance ${user.balance}.` });
+      }
+      const expectedLockedBalance = roundTo(plan.lockedBalance);
+      const actualLockedBalance = roundTo(asFinite(user.lockedBalance, 0));
+      if (expectedLockedBalance !== actualLockedBalance) {
+        mismatches.push({
+          code: 'LOCKED_BALANCE_MISMATCH',
+          userId: plan.userId,
+          detail: `lockedBalance ${actualLockedBalance} != open BUY reservations ${expectedLockedBalance}.`
+        });
+      }
+
+      for (const position of plan.portfolio.positions) {
+        if (position.costBasisStatus === 'UNKNOWN' && position.quantity > 0) {
+          unknownCostBasis.push({
+            userId: plan.userId,
+            symbol: position.symbol,
+            quantity: position.quantity,
+            status: 'UNKNOWN'
+          });
+        }
+        const current = (user.portfolio || []).find(item => item.symbol === position.symbol);
+        if (!current) {
+          mismatches.push({ code: 'MISSING_POSITION', userId: plan.userId, detail: `${position.symbol} is missing from the user portfolio.` });
+          continue;
+        }
+        const currentQuantity = roundTo(asFinite(current.quantity, 0));
+        const expectedStatus = position.costBasisStatus;
+        const currentStatus = current.costBasisStatus
+          || (normalizeAvgPrice(current.avgPrice) !== null ? 'KNOWN' : (currentQuantity > 0 ? 'UNKNOWN' : 'KNOWN'));
+        if (currentStatus !== expectedStatus) {
+          mismatches.push({
+            code: 'COST_BASIS_STATUS_MISMATCH',
+            userId: plan.userId,
+            detail: `${position.symbol} costBasisStatus ${currentStatus} != expected ${expectedStatus}.`
+          });
+        }
+        if (!avgPriceMatches(current.avgPrice, position.avgPrice)) {
+          mismatches.push({
+            code: 'COST_BASIS_MISMATCH',
+            userId: plan.userId,
+            detail: `${position.symbol} avgPrice ${current.avgPrice} != expected ${position.avgPrice}.`
+          });
+        }
+        if (roundTo(asFinite(current.lockedQuantity, 0)) !== roundTo(position.lockedQuantity)) {
+          mismatches.push({
+            code: 'LOCKED_QUANTITY_MISMATCH',
+            userId: plan.userId,
+            detail: `${position.symbol} lockedQuantity ${asFinite(current.lockedQuantity, 0)} != open SELL reservations ${position.lockedQuantity}.`
+          });
+        }
+        if (roundTo(asFinite(current.quantity, 0)) !== roundTo(position.quantity)) {
+          mismatches.push({
+            code: 'POSITION_QUANTITY_MISMATCH',
+            userId: plan.userId,
+            detail: `${position.symbol} quantity ${asFinite(current.quantity, 0)} != reconstructed total ${position.quantity}.`
+          });
+        }
+        const available = roundTo(position.quantity - position.lockedQuantity);
+        if (available < -EPSILON) {
+          mismatches.push({ code: 'NEGATIVE_AVAILABLE', userId: plan.userId, detail: `${position.symbol} available ${available}.` });
+        }
+      }
+    }
+  }
+
+  let backup = null;
+  if (backupFile) {
+    backup = await verifyBackup({ User: models.User }, backupFile, { batchSize });
+    if (!backup.ok) {
+      mismatches.push({ code: 'BACKUP_VERIFICATION_FAILED', userId: null, detail: backup.error || 'Backup integrity check failed.' });
+    }
+  }
+
+  const collections = await countCollections(models);
+  return {
+    ok: mismatches.length === 0,
+    checkedAt: new Date().toISOString(),
+    collections,
+    users: usersChecked,
+    migrated: {
+      orders: migratedOrders,
+      trades: migratedTrades,
+      pending: pendingRecords
+    },
+    lockReconciliation: {
+      usersChecked,
+      mismatches: mismatches.filter(item => item.code.startsWith('LOCKED_')).length
+    },
+    costBasis: {
+      affectedUsers: new Set(unknownCostBasis.map(entry => entry.userId)).size,
+      unknownPositions: unknownCostBasis
+    },
+    mismatches,
+    ambiguity: {
+      total: issues.length,
+      errors: issues.filter(entry => entry.severity === SEVERITY.ERROR).length,
+      warnings: issues.filter(entry => entry.severity === SEVERITY.WARNING).length,
+      // Strict verification (--strict) inspects these entries, so the producer
+      // must expose them exactly as the audit path does.
+      issues
+    },
+    backup
+  };
+}
+
+function backupHash(users) {
+  return crypto.createHash('sha256').update(JSON.stringify(users)).digest('hex');
+}
+
+// The backup is streamed to a temporary file and renamed into place only after
+// the complete payload and checksum have been written. The checksum is computed
+// over the same compact users array that readBackup hashes, so backups remain
+// byte-version compatible with the existing reader.
+async function createBackup({ User }, file, { now = new Date(), batchSize = DEFAULT_BATCH_SIZE } = {}) {
+  const createdAt = now.toISOString();
+  const expectedCount = await User.collection.countDocuments({});
+  const tempFile = `${file}.tmp-${process.pid}-${Date.now()}`;
+  const hash = crypto.createHash('sha256');
+  let handle = null;
+  let streamed = 0;
+
+  try {
+    // The backup contains every account record, so the temporary file is
+    // created owner-only before any content is written.
+    handle = await fs.promises.open(tempFile, 'w', 0o600);
+    await handle.write(
+      `{\n  "version": ${BACKUP_VERSION},\n  "createdAt": ${JSON.stringify(createdAt)},\n  "userCount": ${expectedCount},\n  "users": [`
+    );
+    hash.update('[');
+
+    const cursor = User.collection.find({}).sort({ _id: 1 }).batchSize(normalizeBatchSize(batchSize));
+    for await (const user of cursor) {
+      const compact = JSON.stringify(user);
+      hash.update(streamed === 0 ? compact : `,${compact}`);
+      const pretty = JSON.stringify(user, null, 2).replace(/\n/g, '\n    ');
+      await handle.write(`${streamed === 0 ? '\n' : ',\n'}    ${pretty}`);
+      streamed += 1;
+    }
+    hash.update(']');
+
+    if (streamed !== expectedCount) {
+      throw new Error('User collection changed while the backup was being written; retry.');
+    }
+
+    const sha256 = hash.digest('hex');
+    await handle.write(`${streamed === 0 ? '' : '\n  '}],\n  "sha256": "${sha256}"\n}\n`);
+    await handle.sync();
+    await handle.close();
+    handle = null;
+
+    // Atomic replacement: the destination is untouched until the temporary
+    // file is complete.
+    await fs.promises.rename(tempFile, file);
+
+    return {
+      file,
+      version: BACKUP_VERSION,
+      createdAt,
+      userCount: streamed,
+      sha256
+    };
+  } catch (err) {
+    if (handle) {
+      try {
+        await handle.close();
+      } catch {
+        // The original error is more useful than a close failure.
+      }
+    }
+    try {
+      await fs.promises.unlink(tempFile);
+    } catch {
+      // The temporary file may not exist if opening it failed.
+    }
+    throw err;
+  }
+}
+
+const BACKUP_READ_CHUNK_SIZE = 512 * 1024;
+
+// Streaming JSON reader over a file descriptor. It retains only the bytes of
+// the value currently being parsed, so a backup of any size can be validated
+// and walked without ever holding the whole document in memory.
+function createBackupReader(fd, chunkSize) {
+  const size = Number.isInteger(chunkSize) && chunkSize > 0 ? chunkSize : BACKUP_READ_CHUNK_SIZE;
+  const chunk = Buffer.alloc(size);
+  const decoder = new StringDecoder('utf8');
+  let text = '';
+  let index = 0;
+  let ended = false;
+
+  function fill() {
+    if (ended) return;
+    const bytes = fs.readSync(fd, chunk, 0, size, null);
+    if (bytes === 0) {
+      ended = true;
+      text += decoder.end();
+      return;
+    }
+    text += decoder.write(chunk.subarray(0, bytes));
+  }
+
+  function available() {
+    return text.length - index;
+  }
+
+  function ensure(count) {
+    while (available() < count && !ended) fill();
+  }
+
+  function peek(offset = 0) {
+    ensure(offset + 1);
+    const position = index + offset;
+    return position < text.length ? text[position] : null;
+  }
+
+  function next() {
+    const value = peek();
+    if (value !== null) index += 1;
+    return value;
+  }
+
+  function skipWhitespace() {
+    while (true) {
+      const value = peek();
+      if (value === ' ' || value === '\t' || value === '\n' || value === '\r') {
+        index += 1;
+        continue;
+      }
+      break;
+    }
+  }
+
+  function readStringRaw() {
+    const start = index;
+    if (next() !== '"') throw new SyntaxError('Expected a JSON string.');
+    let escaped = false;
+    while (true) {
+      const value = next();
+      if (value === null) throw new SyntaxError('Unterminated JSON string.');
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (value === '\\') {
+        escaped = true;
+        continue;
+      }
+      if (value === '"') return text.slice(start, index);
+    }
+  }
+
+  function readScalarRaw() {
+    const start = index;
+    while (true) {
+      const value = peek();
+      if (value === null || value === ',' || value === '}' || value === ']'
+        || value === ' ' || value === '\t' || value === '\n' || value === '\r') break;
+      index += 1;
+    }
+    if (index === start) throw new SyntaxError('Expected a JSON value.');
+    return text.slice(start, index);
+  }
+
+  function readCompositeRaw() {
+    const start = index;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    while (true) {
+      const value = next();
+      if (value === null) throw new SyntaxError('Unexpected end of JSON input.');
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (value === '\\') escaped = true;
+        else if (value === '"') inString = false;
+        continue;
+      }
+      if (value === '"') inString = true;
+      else if (value === '{' || value === '[') depth += 1;
+      else if (value === '}' || value === ']') {
+        depth -= 1;
+        if (depth === 0) return text.slice(start, index);
+        if (depth < 0) throw new SyntaxError('Unexpected closing character.');
+      }
+    }
+  }
+
+  function readAnyRaw() {
+    const value = peek();
+    if (value === '"') return readStringRaw();
+    if (value === '{' || value === '[') return readCompositeRaw();
+    return readScalarRaw();
+  }
+
+  function compact() {
+    if (index > size) {
+      text = text.slice(index);
+      index = 0;
+    }
+  }
+
+  return { peek, next, skipWhitespace, readStringRaw, readAnyRaw, compact };
+}
+
+// Yields every user and, after the array ends, the checksum computed over the
+// same compact serialization that backupHash produces.
+function* readBackupEvents(file, { chunkSize } = {}) {
+  const fd = fs.openSync(file, 'r');
+  const reader = createBackupReader(fd, chunkSize);
+  try {
+    reader.skipWhitespace();
+    if (reader.next() !== '{') throw new SyntaxError('Backup file is not a JSON object.');
+
+    const meta = {};
+    let usersSeen = false;
+    let userCount = 0;
+    let hash = null;
+
+    reader.skipWhitespace();
+    if (reader.peek() === '}') {
+      reader.next();
+    } else {
+      members: while (true) {
+        reader.skipWhitespace();
+        const key = JSON.parse(reader.readStringRaw());
+        reader.skipWhitespace();
+        if (reader.next() !== ':') throw new SyntaxError('Expected ":" in the backup object.');
+        reader.skipWhitespace();
+
+        if (key === 'users') {
+          if (usersSeen) throw new SyntaxError('Duplicate "users" member in the backup.');
+          usersSeen = true;
+          if (reader.next() !== '[') throw new SyntaxError('Backup "users" is not an array.');
+          hash = crypto.createHash('sha256');
+          hash.update('[');
+          reader.skipWhitespace();
+          if (reader.peek() === ']') {
+            reader.next();
+          } else {
+            while (true) {
+              reader.skipWhitespace();
+              const raw = reader.readAnyRaw();
+              const user = JSON.parse(raw);
+              hash.update(userCount === 0 ? JSON.stringify(user) : `,${JSON.stringify(user)}`);
+              userCount += 1;
+              yield { type: 'user', user };
+              reader.compact();
+              reader.skipWhitespace();
+              const separator = reader.next();
+              if (separator === ',') continue;
+              if (separator === ']') break;
+              throw new SyntaxError('Expected "," or "]" in the backup "users" array.');
+            }
+          }
+          hash.update(']');
+        } else {
+          meta[key] = JSON.parse(reader.readAnyRaw());
+          reader.compact();
+        }
+
+        reader.skipWhitespace();
+        const separator = reader.next();
+        if (separator === ',') continue members;
+        if (separator === '}') break;
+        throw new SyntaxError('Expected "," or "}" in the backup object.');
+      }
+    }
+
+    reader.skipWhitespace();
+    if (reader.peek() !== null) throw new SyntaxError('Unexpected content after the backup object.');
+
+    yield {
+      type: 'checksum',
+      usersSeen,
+      userCount,
+      sha256: hash ? hash.digest('hex') : null,
+      meta
+    };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+async function* iterateBackupUsers(file, { chunkSize } = {}) {
+  for (const event of readBackupEvents(file, { chunkSize })) {
+    if (event.type === 'user') yield event.user;
+  }
+}
+
+// Validates structure and checksum without retaining the users array. The
+// returned payload holds metadata only; use iterateBackupUsers to walk it.
+function readBackup(file, { chunkSize } = {}) {
+  let checksum = null;
+  try {
+    for (const event of readBackupEvents(file, { chunkSize })) {
+      if (event.type === 'checksum') checksum = event;
+    }
+  } catch (err) {
+    return { ok: false, error: `Backup file could not be read: ${err.message}` };
+  }
+
+  const payload = checksum
+    ? {
+      version: checksum.meta.version,
+      createdAt: checksum.meta.createdAt === undefined ? null : checksum.meta.createdAt,
+      userCount: checksum.meta.userCount,
+      sha256: checksum.meta.sha256
+    }
+    : null;
+
+  if (!payload || !checksum.usersSeen || payload.version !== BACKUP_VERSION) {
+    return { ok: false, error: `Backup file is not a version ${BACKUP_VERSION} migration backup.` };
+  }
+  if (payload.sha256 !== checksum.sha256) {
+    return { ok: false, error: 'Backup checksum does not match its contents.' };
+  }
+  return { ok: true, payload, userCount: checksum.userCount };
+}
+
+// Merge-joins the id-sorted backup against the id-sorted user cursor. Only one
+// record from each side is held at a time, so verification stays bounded even
+// for a collection with a very large number of users. Parsing, comparison and
+// checksum all run in a single pass over one file descriptor; verifying a
+// checksum over one version of the file and comparing another version is not
+// possible.
+async function verifyBackup({ User }, file, { batchSize = DEFAULT_BATCH_SIZE, chunkSize } = {}) {
+  const missingUsers = [];
+  const changedEmbedded = [];
+  let currentUserCount = 0;
+  let backupUsersChecked = 0;
+  let previousBackupId = null;
+  let outOfOrder = false;
+  let checksumEvent = null;
+  let backupEntry = null;
+  let readFailure = null;
+
+  // createBackup writes users sorted by _id, which is what makes the merge
+  // possible without a lookup map. Anything else is rejected rather than
+  // silently producing an incomplete comparison.
+  const events = readBackupEvents(file, { chunkSize })[Symbol.iterator]();
+
+  function advanceBackup() {
+    const next = events.next();
+    if (next.done) {
+      backupEntry = null;
+      return false;
+    }
+    if (next.value.type === 'checksum') {
+      checksumEvent = next.value;
+      backupEntry = null;
+      return false;
+    }
+    backupEntry = next.value.user;
+    const key = String(backupEntry._id);
+    if (previousBackupId !== null && key <= previousBackupId) outOfOrder = true;
+    previousBackupId = key;
+    return true;
+  }
+
+  try {
+    advanceBackup();
+    const cursor = User.collection.find({}).sort({ _id: 1 }).batchSize(normalizeBatchSize(batchSize));
+    for await (const current of cursor) {
+      currentUserCount += 1;
+      const key = String(current._id);
+
+      while (backupEntry && String(backupEntry._id) < key) {
+        missingUsers.push(String(backupEntry._id));
+        backupUsersChecked += 1;
+        advanceBackup();
+      }
+
+      if (backupEntry && String(backupEntry._id) === key) {
+        backupUsersChecked += 1;
+        // The embedded arrays are intentionally retained, so a correct
+        // migration must leave them byte-for-byte equivalent to the backup.
+        if (JSON.stringify(backupEntry.pendingOrders || []) !== JSON.stringify(current.pendingOrders || [])
+          || JSON.stringify(backupEntry.trades || []) !== JSON.stringify(current.trades || [])) {
+          changedEmbedded.push(key);
+        }
+        advanceBackup();
+      }
+    }
+
+    while (backupEntry) {
+      missingUsers.push(String(backupEntry._id));
+      backupUsersChecked += 1;
+      advanceBackup();
+    }
+  } catch (err) {
+    readFailure = err;
+  } finally {
+    try {
+      events.return();
+    } catch {
+      // The original result is more useful than a cleanup failure.
+    }
+  }
+
+  const payload = checksumEvent
+    ? {
+      version: checksumEvent.meta.version,
+      createdAt: checksumEvent.meta.createdAt === undefined ? null : checksumEvent.meta.createdAt,
+      userCount: checksumEvent.meta.userCount,
+      sha256: checksumEvent.meta.sha256
+    }
+    : null;
+
+  function failure(error) {
+    return {
+      ok: false,
+      file,
+      version: payload ? payload.version : null,
+      createdAt: payload ? payload.createdAt : null,
+      userCount: payload ? payload.userCount : null,
+      currentUserCount,
+      backupUsersChecked,
+      missingUsers,
+      changedEmbedded,
+      error
+    };
+  }
+
+  if (readFailure) {
+    return failure(`Backup verification failed while reading users: ${readFailure.message}`);
+  }
+  if (!checksumEvent || !checksumEvent.usersSeen || !payload || payload.version !== BACKUP_VERSION) {
+    return failure(`Backup file is not a version ${BACKUP_VERSION} migration backup.`);
+  }
+  if (payload.sha256 !== checksumEvent.sha256) {
+    return failure('Backup checksum does not match its contents.');
+  }
+  if (outOfOrder) {
+    return failure('Backup users are not sorted by _id; bounded verification cannot continue.');
+  }
+
+  return {
+    ok: missingUsers.length === 0 && changedEmbedded.length === 0,
+    file,
+    version: payload.version,
+    createdAt: payload.createdAt,
+    userCount: payload.userCount,
+    currentUserCount,
+    backupUsersChecked,
+    missingUsers,
+    changedEmbedded,
+    error: missingUsers.length > 0 ? 'Backup users are missing from the database.' : null
+  };
+}
+
+module.exports = {
+  BACKUP_VERSION,
+  DEFAULT_BATCH_SIZE,
+  SEVERITY,
+  DEFAULT_TX_OPTIONS,
+  issue,
+  deterministicId,
+  validateLegacyOrder,
+  validateLegacyTrade,
+  planAccount,
+  planHasChanges,
+  summarizePlan,
+  summarizePlans,
+  iterateUserBatches,
+  transactionsSupported,
+  applyUserPlan,
+  runMigration,
+  auditLegacyData,
+  verifyMigration,
+  createBackup,
+  readBackup,
+  iterateBackupUsers,
+  verifyBackup,
+  backupHash
+};

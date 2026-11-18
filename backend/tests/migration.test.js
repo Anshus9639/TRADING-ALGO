@@ -1,0 +1,1230 @@
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const mongoose = require('mongoose');
+
+const User = require('../models/User');
+const Order = require('../models/Order');
+const Trade = require('../models/Trade');
+const { loadAccountView } = require('../services/accountView');
+const { createMarketFeed } = require('../services/marketFeed');
+const { createTradeService } = require('../services/tradeService');
+const { createMatcher } = require('../services/matcher');
+const { findUnmigratedLegacyOrders, findLegacyOrderBlockers } = require('../services/legacyOrders');
+const { resolveLegacyOrderId, legacyOrderId, legacyTradeId } = require('../lib/legacyIdentity');
+const { checkIdempotencyIndex } = require('../scripts/check-idempotency-index');
+const {
+  planAccount,
+  runMigration,
+  auditLegacyData,
+  verifyMigration,
+  createBackup,
+  readBackup,
+  iterateBackupUsers,
+  verifyBackup,
+  backupHash
+} = require('../scripts/legacyMigration');
+const { startTestDb, stopTestDb, createTestUser } = require('./helpers');
+
+function models() {
+  return { User, Order, Trade };
+}
+
+async function clearCollections() {
+  await Promise.all([
+    User.deleteMany({}),
+    Order.deleteMany({}),
+    Trade.deleteMany({})
+  ]);
+}
+
+function legacyTrade(symbol, type, quantity, price, timestamp) {
+  return {
+    _id: new mongoose.Types.ObjectId(),
+    symbol,
+    type,
+    quantity,
+    price,
+    ...(timestamp ? { timestamp } : {})
+  };
+}
+
+function legacyOrder(symbol, type, quantity, limitPrice, timestamp) {
+  return {
+    _id: new mongoose.Types.ObjectId(),
+    symbol,
+    type,
+    quantity,
+    limitPrice,
+    ...(timestamp ? { timestamp } : {})
+  };
+}
+
+// Wraps the canonical models so tests can observe how many users are read at a
+// time and which user ids each associated-collection query requests.
+function trackedModels() {
+  const calls = { orderBatches: [], tradeBatches: [], orderFilters: [], tradeFilters: [] };
+  const wrap = (Model, sink, filterSink) => ({
+    collection: {
+      find(filter, ...rest) {
+        const ids = filter && filter.userId && filter.userId.$in;
+        if (Array.isArray(ids)) sink.push(ids.map(String));
+        filterSink.push(filter);
+        return Model.collection.find(filter, ...rest);
+      },
+      insertOne: (...args) => Model.collection.insertOne(...args),
+      countDocuments: (...args) => Model.collection.countDocuments(...args)
+    }
+  });
+
+  return {
+    calls,
+    models: {
+      User,
+      Order: wrap(Order, calls.orderBatches, calls.orderFilters),
+      Trade: wrap(Trade, calls.tradeBatches, calls.tradeFilters)
+    }
+  };
+}
+
+async function createBatchUser(index) {
+  return createTestUser({
+    username: `batch-user-${index}`,
+    balance: 6000,
+    portfolio: [{ symbol: 'BTCUSDT', quantity: 0.1, avgPrice: 40000 }],
+    pendingOrders: [legacyOrder('BTCUSDT', 'BUY', 0.1, 40000, new Date('2025-06-01T00:00:00Z'))],
+    trades: [legacyTrade('BTCUSDT', 'BUY', 0.1, 40000, new Date('2025-05-01T00:00:00Z'))]
+  });
+}
+
+describe('legacy embedded data migration', () => {
+  beforeAll(async () => {
+    await startTestDb();
+  }, 120000);
+
+  afterAll(async () => {
+    await stopTestDb();
+  });
+
+  beforeEach(async () => {
+    await clearCollections();
+  });
+
+  test('dry run reports changes and writes nothing', async () => {
+    const buyOrder = legacyOrder('BTCUSDT', 'BUY', 0.1, 40000, new Date('2025-01-01T00:00:00Z'));
+    const sellOrder = legacyOrder('BTCUSDT', 'SELL', 0.1, 60000, new Date('2025-01-02T00:00:00Z'));
+    const buyTrade = legacyTrade('BTCUSDT', 'BUY', 0.2, 45000, new Date('2024-12-01T00:00:00Z'));
+    const sellTrade = legacyTrade('BTCUSDT', 'SELL', 0.1, 50000, new Date('2024-12-02T00:00:00Z'));
+
+    const user = await createTestUser({
+      balance: 6000,
+      portfolio: [{ symbol: 'BTCUSDT', quantity: 0.1, avgPrice: 45000 }],
+      pendingOrders: [buyOrder, sellOrder],
+      trades: [buyTrade, sellTrade]
+    });
+    const before = await User.findById(user._id).lean();
+
+    const report = await runMigration({ ...models(), mongoose, mode: 'dry-run' });
+
+    expect(report.mode).toBe('dry-run');
+    expect(report.writes).toEqual({ users: 0, orders: 0, trades: 0 });
+    expect(report.totals.legacyPendingOrders).toBe(2);
+    expect(report.totals.legacyTrades).toBe(2);
+    expect(report.totals.ordersToInsert).toBe(2);
+    expect(report.totals.tradesToInsert).toBe(2);
+
+    expect(await Order.countDocuments({})).toBe(0);
+    expect(await Trade.countDocuments({})).toBe(0);
+    expect(await User.findById(user._id).lean()).toEqual(before);
+  });
+
+  test('apply migrates history with preserved ids and values', async () => {
+    const buyOrder = legacyOrder('BTCUSDT', 'BUY', 0.1, 40000, new Date('2025-01-01T00:00:00Z'));
+    const sellOrder = legacyOrder('BTCUSDT', 'SELL', 0.1, 60000, new Date('2025-01-02T00:00:00Z'));
+    const buyTrade = legacyTrade('BTCUSDT', 'BUY', 0.2, 45000, new Date('2024-12-01T00:00:00Z'));
+    const sellTrade = legacyTrade('BTCUSDT', 'SELL', 0.1, 50000, new Date('2024-12-02T00:00:00Z'));
+
+    const user = await createTestUser({
+      balance: 6000,
+      portfolio: [{ symbol: 'BTCUSDT', quantity: 0.1, avgPrice: 45000 }],
+      pendingOrders: [buyOrder, sellOrder],
+      trades: [buyTrade, sellTrade]
+    });
+
+    const report = await runMigration({ ...models(), mongoose, mode: 'apply' });
+
+    expect(report.usersUpdated).toBe(1);
+    expect(report.usersFailed).toBe(0);
+    expect(report.writes).toEqual({ users: 1, orders: 2, trades: 2 });
+
+    const migratedTrades = await Trade.find({ userId: user._id }).sort({ timestamp: 1 }).lean();
+    expect(migratedTrades.map(trade => String(trade._id))).toEqual([
+      String(buyTrade._id),
+      String(sellTrade._id)
+    ]);
+    expect(migratedTrades[0]).toMatchObject({
+      symbol: 'BTCUSDT',
+      side: 'BUY',
+      quantity: 0.2,
+      executionPrice: 45000,
+      notional: 9000,
+      realizedPnl: null
+    });
+    expect(migratedTrades[0].timestamp).toEqual(buyTrade.timestamp);
+
+    const migratedOrders = await Order.find({ userId: user._id }).sort({ createdAt: 1 }).lean();
+    expect(migratedOrders.map(order => String(order._id))).toEqual([
+      String(buyOrder._id),
+      String(sellOrder._id)
+    ]);
+    expect(migratedOrders[0]).toMatchObject({
+      symbol: 'BTCUSDT',
+      side: 'BUY',
+      orderType: 'LIMIT',
+      quantity: 0.1,
+      remainingQuantity: 0.1,
+      limitPrice: 40000,
+      status: 'OPEN',
+      clientOrderId: `legacy:${user._id}:${buyOrder._id}`
+    });
+
+    const after = await User.findById(user._id).lean();
+    // The legacy BUY already deducted 4000 from balance; the migration only
+    // annotates it as locked.
+    expect(after.balance).toBe(6000);
+    expect(after.lockedBalance).toBe(4000);
+    // The legacy SELL already deducted 0.1 from holdings; the migration
+    // restores total holdings and marks the escrowed unit as locked.
+    expect(after.portfolio).toEqual([
+      expect.objectContaining({
+        symbol: 'BTCUSDT',
+        quantity: 0.2,
+        lockedQuantity: 0.1,
+        avgPrice: 45000
+      })
+    ]);
+    // Embedded arrays are retained untouched.
+    expect(after.pendingOrders).toHaveLength(2);
+    expect(after.trades).toHaveLength(2);
+  });
+
+  test('apply is idempotent and does not double count escrow', async () => {
+    const user = await createTestUser({
+      balance: 6000,
+      portfolio: [{ symbol: 'BTCUSDT', quantity: 0.1, avgPrice: 45000 }],
+      pendingOrders: [
+        legacyOrder('BTCUSDT', 'BUY', 0.1, 40000, new Date('2025-01-01T00:00:00Z')),
+        legacyOrder('BTCUSDT', 'SELL', 0.1, 60000, new Date('2025-01-02T00:00:00Z'))
+      ],
+      trades: [legacyTrade('BTCUSDT', 'BUY', 0.2, 45000, new Date('2024-12-01T00:00:00Z'))]
+    });
+
+    const first = await runMigration({ ...models(), mongoose, mode: 'apply' });
+    expect(first.writes).toEqual({ users: 1, orders: 2, trades: 1 });
+
+    const afterFirst = await User.findById(user._id).lean();
+    const second = await runMigration({ ...models(), mongoose, mode: 'apply' });
+
+    expect(second.writes).toEqual({ users: 0, orders: 0, trades: 0 });
+    expect(second.usersUnchanged).toBe(1);
+    expect(await User.findById(user._id).lean()).toEqual(afterFirst);
+    expect(await Order.countDocuments({ userId: user._id })).toBe(2);
+    expect(await Trade.countDocuments({ userId: user._id })).toBe(1);
+  });
+
+  test('SELL orders with a missing position are reconstructed and reported', async () => {
+    const sellOrder = legacyOrder('SOLUSDT', 'SELL', 2, 200, new Date('2025-01-02T00:00:00Z'));
+    const user = await createTestUser({
+      balance: 10000,
+      portfolio: [],
+      pendingOrders: [sellOrder]
+    });
+
+    const report = await runMigration({ ...models(), mongoose, mode: 'apply' });
+
+    expect(report.usersFailed).toBe(0);
+    expect(report.ambiguity.issueCounts.MISSING_POSITION_RECONSTRUCTED).toBe(1);
+    expect(report.ambiguity.issueCounts.MISSING_COST_BASIS).toBe(1);
+
+    const after = await User.findById(user._id).lean();
+    expect(after.portfolio).toEqual([
+      expect.objectContaining({
+        symbol: 'SOLUSDT',
+        quantity: 2,
+        lockedQuantity: 2,
+        avgPrice: null,
+        costBasisStatus: 'UNKNOWN'
+      })
+    ]);
+    expect(await Order.countDocuments({ userId: user._id, status: 'OPEN' })).toBe(1);
+  });
+
+  test('duplicate portfolio symbols block the user instead of dropping holdings', async () => {
+    const user = await createTestUser({
+      balance: 10000,
+      portfolio: [
+        { symbol: 'BTCUSDT', quantity: 0.1, avgPrice: 40000 },
+        { symbol: 'BTCUSDT', quantity: 0.2, avgPrice: 50000 }
+      ],
+      pendingOrders: [legacyOrder('BTCUSDT', 'BUY', 0.1, 40000, new Date())]
+    });
+
+    const before = await User.findById(user._id).lean();
+    const report = await runMigration({ ...models(), mongoose, mode: 'apply' });
+
+    expect(report.usersBlocked).toBe(1);
+    expect(report.writes).toEqual({ users: 0, orders: 0, trades: 0 });
+    expect(report.ambiguity.issueCounts.DUPLICATE_POSITION_SYMBOL).toBe(1);
+    expect(await Order.countDocuments({})).toBe(0);
+    expect(await User.findById(user._id).lean()).toEqual(before);
+  });
+
+  test('invalid legacy orders and trades are reported, retained, and not migrated', async () => {
+    const invalidOrder = legacyOrder('DOGEUSDT', 'BUY', 1, 1, new Date());
+    const invalidSell = legacyOrder('DOGEUSDT', 'SELL', -1, 1, new Date());
+    const invalidTrade = legacyTrade('BTCUSDT', 'BUY', 0, 100, new Date());
+    const user = await createTestUser({
+      balance: 10000,
+      portfolio: [{ symbol: 'BTCUSDT', quantity: 1, avgPrice: 100 }]
+    });
+    // Raw updates bypass current schema guards so the fixture can represent
+    // pre-existing corrupt legacy data, which the migration must report.
+    await User.collection.updateOne(
+      { _id: user._id },
+      { $push: { pendingOrders: { $each: [invalidOrder, invalidSell] }, trades: invalidTrade } }
+    );
+
+    const report = await runMigration({ ...models(), mongoose, mode: 'apply' });
+
+    expect(report.ambiguity.issueCounts.INVALID_LEGACY_ORDER).toBe(2);
+    expect(report.ambiguity.issueCounts.INVALID_LEGACY_TRADE).toBe(1);
+    expect(report.ambiguity.issueCounts.IRRECOVERABLE_ESCROW).toBe(1);
+    expect(await Order.countDocuments({})).toBe(0);
+    expect(await Trade.countDocuments({})).toBe(0);
+
+    const after = await User.findById(user._id).lean();
+    expect(after.pendingOrders).toHaveLength(2);
+    expect(after.trades).toHaveLength(1);
+  });
+
+  test('missing timestamps fall back deterministically to the account creation time', async () => {
+    const order = legacyOrder('ETHUSDT', 'BUY', 1, 3000);
+    const trade = legacyTrade('ETHUSDT', 'BUY', 1, 2900);
+    const user = await createTestUser({
+      balance: 7000,
+      portfolio: [{ symbol: 'ETHUSDT', quantity: 1, avgPrice: 2900 }]
+    });
+    // Raw updates avoid the schema's default timestamp so the fixture can
+    // represent records written before timestamps were populated.
+    await User.collection.updateOne(
+      { _id: user._id },
+      { $push: { pendingOrders: order, trades: trade } }
+    );
+
+    const report = await runMigration({ ...models(), mongoose, mode: 'apply' });
+
+    expect(report.ambiguity.issueCounts.MISSING_TIMESTAMP).toBe(2);
+    const migratedOrder = await Order.findById(order._id).lean();
+    const migratedTrade = await Trade.findById(trade._id).lean();
+    expect(migratedOrder.createdAt).toEqual(user.createdAt);
+    expect(migratedTrade.createdAt).toEqual(user.createdAt);
+  });
+
+  test('conflicting canonical records are reported and never overwritten', async () => {
+    const trade = legacyTrade('BNBUSDT', 'BUY', 1, 600, new Date('2025-01-01T00:00:00Z'));
+    const user = await createTestUser({
+      balance: 9400,
+      portfolio: [{ symbol: 'BNBUSDT', quantity: 1, avgPrice: 600 }],
+      trades: [trade]
+    });
+    await Trade.create({
+      _id: trade._id,
+      userId: user._id,
+      symbol: 'BNBUSDT',
+      side: 'BUY',
+      quantity: 2,
+      executionPrice: 500,
+      notional: 1000,
+      timestamp: new Date('2025-01-01T00:00:00Z')
+    });
+
+    const report = await runMigration({ ...models(), mongoose, mode: 'apply' });
+
+    expect(report.ambiguity.issueCounts.CONFLICTING_EXISTING_TRADE).toBe(1);
+    const canonical = await Trade.findById(trade._id).lean();
+    expect(canonical.quantity).toBe(2);
+    expect(canonical.executionPrice).toBe(500);
+  });
+
+  test('backup is verified before apply and embedded arrays remain intact', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'nexustrade-migration-'));
+    const backupFile = path.join(directory, 'users-backup.json');
+    try {
+      const user = await createTestUser({
+        balance: 6000,
+        portfolio: [{ symbol: 'BTCUSDT', quantity: 0.1, avgPrice: 45000 }],
+        pendingOrders: [legacyOrder('BTCUSDT', 'SELL', 0.1, 60000, new Date())],
+        trades: [legacyTrade('BTCUSDT', 'BUY', 0.2, 45000, new Date())]
+      });
+
+      const backup = await createBackup(models(), backupFile);
+      expect(backup.userCount).toBe(1);
+      expect(backup.sha256).toMatch(/^[a-f0-9]{64}$/);
+
+      const applied = await runMigration({ ...models(), mongoose, mode: 'apply' });
+      expect(applied.usersFailed).toBe(0);
+
+      const backupCheck = await verifyBackup(models(), backupFile);
+      expect(backupCheck.ok).toBe(true);
+      expect(backupCheck.changedEmbedded).toEqual([]);
+
+      const verification = await verifyMigration(models(), { backupFile });
+      expect(verification.mismatches).toEqual([]);
+      expect(verification.ok).toBe(true);
+      expect(verification.migrated.orders).toBe(1);
+      expect(verification.migrated.trades).toBe(1);
+      expect(verification.lockReconciliation.mismatches).toBe(0);
+
+      const view = await loadAccountView(await User.findById(user._id));
+      expect(view.pendingOrders).toHaveLength(1);
+      expect(view.trades).toHaveLength(1);
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test('verification flags unmigrated records before apply', async () => {
+    await createTestUser({
+      balance: 6000,
+      portfolio: [{ symbol: 'BTCUSDT', quantity: 0.1, avgPrice: 45000 }],
+      pendingOrders: [legacyOrder('BTCUSDT', 'BUY', 0.1, 40000, new Date())],
+      trades: [legacyTrade('BTCUSDT', 'BUY', 0.2, 45000, new Date())]
+    });
+
+    const verification = await verifyMigration(models());
+    expect(verification.ok).toBe(false);
+    expect(verification.mismatches.map(item => item.code)).toEqual(
+      expect.arrayContaining(['UNMIGRATED_ORDERS', 'UNMIGRATED_TRADES'])
+    );
+  });
+
+  test('audit is read-only and reports legacy counts and ambiguity', async () => {
+    const user = await createTestUser({
+      balance: 6000,
+      portfolio: [{ symbol: 'BTCUSDT', quantity: 0.1, avgPrice: 45000 }],
+      pendingOrders: [
+        legacyOrder('BTCUSDT', 'BUY', 0.1, 40000, new Date()),
+        legacyOrder('BTCUSDT', 'SELL', 0.1, 60000, new Date())
+      ],
+      trades: [legacyTrade('BTCUSDT', 'BUY', 0.2, 45000, new Date())]
+    });
+    const before = await User.findById(user._id).lean();
+
+    const report = await auditLegacyData(models());
+
+    expect(report.readOnly).toBe(true);
+    expect(report.legacy).toMatchObject({
+      users: 1,
+      pendingOrders: 2,
+      openBuy: 1,
+      openSell: 1,
+      trades: 1
+    });
+    expect(report.migration.ordersToInsert).toBe(2);
+    expect(report.migration.tradesToInsert).toBe(1);
+    expect(await Order.countDocuments({})).toBe(0);
+    expect(await Trade.countDocuments({})).toBe(0);
+    expect(await User.findById(user._id).lean()).toEqual(before);
+  });
+
+  test('multiple legacy orders migrate once with deterministic keys, reconcile escrow, and execute once', async () => {
+    const buyOne = legacyOrder('BTCUSDT', 'BUY', 0.1, 40000, new Date('2025-01-01T00:00:00Z'));
+    const buyTwo = legacyOrder('BTCUSDT', 'BUY', 0.2, 30000, new Date('2025-01-02T00:00:00Z'));
+    const sellOne = legacyOrder('ETHUSDT', 'SELL', 0.2, 60000, new Date('2025-01-03T00:00:00Z'));
+    const sellTwo = legacyOrder('ETHUSDT', 'SELL', 0.3, 65000, new Date('2025-01-04T00:00:00Z'));
+
+    const user = await createTestUser({
+      balance: 10000,
+      portfolio: [{ symbol: 'ETHUSDT', quantity: 0.5, avgPrice: 2000 }],
+      pendingOrders: [buyOne, buyTwo, sellOne, sellTwo]
+    });
+    const embeddedBefore = (await User.findById(user._id).lean()).pendingOrders;
+
+    // The isolated replica set must expose the real non-partial unique index.
+    const indexBefore = await checkIdempotencyIndex({ collection: Order.collection });
+    expect(indexBefore.ok).toBe(true);
+    expect(indexBefore.index.partial).toBe(false);
+    expect(indexBefore.index.unique).toBe(true);
+
+    const first = await runMigration({ ...models(), mongoose, mode: 'apply' });
+    expect(first.usersFailed).toBe(0);
+    expect(first.writes).toEqual({ users: 1, orders: 4, trades: 0 });
+
+    // Every embedded order appears exactly once with its original _id.
+    const migrated = await Order.find({ userId: user._id }).sort({ createdAt: 1 }).lean();
+    expect(migrated.map(order => String(order._id))).toEqual([
+      String(buyOne._id),
+      String(buyTwo._id),
+      String(sellOne._id),
+      String(sellTwo._id)
+    ]);
+    expect(await Order.countDocuments({})).toBe(4);
+
+    // Every key is deterministic (derived from user + embedded id), unique,
+    // within the model length limit, and the documents satisfy the schema.
+    const keys = migrated.map(order => order.clientOrderId);
+    expect(new Set(keys).size).toBe(4);
+    for (const order of migrated) {
+      expect(order.clientOrderId).toBe(`legacy:${user._id}:${order._id}`);
+      expect(Order.hydrate(order).validateSync()).toBeUndefined();
+    }
+
+    // A rerun writes nothing and preserves the ids and keys.
+    const second = await runMigration({ ...models(), mongoose, mode: 'apply' });
+    expect(second.writes).toEqual({ users: 0, orders: 0, trades: 0 });
+    expect(second.usersUnchanged).toBe(1);
+    expect(second.usersFailed).toBe(0);
+    const rerun = await Order.find({ userId: user._id }).sort({ createdAt: 1 }).lean();
+    expect(rerun.map(order => String(order._id))).toEqual(migrated.map(order => String(order._id)));
+    expect(rerun.map(order => order.clientOrderId)).toEqual(keys);
+
+    const indexAfter = await checkIdempotencyIndex({ collection: Order.collection });
+    expect(indexAfter.ok).toBe(true);
+    expect(indexAfter.duplicateGroups).toEqual([]);
+
+    // Legacy BUYs already deducted balance; the SELLs already deducted the
+    // holdings. Migration only annotates the reservations.
+    const migratedUser = await User.findById(user._id).lean();
+    expect(migratedUser.balance).toBe(10000);
+    expect(migratedUser.lockedBalance).toBe(10000);
+    expect(migratedUser.portfolio).toEqual([
+      expect.objectContaining({ symbol: 'ETHUSDT', quantity: 1, lockedQuantity: 0.5, avgPrice: 2000 })
+    ]);
+
+    const feed = createMarketFeed();
+    feed.setQuote('BTCUSDT', 28000);
+    feed.setQuote('ETHUSDT', 5000);
+    const service = createTradeService({ feed });
+    const matcher = createMatcher({ feed, tradeService: service });
+
+    const firstCycle = await matcher.runCycle();
+    expect(firstCycle.filled).toBe(2);
+    const secondCycle = await matcher.runCycle();
+    expect(secondCycle.filled).toBe(0);
+
+    const afterFills = await User.findById(user._id).lean();
+    expect(afterFills.balance).toBe(11600);
+    expect(afterFills.lockedBalance).toBe(0);
+    expect(afterFills.portfolio).toEqual(expect.arrayContaining([
+      expect.objectContaining({ symbol: 'BTCUSDT', quantity: 0.3, lockedQuantity: 0, avgPrice: 28000 }),
+      expect.objectContaining({ symbol: 'ETHUSDT', quantity: 1, lockedQuantity: 0.5, avgPrice: 2000 })
+    ]));
+    expect(await Trade.countDocuments({ userId: user._id })).toBe(2);
+    expect(await Order.countDocuments({ userId: user._id, status: 'FILLED' })).toBe(2);
+
+    const cancelOne = await service.cancelOrder({ orderId: sellOne._id, userId: user._id });
+    expect(cancelOne.status).toBe(200);
+    const cancelOneAgain = await service.cancelOrder({ orderId: sellOne._id, userId: user._id });
+    expect(cancelOneAgain.status).toBe(200);
+    expect(cancelOneAgain.body.message).toMatch(/already cancelled/i);
+    const cancelTwo = await service.cancelOrder({ orderId: sellTwo._id, userId: user._id });
+    expect(cancelTwo.status).toBe(200);
+    const cancelTwoAgain = await service.cancelOrder({ orderId: sellTwo._id, userId: user._id });
+    expect(cancelTwoAgain.status).toBe(200);
+    expect(cancelTwoAgain.body.message).toMatch(/already cancelled/i);
+
+    const idleCycle = await matcher.runCycle();
+    expect(idleCycle.filled).toBe(0);
+
+    const finalUser = await User.findById(user._id).lean();
+    expect(finalUser.balance).toBe(11600);
+    expect(finalUser.lockedBalance).toBe(0);
+    expect(finalUser.portfolio).toEqual(expect.arrayContaining([
+      expect.objectContaining({ symbol: 'BTCUSDT', quantity: 0.3, lockedQuantity: 0, avgPrice: 28000 }),
+      expect.objectContaining({ symbol: 'ETHUSDT', quantity: 1, lockedQuantity: 0, avgPrice: 2000 })
+    ]));
+    expect(await Order.countDocuments({ userId: user._id, status: 'FILLED' })).toBe(2);
+    expect(await Order.countDocuments({ userId: user._id, status: 'CANCELLED' })).toBe(2);
+    expect(await Order.countDocuments({ userId: user._id })).toBe(4);
+    expect(await Trade.countDocuments({ userId: user._id })).toBe(2);
+    expect(await findUnmigratedLegacyOrders({ User, Order })).toEqual([]);
+
+    const verification = await verifyMigration(models());
+    expect(verification.mismatches).toEqual([]);
+    expect(verification.ok).toBe(true);
+
+    // Embedded arrays are never altered or removed by migration or lifecycle.
+    const embeddedAfter = (await User.findById(user._id).lean()).pendingOrders;
+    expect(embeddedAfter.map(order => String(order._id))).toEqual(embeddedBefore.map(order => String(order._id)));
+    expect(embeddedAfter.map(order => order.type)).toEqual(['BUY', 'BUY', 'SELL', 'SELL']);
+    expect(embeddedAfter.map(order => order.quantity)).toEqual([0.1, 0.2, 0.2, 0.3]);
+  });
+
+  test('plans existing canonical escrow without double counting', () => {
+    const userId = new mongoose.Types.ObjectId();
+    const plan = planAccount({
+      _id: userId,
+      createdAt: new Date('2024-01-01T00:00:00Z'),
+      balance: 6000,
+      lockedBalance: 4000,
+      portfolio: [{ symbol: 'BTCUSDT', quantity: 0.2, lockedQuantity: 0.1, avgPrice: 45000 }],
+      pendingOrders: [],
+      trades: []
+    }, [
+      {
+        _id: new mongoose.Types.ObjectId(),
+        userId,
+        symbol: 'BTCUSDT',
+        side: 'BUY',
+        orderType: 'LIMIT',
+        quantity: 0.1,
+        remainingQuantity: 0.1,
+        limitPrice: 40000,
+        status: 'OPEN'
+      },
+      {
+        _id: new mongoose.Types.ObjectId(),
+        userId,
+        symbol: 'BTCUSDT',
+        side: 'SELL',
+        orderType: 'LIMIT',
+        quantity: 0.1,
+        remainingQuantity: 0.1,
+        limitPrice: 60000,
+        status: 'OPEN'
+      }
+    ], []);
+
+    expect(plan.blocked).toBe(false);
+    expect(plan.lockedBalance).toBe(4000);
+    expect(plan.lockedBalanceChanged).toBe(false);
+    expect(plan.portfolio.positions[0]).toMatchObject({
+      symbol: 'BTCUSDT',
+      quantity: 0.2,
+      lockedQuantity: 0.1
+    });
+    expect(plan.portfolio.changed).toBe(false);
+  });
+
+  test('restoring a legacy SELL keeps an unknown cost basis UNKNOWN', async () => {
+    const legacySell = legacyOrder('BTCUSDT', 'SELL', 0.5, 60000, new Date('2025-02-01T00:00:00Z'));
+    const user = await createTestUser({
+      balance: 0,
+      portfolio: [{ symbol: 'BTCUSDT', quantity: 0, avgPrice: null }],
+      pendingOrders: [legacySell]
+    });
+
+    const report = await runMigration({ ...models(), mongoose, mode: 'apply' });
+    expect(report.usersFailed).toBe(0);
+
+    const stored = await User.findById(user._id).lean();
+    expect(stored.portfolio).toEqual([
+      expect.objectContaining({
+        symbol: 'BTCUSDT',
+        quantity: 0.5,
+        lockedQuantity: 0.5,
+        avgPrice: null,
+        costBasisStatus: 'UNKNOWN'
+      })
+    ]);
+
+    const verification = await verifyMigration(models());
+    expect(verification.mismatches).toEqual([]);
+    expect(verification.ok).toBe(true);
+    expect(verification.costBasis.unknownPositions).toEqual([
+      { userId: String(user._id), symbol: 'BTCUSDT', quantity: 0.5, status: 'UNKNOWN' }
+    ]);
+  });
+
+  test('restoring a legacy SELL preserves a verified cost basis', async () => {
+    const legacySell = legacyOrder('ETHUSDT', 'SELL', 0.3, 2000, new Date('2025-02-02T00:00:00Z'));
+    const user = await createTestUser({
+      balance: 0,
+      portfolio: [{ symbol: 'ETHUSDT', quantity: 0.2, avgPrice: 1500 }],
+      pendingOrders: [legacySell]
+    });
+
+    await runMigration({ ...models(), mongoose, mode: 'apply' });
+
+    const stored = await User.findById(user._id).lean();
+    expect(stored.portfolio).toEqual([
+      expect.objectContaining({
+        symbol: 'ETHUSDT',
+        quantity: 0.5,
+        lockedQuantity: 0.3,
+        avgPrice: 1500,
+        costBasisStatus: 'KNOWN'
+      })
+    ]);
+  });
+
+  test('legacy identity hashes only stable financial fields', () => {
+    const userId = new mongoose.Types.ObjectId();
+    const timestamp = new Date('2025-06-01T00:00:00Z');
+    const order = { symbol: 'BTCUSDT', type: 'BUY', quantity: 0.1, limitPrice: 40000, timestamp };
+    const trade = { symbol: 'BTCUSDT', type: 'BUY', quantity: 0.1, price: 40000, timestamp };
+
+    // Properties outside the documented seed (for example a password or email
+    // copied into a record by mistake) cannot influence the derived id.
+    expect(String(legacyOrderId(userId, { ...order, password: 'secret', email: 'a@b.test' })))
+      .toBe(String(legacyOrderId(userId, order)));
+    expect(String(legacyTradeId(userId, { ...trade, password: 'secret' })))
+      .toBe(String(legacyTradeId(userId, trade)));
+
+    // The owning user id is part of the seed, so ids never collide across users.
+    const otherUser = new mongoose.Types.ObjectId();
+    expect(String(legacyOrderId(otherUser, order))).not.toBe(String(legacyOrderId(userId, order)));
+    expect(String(legacyTradeId(otherUser, trade))).not.toBe(String(legacyTradeId(userId, trade)));
+  });
+
+  test('records without an _id share one deterministic id in readers, the gate and migration', async () => {
+    const raw = {
+      symbol: 'BTCUSDT',
+      type: 'BUY',
+      quantity: 0.1,
+      limitPrice: 40000,
+      timestamp: new Date('2025-03-01T00:00:00Z')
+    };
+    const user = await createTestUser({ balance: 9500, lockedBalance: 500, pendingOrders: [] });
+    // Bypass Mongoose so the embedded document really has no _id.
+    await User.collection.updateOne({ _id: user._id }, { $set: { pendingOrders: [raw] } });
+    const expectedId = resolveLegacyOrderId(user._id, raw);
+
+    const gateBefore = await findLegacyOrderBlockers(models());
+    expect(gateBefore).toHaveLength(1);
+    expect(gateBefore[0].reasons).toEqual(['MISSING_ORDER_ID']);
+    expect(gateBefore[0].missingOrderIds).toBe(1);
+
+    const applied = await runMigration({ ...models(), mongoose, mode: 'apply' });
+    expect(applied.usersFailed).toBe(0);
+    expect(applied.writes.orders).toBe(1);
+
+    const canonical = await Order.find({ userId: user._id }).lean();
+    expect(canonical).toHaveLength(1);
+    expect(String(canonical[0]._id)).toBe(expectedId);
+
+    // The gate and the reader resolve the same derived id, so the migrated
+    // record is recognised instead of looking unmigrated or appearing twice.
+    expect(await findLegacyOrderBlockers(models())).toEqual([]);
+
+    const view = await loadAccountView(await User.findById(user._id));
+    expect(view.pendingOrders).toHaveLength(1);
+    expect(String(view.pendingOrders[0]._id)).toBe(expectedId);
+    expect(view.pendingOrders[0].legacy).toBeUndefined();
+
+    const rerun = await runMigration({ ...models(), mongoose, mode: 'apply' });
+    expect(rerun.writes.orders).toBe(0);
+    expect(await Order.countDocuments({ userId: user._id })).toBe(1);
+  });
+
+  test('another account\'s canonical order cannot satisfy this account\'s migration gate', async () => {
+    const sharedId = new mongoose.Types.ObjectId();
+    const owner = await createTestUser({ balance: 9500, lockedBalance: 4000 });
+    const stranger = await createTestUser({ username: 'stranger' });
+    await User.collection.updateOne(
+      { _id: owner._id },
+      {
+        $set: {
+          pendingOrders: [{
+            _id: sharedId,
+            symbol: 'BTCUSDT',
+            type: 'BUY',
+            quantity: 0.1,
+            limitPrice: 40000,
+            timestamp: new Date('2025-04-01T00:00:00Z')
+          }]
+        }
+      }
+    );
+    await Order.create({
+      _id: sharedId,
+      userId: stranger._id,
+      symbol: 'BTCUSDT',
+      side: 'BUY',
+      orderType: 'LIMIT',
+      quantity: 0.1,
+      remainingQuantity: 0.1,
+      limitPrice: 40000,
+      status: 'OPEN',
+      clientOrderId: `legacy:${stranger._id}:${sharedId}`
+    });
+
+    const blockers = await findLegacyOrderBlockers({ User, Order });
+    expect(blockers).toHaveLength(1);
+    expect(blockers[0]).toMatchObject({
+      userId: owner._id,
+      reasons: ['UNMIGRATED_ORDER'],
+      unmigratedOrders: 1
+    });
+
+    const view = await loadAccountView(await User.findById(owner._id));
+    expect(view.pendingOrders).toHaveLength(1);
+    expect(view.pendingOrders[0].legacy).toBe(true);
+  });
+
+  test('dry run streams every user in bounded batches', async () => {
+    for (let index = 0; index < 5; index += 1) {
+      await createBatchUser(index);
+    }
+
+    const { calls, models: tracked } = trackedModels();
+    const report = await runMigration({ ...tracked, mongoose, mode: 'dry-run', batchSize: 2 });
+
+    expect(report.totals.usersScanned).toBe(5);
+    expect(report.totals.ordersToInsert).toBe(5);
+    expect(report.totals.tradesToInsert).toBe(5);
+    expect(report.writes).toEqual({ users: 0, orders: 0, trades: 0 });
+    // Three batches of 2, 2 and 1 users are planned and read independently.
+    expect(calls.orderBatches.map(batch => batch.length)).toEqual([2, 2, 1]);
+    expect(calls.tradeBatches.map(batch => batch.length)).toEqual([2, 2, 1]);
+    expect(await Order.countDocuments({})).toBe(0);
+    expect(await Trade.countDocuments({})).toBe(0);
+  });
+
+  test('the limit is applied before reading associated records', async () => {
+    for (let index = 0; index < 3; index += 1) {
+      await createBatchUser(index);
+    }
+    const sorted = await User.find({}).sort({ _id: 1 }).lean();
+
+    const { calls, models: tracked } = trackedModels();
+    const report = await runMigration({ ...tracked, mongoose, mode: 'dry-run', limit: 1, batchSize: 2 });
+
+    expect(report.totals.usersScanned).toBe(1);
+    expect(report.totals.ordersToInsert).toBe(1);
+    // A limit of 1 reads exactly one user and only that user's records.
+    expect(calls.orderBatches).toEqual([[String(sorted[0]._id)]]);
+    expect(calls.tradeBatches).toEqual([[String(sorted[0]._id)]]);
+  });
+
+  test('audit accumulates totals across batches', async () => {
+    for (let index = 0; index < 5; index += 1) {
+      await createBatchUser(index);
+    }
+
+    const report = await auditLegacyData(models(), { batchSize: 2 });
+
+    expect(report.readOnly).toBe(true);
+    expect(report.collections).toEqual({ users: 5, orders: 0, trades: 0 });
+    expect(report.legacy).toMatchObject({
+      users: 5,
+      pendingOrders: 5,
+      openBuy: 5,
+      openSell: 0,
+      trades: 5
+    });
+    expect(report.migration.ordersToInsert).toBe(5);
+    expect(report.migration.tradesToInsert).toBe(5);
+    expect(await Order.countDocuments({})).toBe(0);
+  });
+
+  test('a streamed backup is readable, checksummed and verifiable after apply', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'nexustrade-migration-'));
+    const backupFile = path.join(directory, 'users-backup.json');
+    try {
+      for (let index = 0; index < 3; index += 1) {
+        await createBatchUser(index);
+      }
+
+      const backup = await createBackup(models(), backupFile, { batchSize: 1 });
+      expect(backup.userCount).toBe(3);
+      expect(backup.sha256).toMatch(/^[a-f0-9]{64}$/);
+      // The streamed temporary file is renamed into place, never left behind.
+      expect(fs.readdirSync(directory)).toEqual(['users-backup.json']);
+
+      const read = readBackup(backupFile);
+      expect(read.ok).toBe(true);
+      expect(read.payload.version).toBe(1);
+      expect(read.payload.userCount).toBe(3);
+      expect(read.payload.sha256).toBe(backup.sha256);
+      // Metadata is returned without retaining the users array in memory.
+      expect(read.payload.users).toBeUndefined();
+
+      const backedUpUsers = [];
+      for await (const user of iterateBackupUsers(backupFile)) backedUpUsers.push(user);
+      expect(backedUpUsers).toHaveLength(3);
+      expect(read.payload.sha256).toBe(backupHash(backedUpUsers));
+
+      const applied = await runMigration({ ...models(), mongoose, mode: 'apply', batchSize: 2 });
+      expect(applied.usersFailed).toBe(0);
+      expect(applied.writes).toEqual({ users: 3, orders: 3, trades: 3 });
+
+      const backupCheck = await verifyBackup(models(), backupFile, { batchSize: 2 });
+      expect(backupCheck.ok).toBe(true);
+      expect(backupCheck.currentUserCount).toBe(3);
+      expect(backupCheck.missingUsers).toEqual([]);
+      expect(backupCheck.changedEmbedded).toEqual([]);
+
+      const verification = await verifyMigration(models(), { backupFile, batchSize: 2 });
+      expect(verification.ok).toBe(true);
+      expect(verification.mismatches).toEqual([]);
+      expect(verification.users).toBe(3);
+      expect(verification.migrated).toEqual({ orders: 3, trades: 3, pending: 0 });
+      expect(verification.backup.ok).toBe(true);
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test('backup streaming handles tiny chunks, unicode and escaped braces', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'nexustrade-migration-'));
+    const backupFile = path.join(directory, 'users-backup.json');
+    try {
+      const users = [
+        {
+          _id: '000000000000000000000001',
+          username: 'café-😀-{tricky}',
+          note: 'quote " and backslash \\ and ] bracket',
+          pendingOrders: [{ symbol: 'BTCUSDT', note: '}{[', nested: { deep: [1, 2, 3] } }],
+          trades: []
+        },
+        {
+          _id: '000000000000000000000002',
+          username: 'braces } { [',
+          pendingOrders: [],
+          trades: [{ price: 1.5 }]
+        }
+      ];
+      fs.writeFileSync(backupFile, `${JSON.stringify({
+        version: 1,
+        createdAt: '2025-01-01T00:00:00.000Z',
+        userCount: users.length,
+        users,
+        sha256: backupHash(users)
+      }, null, 2)}\n`);
+
+      const read = readBackup(backupFile, { chunkSize: 7 });
+      expect(read.ok).toBe(true);
+      expect(read.userCount).toBe(2);
+      expect(read.payload.sha256).toBe(backupHash(users));
+
+      const streamed = [];
+      for await (const user of iterateBackupUsers(backupFile, { chunkSize: 5 })) {
+        streamed.push(user);
+      }
+      expect(streamed).toEqual(users);
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test('backup structure and checksum are validated while streaming', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'nexustrade-migration-'));
+    const backupFile = path.join(directory, 'users-backup.json');
+    try {
+      const users = [{ _id: '000000000000000000000001', pendingOrders: [], trades: [] }];
+      fs.writeFileSync(backupFile, JSON.stringify({
+        version: 1,
+        createdAt: '2025-01-01T00:00:00.000Z',
+        userCount: users.length,
+        users,
+        sha256: backupHash(users)
+      }));
+      expect(readBackup(backupFile).ok).toBe(true);
+
+      fs.writeFileSync(backupFile, JSON.stringify({
+        version: 1,
+        userCount: 1,
+        users: [{ _id: '000000000000000000000001', pendingOrders: [{ symbol: 'ETHUSDT' }], trades: [] }],
+        sha256: backupHash(users)
+      }));
+      expect(readBackup(backupFile)).toMatchObject({
+        ok: false,
+        error: 'Backup checksum does not match its contents.'
+      });
+
+      fs.writeFileSync(backupFile, JSON.stringify({ version: 2, users: [], sha256: backupHash([]) }));
+      expect(readBackup(backupFile).error).toMatch(/not a version 1 migration backup/);
+
+      fs.writeFileSync(backupFile, '{not json');
+      expect(readBackup(backupFile).error).toMatch(/could not be read/);
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test('a failed streamed backup keeps the previous file and removes the temporary file', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'nexustrade-migration-'));
+    const backupFile = path.join(directory, 'users-backup.json');
+    const previous = '{"previous":true}\n';
+    try {
+      await createBatchUser(0);
+      await createBatchUser(1);
+      fs.writeFileSync(backupFile, previous);
+
+      const failingUser = {
+        collection: {
+          countDocuments: () => User.collection.countDocuments({}),
+          find() {
+            return {
+              sort() { return this; },
+              batchSize() { return this; },
+              async *[Symbol.asyncIterator]() {
+                const [first] = await User.collection.find({}).limit(1).toArray();
+                yield first;
+                throw new Error('simulated read failure');
+              }
+            };
+          }
+        }
+      };
+
+      await expect(createBackup({ User: failingUser }, backupFile)).rejects.toThrow('simulated read failure');
+
+      expect(fs.readFileSync(backupFile, 'utf8')).toBe(previous);
+      expect(fs.readdirSync(directory)).toEqual(['users-backup.json']);
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test('verification streams users and canonical records in bounded batches', async () => {
+    for (let index = 0; index < 5; index += 1) {
+      await createBatchUser(index);
+    }
+    await runMigration({ ...models(), mongoose, mode: 'apply', batchSize: 2 });
+
+    const { calls, models: tracked } = trackedModels();
+    const verification = await verifyMigration(tracked, { batchSize: 2 });
+
+    expect(verification.ok).toBe(true);
+    expect(verification.mismatches).toEqual([]);
+    expect(verification.users).toBe(5);
+    expect(verification.migrated).toEqual({ orders: 5, trades: 5, pending: 0 });
+    expect(calls.orderBatches.map(batch => batch.length)).toEqual([2, 2, 1]);
+    expect(calls.tradeBatches.map(batch => batch.length)).toEqual([2, 2, 1]);
+  });
+
+  test('a large unrelated canonical history is never loaded for migration or verification', async () => {
+    const trade = legacyTrade('BTCUSDT', 'BUY', 0.1, 40000, new Date('2025-01-01T00:00:00Z'));
+    const user = await createTestUser({
+      balance: 6000,
+      portfolio: [{ symbol: 'BTCUSDT', quantity: 0.1, avgPrice: 40000 }],
+      trades: [trade]
+    });
+
+    // This account has thousands of canonical trades that the legacy data does
+    // not reference. They must be filtered in the database, not fetched and
+    // discarded in memory.
+    const unrelated = [];
+    for (let index = 0; index < 2000; index += 1) {
+      unrelated.push({
+        userId: user._id,
+        symbol: 'ETHUSDT',
+        side: 'BUY',
+        quantity: 1,
+        executionPrice: 1000 + index,
+        notional: 1000 + index,
+        timestamp: new Date('2024-01-01T00:00:00Z')
+      });
+    }
+    await Trade.insertMany(unrelated);
+
+    const verificationRun = trackedModels();
+    const report = await verifyMigration(verificationRun.models, { batchSize: 2 });
+
+    expect(report.mismatches.map(item => item.code)).toContain('UNMIGRATED_TRADES');
+    const tradeFilter = verificationRun.calls.tradeFilters[0];
+    expect(tradeFilter.userId.$in.map(String)).toEqual([String(user._id)]);
+    expect(tradeFilter._id.$in).toHaveLength(1);
+    expect(String(tradeFilter._id.$in[0])).toBe(String(trade._id));
+
+    const applyRun = trackedModels();
+    const applied = await runMigration({
+      ...applyRun.models,
+      mongoose,
+      mode: 'apply',
+      batchSize: 2
+    });
+
+    expect(applied.usersFailed).toBe(0);
+    expect(applied.writes).toEqual({ users: 1, orders: 0, trades: 1 });
+    expect(applyRun.calls.tradeFilters[0]._id.$in).toHaveLength(1);
+    expect(await Trade.countDocuments({ userId: user._id })).toBe(2001);
+  });
+
+  test('a canonical order conflict makes verification fail', async () => {    const order = legacyOrder('BTCUSDT', 'BUY', 0.1, 40000, new Date('2025-05-01T00:00:00Z'));
+    const user = await createTestUser({
+      balance: 6000,
+      lockedBalance: 8000,
+      pendingOrders: [order]
+    });
+    await Order.create({
+      _id: order._id,
+      userId: user._id,
+      symbol: 'BTCUSDT',
+      side: 'BUY',
+      orderType: 'LIMIT',
+      quantity: 0.2,
+      remainingQuantity: 0.2,
+      limitPrice: 40000,
+      status: 'OPEN',
+      clientOrderId: `legacy:${user._id}:${order._id}`
+    });
+
+    const verification = await verifyMigration(models());
+
+    expect(verification.ok).toBe(false);
+    expect(verification.mismatches.map(item => item.code)).toContain('CONFLICTING_ORDERS');
+    expect(verification.ambiguity.issues.map(item => item.code)).toContain('CONFLICTING_EXISTING_ORDER');
+
+    const untouched = await Order.findById(order._id).lean();
+    expect(untouched.quantity).toBe(0.2);
+  });
+
+  test('legacy trades without any timestamp migrate deterministically across reruns', async () => {
+    const userId = new mongoose.Types.ObjectId();
+    const trade = legacyTrade('BTCUSDT', 'BUY', 0.1, 40000);
+    await User.collection.insertOne({
+      _id: userId,
+      username: 'no-timestamps',
+      email: 'no-timestamps@example.test',
+      password: 'not-a-real-password-hash',
+      balance: 6000,
+      lockedBalance: 0,
+      portfolio: [{ symbol: 'BTCUSDT', quantity: 0.1, lockedQuantity: 0, avgPrice: 40000 }],
+      pendingOrders: [],
+      trades: [trade]
+    });
+
+    const first = await runMigration({ ...models(), mongoose, mode: 'apply' });
+    expect(first.usersFailed).toBe(0);
+    expect(first.ambiguity.issueCounts.MISSING_TIMESTAMP).toBe(1);
+
+    const migrated = await Trade.findById(trade._id).lean();
+    // Neither the trade nor user.createdAt has a timestamp, so the stable
+    // fallback is the account id's generation time, not the wall clock.
+    expect(new Date(migrated.timestamp).getTime())
+      .toBe(userId.getTimestamp().getTime());
+
+    const second = await runMigration({ ...models(), mongoose, mode: 'apply' });
+    expect(second.usersFailed).toBe(0);
+    expect(second.usersUpdated).toBe(0);
+    expect(second.ambiguity.issueCounts.CONFLICTING_EXISTING_TRADE).toBeUndefined();
+    expect(second.ambiguity.issueCounts.MISSING_TIMESTAMP).toBe(1);
+
+    const afterRerun = await Trade.findById(trade._id).lean();
+    expect(new Date(afterRerun.timestamp).getTime())
+      .toBe(new Date(migrated.timestamp).getTime());
+  });
+
+  test('an open canonical SELL without a portfolio position is reported, not funded', async () => {
+    const user = await createTestUser({
+      portfolio: [{ symbol: 'ETHUSDT', quantity: 1, avgPrice: 2000 }]
+    });
+    await Order.create({
+      userId: user._id,
+      symbol: 'BTCUSDT',
+      side: 'SELL',
+      orderType: 'LIMIT',
+      quantity: 0.5,
+      remainingQuantity: 0.5,
+      limitPrice: 50000,
+      status: 'OPEN',
+      clientOrderId: 'canonical-sell-without-position'
+    });
+
+    const report = await runMigration({ ...models(), mongoose, mode: 'dry-run' });
+
+    expect(report.ambiguity.issueCounts.UNMATCHED_CANONICAL_SELL_RESERVATION).toBe(1);
+    expect(report.ambiguity.errors).toBe(1);
+
+    const applied = await runMigration({ ...models(), mongoose, mode: 'apply' });
+    expect(applied.usersFailed).toBe(0);
+    const stored = await User.findById(user._id).lean();
+    expect(stored.portfolio.map(position => position.symbol)).toEqual(['ETHUSDT']);
+    expect(stored.portfolio[0].lockedQuantity).toBe(0);
+  });
+
+  test('audit tolerates null entries in pendingOrders', async () => {
+    const user = await createTestUser({
+      portfolio: [{ symbol: 'BTCUSDT', quantity: 0.1, avgPrice: 45000 }],
+      pendingOrders: [legacyOrder('BTCUSDT', 'BUY', 0.1, 40000, new Date())]
+    });
+    await User.collection.updateOne(
+      { _id: user._id },
+      { $push: { pendingOrders: null } }
+    );
+
+    const report = await auditLegacyData(models());
+
+    expect(report.ambiguity.issueCounts.INVALID_LEGACY_ORDER).toBe(1);
+    expect(report.legacy.openBuy).toBe(1);
+    expect(report.legacy.openSell).toBe(0);
+  });
+
+  test('backup verification parses, compares and checksums in a single pass', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'nexustrade-migration-'));
+    const backupFile = path.join(directory, 'users-backup.json');
+    try {
+      await createBatchUser(0);
+      await createBatchUser(1);
+      await createBackup(models(), backupFile);
+
+      const openSync = jest.spyOn(fs, 'openSync');
+      try {
+        const check = await verifyBackup(models(), backupFile);
+        expect(check.ok).toBe(true);
+        const opens = openSync.mock.calls.filter(([target]) => target === backupFile);
+        expect(opens).toHaveLength(1);
+      } finally {
+        openSync.mockRestore();
+      }
+
+      const tampered = JSON.parse(fs.readFileSync(backupFile, 'utf8'));
+      tampered.sha256 = backupHash([{ _id: 'different' }]);
+      fs.writeFileSync(backupFile, JSON.stringify(tampered));
+
+      const rejected = await verifyBackup(models(), backupFile);
+      expect(rejected.ok).toBe(false);
+      expect(rejected.error).toBe('Backup checksum does not match its contents.');
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test('the backup temporary file is created owner-only', async () => {
+    if (process.platform === 'win32') return;
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'nexustrade-migration-'));
+    const backupFile = path.join(directory, 'users-backup.json');
+    try {
+      await createBatchUser(0);
+      await createBackup(models(), backupFile);
+      const mode = fs.statSync(backupFile).mode & 0o777;
+      expect(mode).toBe(0o600);
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test('a stored zero average price cannot satisfy an unknown cost basis', async () => {
+    const user = await createTestUser({
+      portfolio: [{
+        symbol: 'BTCUSDT',
+        quantity: 1,
+        lockedQuantity: 0,
+        avgPrice: 0,
+        costBasisStatus: 'UNKNOWN'
+      }]
+    });
+    const raw = await User.findById(user._id).lean();
+
+    const plan = planAccount(raw);
+    expect(plan.portfolio.changed).toBe(true);
+    expect(plan.portfolio.positions[0]).toMatchObject({ avgPrice: null, costBasisStatus: 'UNKNOWN' });
+
+    const applied = await runMigration({ ...models(), mongoose, mode: 'apply' });
+    expect(applied.usersFailed).toBe(0);
+    const stored = await User.findById(user._id).lean();
+    expect(stored.portfolio[0].avgPrice).toBeNull();
+
+    // Reintroducing the zero through a raw write must fail verification.
+    await User.collection.updateOne(
+      { _id: user._id },
+      { $set: { 'portfolio.0.avgPrice': 0 } }
+    );
+    const verification = await verifyMigration(models());
+    expect(verification.ok).toBe(false);
+    expect(verification.mismatches.map(item => item.code)).toContain('COST_BASIS_MISMATCH');
+  });
+});
